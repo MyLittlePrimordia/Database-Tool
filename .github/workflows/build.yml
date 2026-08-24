@@ -1,0 +1,102 @@
+name: Build Database Tool
+
+# Assumes this repo's layout matches what was shipped: a top-level
+# app/ folder containing main.py, db_logic.py, assets/, build_macos.sh,
+# and build_linux_appimage.sh. If you flattened the repo (app/*
+# directly at the root), remove "working-directory: app" below and
+# the "app/" prefix from each artifact "path:".
+
+on:
+  workflow_dispatch: {}
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  windows:
+    name: Windows (.exe)
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PyInstaller
+        run: python -m pip install --upgrade pip pyinstaller
+
+      - name: Build .exe
+        run: python -m PyInstaller --onefile --windowed --name "Database Tool" --icon "assets/icon.ico" --add-data "assets;assets" main.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Database-Tool-windows
+          path: app/dist/Database Tool.exe
+
+  macos:
+    name: macOS (.dmg)
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Python with Tk via Homebrew
+        run: |
+          brew install python-tk@3.12
+          echo "$(brew --prefix python@3.12)/bin" >> "$GITHUB_PATH"
+
+      # Removed `--upgrade pip` so it installs pyinstaller without trying to overwrite Homebrew's pip
+      - name: Install PyInstaller and create-dmg
+        run: |
+          python3.12 -m pip install pyinstaller --break-system-packages
+          brew install create-dmg
+
+      - name: Verify tkinter is available
+        run: python3.12 -c "import tkinter; print('tkinter OK')"
+
+      - name: Build .app and .dmg
+        run: |
+          chmod +x build_macos.sh
+          PYTHON=python3.12 ./build_macos.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Database-Tool-macos
+          path: app/dist/*.dmg
+
+  linux:
+    name: Linux (.AppImage)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install system dependencies (tkinter + AppImage extraction support)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk libfuse2
+
+      - name: Install PyInstaller
+        run: python -m pip install --upgrade pip pyinstaller
+
+      - name: Build AppImage
+        run: |
+          chmod +x build_linux_appimage.sh
+          ./build_linux_appimage.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Database-Tool-linux
+          path: app/dist/*.AppImage
