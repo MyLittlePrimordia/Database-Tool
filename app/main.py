@@ -3136,6 +3136,10 @@ class MainApp(tk.Tk):
         # companion tools (secondary to the editor by design)
         self.curve_panel = curve_import.CurveImportPanel(self.notebook, self)
         self.notebook.add(self.curve_panel, text="  Import Curves  ")
+        # drag-panning for the Import tab's scrollable body (wired here, not
+        # inside curve_import, to keep the module import graph acyclic)
+        attach_touch_scroll_canvas(self.curve_panel.scroll_canvas,
+                                   self.curve_panel.scroll_inner)
 
         self.tools_panel = tools_panel.ToolsPanel(self.notebook, self)
         self.notebook.add(self.tools_panel, text="  Export  ")

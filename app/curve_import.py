@@ -23,8 +23,8 @@ from tkinter import ttk, filedialog, messagebox, simpledialog
 
 import curve_logic as CL
 import fr_plot
-from theme import (BG_INPUT, BG_CARD, TEXT_MAIN, TEXT_DIM, ACCENT_GREEN,
-                   ACCENT_BLUE, ACCENT_RED, ACCENT_ORANGE,
+from theme import (BG_MAIN, BG_INPUT, BG_CARD, TEXT_MAIN, TEXT_DIM,
+                   ACCENT_GREEN, ACCENT_BLUE, ACCENT_RED, ACCENT_ORANGE,
                    pick_font_family)
 
 
@@ -46,19 +46,53 @@ class CurveImportPanel(ttk.Frame):
         self._plan_rows = []       # [(row, bg_widgets)] for click-to-preview
         self._sel_plan = -1        # index into self._plans shown in the plot
 
-        self._build_queue_section()
-        self._build_curve_preview_card()
-        self._build_destination_card()
-        self._build_preview_card()
-        self._build_log()
+        # Scrollable body: the five stacked cards are taller than the tab
+        # viewport on normal screens, which clipped the PLANNED OUTPUTS card
+        # and its "Convert & Save" button below the fold with no way to
+        # reach them (same scrollable-canvas pattern as the Editor tab).
+        self.scroll_canvas = tk.Canvas(self, background=BG_MAIN,
+                                       highlightthickness=0)
+        vsb = ttk.Scrollbar(self, orient="vertical",
+                            command=self.scroll_canvas.yview)
+        self.scroll_canvas.configure(yscrollcommand=vsb.set)
+        self.scroll_canvas.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+        self.scroll_inner = ttk.Frame(self.scroll_canvas, style="TFrame")
+        self.scroll_canvas.create_window(
+            (0, 0), window=self.scroll_inner, anchor="nw", tags="inner")
+
+        def _on_configure(_event=None):
+            self.scroll_canvas.configure(
+                scrollregion=self.scroll_canvas.bbox("all"))
+            self.scroll_canvas.itemconfigure(
+                "inner", width=self.scroll_canvas.winfo_width())
+        self.scroll_inner.bind("<Configure>", _on_configure)
+        self.scroll_canvas.bind("<Configure>", _on_configure)
+        # Mouse-wheel scrolling when the pointer is over the canvas
+        # background (child widgets keep their own wheel behavior).
+        self.scroll_canvas.bind(
+            "<MouseWheel>",
+            lambda e: self.scroll_canvas.yview_scroll(
+                int(-1 * (e.delta / 120)), "units"))
+        self.scroll_canvas.bind(
+            "<Button-4>", lambda e: self.scroll_canvas.yview_scroll(-1, "units"))
+        self.scroll_canvas.bind(
+            "<Button-5>", lambda e: self.scroll_canvas.yview_scroll(1, "units"))
+
+        body = self.scroll_inner
+        self._build_queue_section(body)
+        self._build_curve_preview_card(body)
+        self._build_destination_card(body)
+        self._build_preview_card(body)
+        self._build_log(body)
 
         self.refresh_data_root()
 
     # ------------------------------------------------------------------
     # Queue
     # ------------------------------------------------------------------
-    def _build_queue_section(self):
-        wrap = ttk.Frame(self, style="Card.TFrame")
+    def _build_queue_section(self, host):
+        wrap = ttk.Frame(host, style="Card.TFrame")
         wrap.pack(fill="x", padx=10, pady=(10, 6))
 
         header = ttk.Frame(wrap, style="Card.TFrame")
@@ -181,8 +215,8 @@ class CurveImportPanel(ttk.Frame):
     # ------------------------------------------------------------------
     # Curve preview (live plot of the selected queued file / plan)
     # ------------------------------------------------------------------
-    def _build_curve_preview_card(self):
-        card = ttk.Frame(self, style="Card.TFrame")
+    def _build_curve_preview_card(self, host):
+        card = ttk.Frame(host, style="Card.TFrame")
         card.pack(fill="x", padx=10, pady=6)
         head = ttk.Frame(card, style="Card.TFrame")
         head.pack(fill="x", padx=8, pady=(8, 2))
@@ -287,8 +321,8 @@ class CurveImportPanel(ttk.Frame):
     # ------------------------------------------------------------------
     # Destination
     # ------------------------------------------------------------------
-    def _build_destination_card(self):
-        card = ttk.Frame(self, style="Card.TFrame")
+    def _build_destination_card(self, host):
+        card = ttk.Frame(host, style="Card.TFrame")
         card.pack(fill="x", padx=10, pady=6)
 
         ttk.Label(card, text="\U0001F4C2  DESTINATION", style="CardHeader.TLabel").grid(
@@ -406,16 +440,30 @@ class CurveImportPanel(ttk.Frame):
     # ------------------------------------------------------------------
     # Output preview
     # ------------------------------------------------------------------
-    def _build_preview_card(self):
-        card = ttk.Frame(self, style="Card.TFrame")
+    def _build_preview_card(self, host):
+        card = ttk.Frame(host, style="Card.TFrame")
         card.pack(fill="x", padx=10, pady=6)
 
+        # The action button lives in the CARD HEADER (not below the output
+        # list) so it stays visible even before any scrolling -- it used to
+        # sit under the list at the bottom of the tab and was routinely
+        # clipped off-screen entirely.
         header = ttk.Frame(card, style="Card.TFrame")
         header.pack(fill="x", padx=8, pady=(8, 0))
-        ttk.Label(header, text="\U0001F4DD  PLANNED OUTPUTS", style="CardHeader.TLabel").pack(side="left")
-        ttk.Label(header,
+        ttk.Label(header, text="\U0001F4DD  PLANNED OUTPUTS",
+                  style="CardHeader.TLabel").pack(side="left")
+        self.convert_btn = ttk.Button(header, text="Convert & Save",
+                                      style="Accent.TButton",
+                                      command=self._run_convert)
+        self.convert_btn.pack(side="right")
+        self.convert_status = tk.StringVar(value="")
+        ttk.Label(header, textvariable=self.convert_status, style="Card.TLabel",
+                  foreground=ACCENT_BLUE, wraplength=430,
+                  justify="right").pack(side="right", padx=12)
+        ttk.Label(card,
                   text="Rename freely before converting. \u26a0 marks files that already exist.",
-                  style="Card.TLabel", foreground=TEXT_DIM).pack(side="right")
+                  style="Card.TLabel", foreground=TEXT_DIM).pack(
+            anchor="w", padx=8)
 
         outer = tk.Frame(card, bg=BG_CARD, highlightthickness=1,
                          highlightbackground=BG_CARD, highlightcolor=BG_CARD)
@@ -434,17 +482,6 @@ class CurveImportPanel(ttk.Frame):
         self.preview_canvas.configure(yscrollcommand=vsb.set)
         self.preview_canvas.pack(side="left", fill="both", expand=True)
         vsb.pack(side="right", fill="y")
-
-        actions = ttk.Frame(card, style="Card.TFrame")
-        actions.pack(fill="x", padx=8, pady=(0, 8))
-        # plain Tk renders "&" literally (no Win32-style && escaping)
-        self.convert_btn = ttk.Button(actions, text="Convert & Save",
-                                      style="Accent.TButton",
-                                      command=self._run_convert)
-        self.convert_btn.pack(side="left")
-        self.convert_status = tk.StringVar(value="")
-        ttk.Label(actions, textvariable=self.convert_status, style="Card.TLabel",
-                  foreground=ACCENT_BLUE).pack(side="left", padx=12)
 
     def _set_plans(self, plans):
         self._plans = plans
@@ -695,9 +732,13 @@ class CurveImportPanel(ttk.Frame):
         if self.autolink_var.get():
             n_linked = self._link_written(written)
             if n_linked:
-                linked_note = ("  \u2022 {} linked to the open entry form "
-                               "(click Save Entry in the Editor to keep "
-                               "them)".format(n_linked))
+                # Say WHICH form received the links: a brand-new entry that
+                # has never been saved is a perfectly valid target (the
+                # links live in the form until Save Entry commits them).
+                target = self.app.editor.original_id or "(new unsaved entry)"
+                linked_note = ("  \u2022 {} linked to {} -- click Save Entry "
+                               "in the Editor to keep them".format(
+                                   n_linked, target))
 
         dest = os.path.dirname(written[0])
         self.convert_status.set("Wrote {} file(s) to {}{}".format(
@@ -721,29 +762,36 @@ class CurveImportPanel(ttk.Frame):
 
     def _link_written(self, written):
         """Append successfully written files to the currently edited
-        entry's measurement list. Returns how many were newly linked."""
+        entry's measurement list. Works for entries that only exist in the
+        form (not yet saved to the database) -- the links are form state
+        until Save Entry commits them. Returns how many were newly linked."""
         rels = []
         for w in written:
             rel = self._relative_for_db(w)
             if rel:
                 rels.append(rel)
         if not rels:
+            self._log("[SKIPPED] Could not link files: no data folder set "
+                      "(File > Set Data Folder...).")
             return 0
         panel = self.app.editor.file_panel
         current = panel.get_files()
         fresh = [r for r in rels if r not in current]
         if not fresh:
+            self._log("[SKIPPED] Already linked to this entry: {}".format(
+                ", ".join(rels)))
             return 0
         panel.set_files(current + fresh)
-        self._log("[OK] Linked to entry: {}".format(", ".join(fresh)), tag="ok")
+        self._log("[OK] Linked to entry form: {}".format(", ".join(fresh)),
+                  tag="ok")
         return len(fresh)
 
     # ------------------------------------------------------------------
     # Log console
     # ------------------------------------------------------------------
-    def _build_log(self):
-        wrap = ttk.Frame(self, style="Card.TFrame")
-        wrap.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+    def _build_log(self, host):
+        wrap = ttk.Frame(host, style="Card.TFrame")
+        wrap.pack(fill="x", padx=10, pady=(0, 10))
         ttk.Label(wrap, text="CONVERSION LOG", style="CardHeader.TLabel").pack(
             anchor="w", padx=8, pady=(6, 2))
         self.log = tk.Text(wrap, height=7, bg=BG_INPUT, fg=TEXT_MAIN,
