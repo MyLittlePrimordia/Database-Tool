@@ -45,7 +45,11 @@ MAX_DECOMPRESSED_BYTES = 256 * 1024 * 1024
 # BEHAVIOR SWITCHES (defaults match ADD ENTRY PROMPT.txt / AUDIT PROMPT.txt)
 # ==========================================================================
 ENFORCE_TWS_ZERO_SPECS = False       # prompts do NOT require TWS specs = 0
-CANONICALIZE_DRIVER_ORDER = False    # prompts only forbid whitespace
+CANONICALIZE_DRIVER_ORDER = False    # opt-in: DRIVER_TECH_ORDER now matches
+                                     # the prompt's canonical sequence, so
+                                     # newly generated configs are already
+                                     # canonical; this flag only rewrites
+                                     # legacy data during audits
 
 # sanity caps (defensive; prompts say whole integers, 0 if unverifiable)
 IMPEDANCE_MAX = 200000     # ohms (electrostatics reach ~145k)
@@ -93,7 +97,10 @@ BLANK_ENTRY = {
 # --------------------------------------------------------------------------
 # DRIVERS
 # --------------------------------------------------------------------------
-DRIVER_TECH_ORDER = ["DD", "Planar", "BA", "BC", "PZT", "MEMS", "EST"]
+# Canonical ordering sequence for generated/normalized driver_config
+# strings. Matches ADD ENTRY PROMPT.txt exactly:
+#   DD -> BA -> Planar -> EST -> MEMS -> PZT -> BC
+DRIVER_TECH_ORDER = ["DD", "BA", "Planar", "EST", "MEMS", "PZT", "BC"]
 DRIVER_TECH_LABELS = {
     "DD": "Dynamic Driver (DD)",
     "Planar": "Planar",
@@ -245,6 +252,10 @@ def round_price_to_5(price_usd):
         if not math.isfinite(p):
             return 0
     except (TypeError, ValueError):
+        return 0
+    if p <= 0:
+        # Clamp non-positive input instead of rounding further away from
+        # zero (round_price_to_5(-3) used to return -5).
         return 0
     return int(math.floor((p + 2.5) / 5.0) * 5)
 
@@ -448,7 +459,7 @@ def validate_entry(entry, existing_ids=None, exclude_id=None):
                     "(expected '{}').".format(driver_type, driver_config, expected_type)
                 )
 
-    for f, cap in (("impedance", IMPEDANCE_MAX), ("sensitivity", SENSITIVITY_MAX)):
+    for f in ("impedance", "sensitivity"):
         label = f.capitalize()
         raw = entry.get(f, 0)
         if isinstance(raw, str) and "." in raw:
@@ -525,7 +536,10 @@ def build_clean_entry(source, notes=None, where=""):
                         fv = float(sval.replace(",", "."))
                         if not math.isfinite(fv):
                             raise ValueError
-                        val = int(fv)
+                        # Same half-up path as numeric floats so a value
+                        # stored as text coerces identically to the same
+                        # number stored as a float ("239.5" -> 240, not 239).
+                        val = coerce_int(fv, 0)
                         note("{} value '{}' coerced to {}.".format(_label(f), orig, val))
                     except (ValueError, OverflowError):
                         note("{} value '{}' is not numeric; reset to 0.".format(_label(f), orig))
@@ -775,14 +789,26 @@ def write_pre_overwrite_snapshot(db_path, keep=OVERWRITE_SNAPSHOT_KEEP):
 
 def _autosave_sort_key(p):
     """Chronological ordering: modification time first, then a suffix-aware
-    name comparison so same-second snapshots (_2, _10 ...) order correctly."""
+    name comparison so same-second snapshots (_2, _10 ...) order correctly.
+
+    Only a trailing "_<n>" that FOLLOWS the timestamp stamp counts as the
+    sequence number; the digits inside the stamp itself (e.g. the time
+    "..._101010") must not poison the comparison, or same-second files
+    sorted inverted and pruning could drop the newest snapshot."""
     try:
         mtime = os.path.getmtime(p)
     except OSError:
         mtime = 0.0
-    m = re.search(r"_(\d+)\.json$", os.path.basename(p))
-    seq = int(m.group(1)) if m else -1
-    return (mtime, seq, os.path.basename(p))
+    name = os.path.basename(p)
+    seq = 0
+    m = re.search(r"_(\d+)\.json$", name)
+    # The trailing "_<n>" is a real collision sequence ONLY when what
+    # remains before it still ends with a full timestamp stamp. Otherwise
+    # the matched digits ARE the stamp's own time part (e.g.
+    # "autosave_20260824_101010.json") and must not poison the ordering.
+    if m and re.search(r"\d{8}_\d{6}$", name[:m.start()]):
+        seq = int(m.group(1))
+    return (mtime, seq, name)
 
 
 def _list_autosave_files(bdir):
@@ -864,7 +890,8 @@ def unseen_autosave(db_path):
 # --------------------------------------------------------------------------
 
 class AuditIssue:
-    def __init__(self, category, entry_index, entry_id, message, fix=None, severity="warning"):
+    def __init__(self, category, entry_index, entry_id, message, fix=None,
+                 severity="warning", code="", subject=None):
         self.category = category
         self.entry_index = entry_index
         self.entry_id = entry_id
@@ -872,9 +899,59 @@ class AuditIssue:
         # fix(entries_list) -> position mutated (int) or None when stale
         self.fix = fix
         self.severity = severity
+        # stable waiver identity: "code" classifies the finding kind (so a
+        # waiver survives message/value changes), "subject" is what it
+        # attaches to (entry id, or a file path for file-level findings)
+        self.code = code or category.lower().replace(" ", "-")
+        self.subject = subject if subject is not None else entry_id
+
+    def waiver_key(self):
+        return "{}|{}|{}".format(self.subject, self.category, self.code)
 
     def __repr__(self):
         return "<AuditIssue {} {} {}>".format(self.category, self.entry_id, self.message)
+
+
+# --------------------------------------------------------------------------
+# AUDIT WAIVERS (user-ignored findings, persisted beside the database)
+# --------------------------------------------------------------------------
+WAIVER_FILENAME = "audit_waivers.json"
+
+
+def waivers_path_for(db_path):
+    return os.path.join(os.path.dirname(os.path.abspath(db_path or "")),
+                        WAIVER_FILENAME)
+
+
+def load_waivers(db_path):
+    """Set of waiver keys persisted next to the database. Corrupt or
+    missing files simply mean 'no waivers'."""
+    path = waivers_path_for(db_path)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return set()
+    if isinstance(data, dict):
+        data = data.get("waived", [])
+    if not isinstance(data, list):
+        return set()
+    return {str(k) for k in data if isinstance(k, str) and k}
+
+
+def save_waivers(db_path, waivers):
+    """Persist waiver keys atomically beside the database."""
+    path = waivers_path_for(db_path)
+    parent = os.path.dirname(path)
+    if parent and not os.path.isdir(parent):
+        os.makedirs(parent, exist_ok=True)
+    tmp = path + ".tmp"
+    payload = {"version": 1,
+               "waived": sorted(str(w) for w in waivers if w)}
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    os.replace(tmp, path)
 
 
 def run_full_audit(entries, data_root=None):
@@ -953,26 +1030,26 @@ def run_full_audit(entries, data_root=None):
                     "Duplicate ID", idx, eid,
                     "Duplicate id '{}' also used by entry #{}.".format(real_id, first_idx),
                     severity="error",
+                    # Per-row subject: every twin shares the same entry_id,
+                    # and an unscoped subject would make waiving one row
+                    # hide ALL of them.
+                    subject="{}@{}".format(real_id, idx),
                 ))
             else:
                 seen_ids[real_id] = idx
 
         expected_id = build_id(entry.get("brand", ""), entry.get("model", ""), entry.get("variant", ""))
-        has_leading_trailing = entry.get("id", "").startswith("_") or entry.get("id", "").endswith("_")
+        # build_id never emits leading/trailing underscores, so whenever the
+        # stored id already matches it the underscore check is moot.
         if expected_id and entry.get("id") != expected_id:
+            has_leading_trailing = entry.get("id", "").startswith("_") or \
+                entry.get("id", "").endswith("_")
             if has_leading_trailing:
                 msg = "ID '{}' should be '{}' (has leading/trailing underscore).".format(entry.get("id"), expected_id)
             else:
                 msg = "ID '{}' should be '{}'.".format(entry.get("id"), expected_id)
             issues.append(AuditIssue(
                 "ID Format", idx, eid, msg,
-                fix=make_fix(entry, real_id or eid, idx,
-                             lambda en, exp=expected_id: en.__setitem__("id", exp)),
-            ))
-        elif has_leading_trailing:
-            issues.append(AuditIssue(
-                "ID Format", idx, eid,
-                "ID has a leading/trailing underscore.",
                 fix=make_fix(entry, real_id or eid, idx,
                              lambda en, exp=expected_id: en.__setitem__("id", exp)),
             ))
@@ -986,6 +1063,7 @@ def run_full_audit(entries, data_root=None):
                 "driver_config '{}' contains whitespace.".format(dc),
                 fix=make_fix(entry, real_id or eid, idx,
                              lambda en, val=fixed_dc: en.__setitem__("driver_config", val)),
+                code="dc-whitespace",
             ))
 
         parsed = parse_driver_config(entry.get("driver_config", ""))
@@ -1001,7 +1079,7 @@ def run_full_audit(entries, data_root=None):
                     dc_stripped, ", ".join(unknown_tokens), clean_cfg),
                 fix=make_fix(entry, real_id or eid, idx,
                              lambda en, val=clean_cfg: en.__setitem__("driver_config", val)),
-                severity="warning",
+                severity="warning", code="dc-unknown",
             ))
 
         if dt and not dc_stripped:
@@ -1010,7 +1088,7 @@ def run_full_audit(entries, data_root=None):
                 "driver_type '{}' present but driver_config is empty.".format(dt),
                 fix=make_fix(entry, real_id or eid, idx,
                              lambda en: en.__setitem__("driver_type", "")),
-                severity="error",
+                severity="error", code="dt-no-config",
             ))
         elif dc_stripped and not dt:
             if parsed:
@@ -1020,7 +1098,7 @@ def run_full_audit(entries, data_root=None):
                     "driver_type missing but driver_config '{}' implies '{}'.".format(dc_stripped, expected_type),
                     fix=make_fix(entry, real_id or eid, idx,
                                  lambda en, val=expected_type: en.__setitem__("driver_type", val)),
-                    severity="error",
+                    severity="error", code="dt-no-type",
                 ))
         elif parsed:
             expected_type, expected_config = classify_driver(parsed)
@@ -1031,6 +1109,7 @@ def run_full_audit(entries, data_root=None):
                         dt, dc_stripped, expected_type),
                     fix=make_fix(entry, real_id or eid, idx,
                                  lambda en, val=expected_type: en.__setitem__("driver_type", val)),
+                    code="dt-mismatch",
                 ))
             if CANONICALIZE_DRIVER_ORDER and not has_ws and dc_stripped != expected_config:
                 issues.append(AuditIssue(
@@ -1039,7 +1118,7 @@ def run_full_audit(entries, data_root=None):
                         dc_stripped, expected_config),
                     fix=make_fix(entry, real_id or eid, idx,
                                  lambda en, val=expected_config: en.__setitem__("driver_config", val)),
-                    severity="info",
+                    severity="info", code="dc-order",
                 ))
 
         ff = (entry.get("form_factor") or "").strip()
@@ -1047,25 +1126,29 @@ def run_full_audit(entries, data_root=None):
         if not ff:
             issues.append(AuditIssue(
                 "Form/Connector Mismatch", idx, eid,
-                "Form factor is missing/empty.", severity="error"))
+                "Form factor is missing/empty.",
+                severity="error", code="ff-missing"))
         elif ff not in FORM_FACTORS:
             issues.append(AuditIssue(
                 "Form/Connector Mismatch", idx, eid,
-                "Form factor '{}' is not an approved value.".format(ff), severity="error"))
+                "Form factor '{}' is not an approved value.".format(ff),
+                severity="error", code="ff-invalid"))
         if not conn:
             issues.append(AuditIssue(
                 "Form/Connector Mismatch", idx, eid,
-                "Connector is missing/empty.", severity="error"))
+                "Connector is missing/empty.",
+                severity="error", code="conn-missing"))
         elif conn not in CONNECTORS_ALL:
             issues.append(AuditIssue(
                 "Form/Connector Mismatch", idx, eid,
-                "Connector '{}' is not an approved value.".format(conn), severity="error"))
+                "Connector '{}' is not an approved value.".format(conn),
+                severity="error", code="conn-invalid"))
         if ff in FORM_CONNECTOR_MAP and conn in CONNECTORS_ALL and conn not in FORM_CONNECTOR_MAP[ff]:
             issues.append(AuditIssue(
                 "Form/Connector Mismatch", idx, eid,
                 "Connector '{}' is not allowed for form factor '{}'. Allowed: {}".format(
                     conn, ff, ", ".join(FORM_CONNECTOR_MAP[ff])),
-                severity="error"))
+                severity="error", code="conn-matrix"))
 
         if ENFORCE_TWS_ZERO_SPECS and ff == TWS_FORM_FACTOR:
             imp_val = coerce_int(entry.get("impedance", 0), -1)
@@ -1095,7 +1178,7 @@ def run_full_audit(entries, data_root=None):
                     "{} '{}' is not a usable number (reset to 0).".format(label, raw),
                     fix=make_fix(entry, real_id or eid, idx,
                                  lambda en, f=field: en.__setitem__(f, 0)),
-                    severity="error",
+                    severity="error", code="spec-nan",
                 ))
                 continue
             if fv < 0:
@@ -1104,7 +1187,7 @@ def run_full_audit(entries, data_root=None):
                     "{} {} is negative (reset to 0).".format(label, raw),
                     fix=make_fix(entry, real_id or eid, idx,
                                  lambda en, f=field: en.__setitem__(f, 0)),
-                    severity="error",
+                    severity="error", code="spec-negative",
                 ))
             elif fv != int(fv):
                 rounded = int(math.floor(fv + 0.5))
@@ -1113,13 +1196,13 @@ def run_full_audit(entries, data_root=None):
                     "{} must be a whole integer ({:.1f} -> {}).".format(label, fv, rounded),
                     fix=make_fix(entry, real_id or eid, idx,
                                  lambda en, f=field, val=rounded: en.__setitem__(f, val)),
-                    severity="warning",
+                    severity="warning", code="spec-float",
                 ))
             elif fv > (IMPEDANCE_MAX if field == "impedance" else SENSITIVITY_MAX):
                 issues.append(AuditIssue(
                     "Spec Sanity", idx, eid,
                     "{} {} is above the usual range (advisory).".format(label, int(fv)),
-                    severity="warning",
+                    severity="warning", code="spec-range",
                 ))
 
         files = entry.get("files", []) or []
@@ -1183,7 +1266,8 @@ def run_full_audit(entries, data_root=None):
             if p < 0:
                 issues.append(AuditIssue(
                     "Price Rounding", idx, eid,
-                    "Price ${} cannot be negative.".format(p), severity="error"))
+                    "Price ${} cannot be negative.".format(p),
+                    severity="error", code="price-negative"))
             elif p % 5 != 0:
                 rounded = round_price_to_5(p)
                 issues.append(AuditIssue(
@@ -1191,11 +1275,13 @@ def run_full_audit(entries, data_root=None):
                     "Price ${} is not a multiple of $5 (should be ${}).".format(p, rounded),
                     fix=make_fix(entry, real_id or eid, idx,
                                  lambda en, val=rounded: en.__setitem__("price_usd", val)),
+                    code="price-rounding",
                 ))
         except (TypeError, ValueError):
             issues.append(AuditIssue(
                 "Price Rounding", idx, eid,
-                "Price '{}' is not a valid integer.".format(price), severity="error"))
+                "Price '{}' is not a valid integer.".format(price),
+                severity="error", code="price-invalid"))
 
         if not is_valid_year(entry.get("year", 0)):
             issues.append(AuditIssue(
@@ -1211,23 +1297,23 @@ def run_full_audit(entries, data_root=None):
             issues.append(AuditIssue(
                 "Missing Field", idx, eid,
                 "Brand is empty -- every entry requires a brand.",
-                severity="error"))
+                severity="error", code="brand-missing"))
         if not (entry.get("model") or "").strip():
             issues.append(AuditIssue(
                 "Missing Field", idx, eid,
                 "Model is empty -- every entry requires a model.",
-                severity="error"))
+                severity="error", code="model-missing"))
 
         if WARN_ZERO_YEAR and coerce_int(entry.get("year", 0)) == 0:
             issues.append(AuditIssue(
                 "Missing Data", idx, eid,
                 "Year is 0 (unknown) -- set the launch year when verified.",
-                severity="warning"))
+                severity="warning", code="year-unknown"))
         if WARN_ZERO_PRICE and coerce_int(entry.get("price_usd", 0)) == 0:
             issues.append(AuditIssue(
                 "Missing Data", idx, eid,
                 "Price is $0 -- set the launch MSRP when verified.",
-                severity="warning"))
+                severity="warning", code="price-unknown"))
         if WARN_UNVERIFIED_DRIVERS \
                 and not (entry.get("driver_type") or "").strip() \
                 and not (entry.get("driver_config") or "").strip():
@@ -1235,7 +1321,7 @@ def run_full_audit(entries, data_root=None):
                 "Missing Data", idx, eid,
                 "Driver type and config both empty (unverified) -- fill in "
                 "when known.",
-                severity="warning"))
+                severity="warning", code="drivers-unknown"))
         if WARN_ZERO_SPECS_NON_TWS and ff != TWS_FORM_FACTOR:
             for field, label in (("impedance", "Impedance"),
                                  ("sensitivity", "Sensitivity")):
@@ -1244,7 +1330,9 @@ def run_full_audit(entries, data_root=None):
                         "Missing Data", idx, eid,
                         "{} is 0 on a non-TWS entry (unverified) -- set it "
                         "when known.".format(label),
-                        severity="warning"))
+                        severity="warning",
+                        code="impedance-unknown" if field == "impedance"
+                        else "sensitivity-unknown"))
 
         conflicts = tag_conflicts(set(map(str, tags)))
         for pair in conflicts:
@@ -1280,24 +1368,37 @@ def run_full_audit(entries, data_root=None):
                 "Duplicate file path(s) within entry.", severity="error"))
         for pos, rel in enumerate(files):
             if not isinstance(rel, str) or not rel.strip():
+                def _pop_bad_path(en, ppos=pos, old=rel):
+                    lst = en.get("files", [])
+                    # Guard on the captured VALUE as well as the position:
+                    # earlier fixes may have shifted indices, so a bare
+                    # pop(ppos) could silently delete a good path.
+                    if 0 <= ppos < len(lst) and lst[ppos] == old:
+                        lst.pop(ppos)
+                    elif old in lst:
+                        lst.remove(old)
                 issues.append(AuditIssue(
                     "File Path", idx, eid,
                     "File path is empty or not a string: '{}'.".format(rel),
-                    fix=make_fix(entry, real_id or eid, idx,
-                                 lambda en, ppos=pos: en["files"].pop(ppos)
-                                 if 0 <= ppos < len(en.get("files", [])) else None),
-                    severity="error",
+                    fix=make_fix(entry, real_id or eid, idx, _pop_bad_path),
+                    severity="error", code="file-empty",
                 ))
                 continue
             if rel != rel.strip():
+                def _strip_path(en, ppos=pos, old=rel):
+                    lst = en.get("files", [])
+                    if 0 <= ppos < len(lst) and lst[ppos] == old:
+                        lst[ppos] = old.strip()
+                    else:
+                        for k, q in enumerate(lst):
+                            if q == old:
+                                lst[k] = old.strip()
+                                break
                 issues.append(AuditIssue(
                     "File Path", idx, eid,
                     "File path has leading/trailing whitespace: '{}'.".format(rel),
-                    fix=make_fix(entry, real_id or eid, idx,
-                                 lambda en, ppos=pos: en["files"].__setitem__(
-                                     ppos, en["files"][ppos].strip())
-                                 if 0 <= ppos < len(en.get("files", [])) else None),
-                    severity="error",
+                    fix=make_fix(entry, real_id or eid, idx, _strip_path),
+                    severity="error", code="file-ws",
                 ))
             if "\\" in rel:
                 def slash_mut(en, old=rel):
@@ -1307,12 +1408,13 @@ def run_full_audit(entries, data_root=None):
                     "File Path", idx, eid,
                     "File path uses backslashes (should be forward slashes): '{}'.".format(rel),
                     fix=make_fix(entry, real_id or eid, idx, slash_mut),
-                    severity="warning",
+                    severity="warning", code="file-backslash",
                 ))
             if ".." in rel.split("/"):
                 issues.append(AuditIssue(
                     "File Path", idx, eid,
-                    "File path contains '..' traversal: '{}'.".format(rel), severity="error"))
+                    "File path contains '..' traversal: '{}'.".format(rel),
+                    severity="error", code="file-traversal"))
 
     # ---- entries without any measurement files (single summary row) ------
     no_files_idx = [i for i, e2 in enumerate(entries)
@@ -1341,7 +1443,10 @@ def run_full_audit(entries, data_root=None):
                 issues.append(AuditIssue(
                     "Duplicate File Link", idx, eid,
                     "File '{}' is linked to multiple entries: {}".format(rel, ", ".join(ids)),
-                    severity="warning"))
+                    severity="warning",
+                    # Scoped per entry so ignoring one row does not hide
+                    # the same finding on every other linked entry.
+                    subject="{}@{}".format(rel, idx)))
 
     if on_disk_set is not None:
         for rel, idxs in referenced_map.items():
@@ -1365,6 +1470,7 @@ def run_full_audit(entries, data_root=None):
             for rel in unlinked:
                 issues.append(AuditIssue(
                     "Unlinked File", -1, "(none)",
-                    "File on disk is not linked to any entry: {}".format(rel), severity="info"))
+                    "File on disk is not linked to any entry: {}".format(rel),
+                    severity="info", subject=rel))
 
     return issues

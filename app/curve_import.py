@@ -22,6 +22,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
 
 import curve_logic as CL
+import fr_plot
 from theme import (BG_INPUT, BG_CARD, TEXT_MAIN, TEXT_DIM, ACCENT_GREEN,
                    ACCENT_BLUE, ACCENT_RED, ACCENT_ORANGE,
                    pick_font_family)
@@ -40,8 +41,13 @@ class CurveImportPanel(ttk.Frame):
         self.files = []            # queued raw input paths
         self._plans = []           # GroupPlans for the current queue
         self._busy = False
+        self._queue_rows = []      # [(row, label)] for click-to-preview
+        self._sel_queue = -1       # index into self.files shown in the plot
+        self._plan_rows = []       # [(row, bg_widgets)] for click-to-preview
+        self._sel_plan = -1        # index into self._plans shown in the plot
 
         self._build_queue_section()
+        self._build_curve_preview_card()
         self._build_destination_card()
         self._build_preview_card()
         self._build_log()
@@ -132,23 +138,27 @@ class CurveImportPanel(ttk.Frame):
             w.destroy()
         n = len(self.files)
         self.count_var.set("{} file(s) queued".format(n))
+        self._queue_rows = []
+        self._sel_queue = -1
         if not n:
             tk.Label(self.queue_inner,
                      text="No files queued yet - use \"Select files...\" or "
                           "drag & drop .txt/.csv files onto this window",
                      bg=BG_INPUT, fg=TEXT_DIM, font=self._font, anchor="w",
-                ).pack(fill="x", padx=10, pady=8)
+                 ).pack(fill="x", padx=10, pady=8)
             self._set_plans([])
+            self._show_preview_empty()
             return
-        for path in self.files:
-            self._add_queue_row(path)
+        for i, path in enumerate(self.files):
+            self._add_queue_row(path, i)
         self._set_plans(CL.plan_groups(self.files))
 
-    def _add_queue_row(self, path):
+    def _add_queue_row(self, path, idx):
         row = tk.Frame(self.queue_inner, bg=BG_INPUT)
         row.pack(fill="x")
         lbl = tk.Label(row, text=os.path.basename(path), bg=BG_INPUT,
-                       fg=TEXT_MAIN, font=self._font, anchor="w")
+                       fg=TEXT_MAIN, font=self._font, anchor="w",
+                       cursor="hand2")
         lbl.pack(side="left", fill="x", expand=True, padx=(10, 4), pady=2)
         x_btn = tk.Label(row, text="\u2715", bg=BG_INPUT, fg=TEXT_DIM,
                          font=(self._font[0], 10, "bold"), cursor="hand2", padx=4)
@@ -156,6 +166,10 @@ class CurveImportPanel(ttk.Frame):
         x_btn.bind("<Button-1>", lambda e, p=path: self._remove_file(p))
         x_btn.bind("<Enter>", lambda e, b=x_btn: b.configure(fg=ACCENT_RED))
         x_btn.bind("<Leave>", lambda e, b=x_btn: b.configure(fg=TEXT_DIM))
+        # clicking a queued file previews its raw curve
+        for w in (row, lbl):
+            w.bind("<Button-1>", lambda e, i=idx: self._select_queue_row(i))
+        self._queue_rows.append((row, lbl))
 
     def _remove_file(self, path):
         try:
@@ -163,6 +177,112 @@ class CurveImportPanel(ttk.Frame):
         except ValueError:
             pass
         self._refresh_queue()
+
+    # ------------------------------------------------------------------
+    # Curve preview (live plot of the selected queued file / plan)
+    # ------------------------------------------------------------------
+    def _build_curve_preview_card(self):
+        card = ttk.Frame(self, style="Card.TFrame")
+        card.pack(fill="x", padx=10, pady=6)
+        head = ttk.Frame(card, style="Card.TFrame")
+        head.pack(fill="x", padx=8, pady=(8, 2))
+        ttk.Label(head, text="\U0001F4C9  CURVE PREVIEW",
+                  style="CardHeader.TLabel").pack(side="left")
+        self.preview_info = tk.Label(head, text="", bg=BG_CARD, fg=TEXT_DIM,
+                                     font=(self._font[0], 9), anchor="w")
+        self.preview_info.pack(side="left", padx=(12, 0))
+        ttk.Label(head, text="click a queued file or a planned-output row",
+                  style="Card.TLabel", foreground=TEXT_DIM).pack(side="right")
+        self.preview_plot = fr_plot.CurvePlot(card, height=190)
+        self.preview_plot.pack(fill="both", expand=True, padx=8, pady=(2, 8))
+        self._show_preview_empty()
+
+    def _show_preview_empty(self):
+        self.preview_plot.clear(
+            msg="Click a queued file above (or a planned-output row below) "
+                "to see its curve")
+        self.preview_info.configure(text="")
+
+    def _select_queue_row(self, idx):
+        if not (0 <= idx < len(self.files)):
+            return
+        self._sel_queue = idx
+        self._sel_plan = -1
+        for i, (row, lbl) in enumerate(self._queue_rows):
+            bg = "#26304a" if i == idx else BG_INPUT
+            row.configure(bg=bg)
+            lbl.configure(bg=bg)
+        self._render_plan_selection()
+        pts = fr_plot.get_curve_points(self.files[idx])
+        norm = fr_plot.normalized(pts) if pts else []
+        name = os.path.basename(self.files[idx])
+        if norm:
+            self.preview_plot.set_data(
+                [{"name": name, "pts": norm,
+                  "color": fr_plot.PALETTE[0], "width": 2}])
+            self.preview_info.configure(
+                text="RAW  \u00b7  {}".format(name),
+                fg=TEXT_DIM)
+        else:
+            self.preview_plot.clear(msg="No parsable data rows in this file")
+            self.preview_info.configure(
+                text="RAW  \u00b7  {}  (no data)".format(name), fg=ACCENT_RED)
+
+    def _select_plan_row(self, idx):
+        if not (0 <= idx < len(self._plans)):
+            return
+        plan = self._plans[idx]
+        self._sel_plan = idx
+        self._sel_queue = -1
+        self._render_queue_selection()
+        self._render_plan_selection()
+        series = []
+        names = []
+        for k, (p, _role) in enumerate(plan.sources):
+            pts = fr_plot.get_curve_points(p)
+            norm = fr_plot.normalized(pts) if pts else []
+            if not norm:
+                continue
+            series.append({"name": os.path.basename(p), "pts": norm,
+                           "color": fr_plot.PALETTE[k % len(fr_plot.PALETTE)],
+                           "width": 2})
+            names.append(os.path.basename(p))
+        badge = ("PAIR\u2192AVG" if plan.averaged else
+                 ("SOLO" if len(plan.sources) == 1 else "GROUP"))
+        label = "{}  \u00b7  {}".format(badge, plan.suggested_name)
+        if not series:
+            self.preview_plot.clear(msg="No parsable data rows in this plan")
+            self.preview_info.configure(text=label + "  (no data)",
+                                        fg=ACCENT_RED)
+            return
+        avg = None
+        if plan.averaged and len(series) == 2:
+            # exact same math convert_plan uses: mean on raw SPL, first grid
+            pa = fr_plot.get_curve_points(plan.sources[0][0])
+            pb = fr_plot.get_curve_points(plan.sources[1][0])
+            avg = fr_plot.average_raw(pa, pb) if pa and pb else None
+            if avg:
+                names.append("average")
+        self.preview_plot.set_data(series, avg=avg)
+        self.preview_info.configure(
+            text=label + "   \u00b7   " + "  +  ".join(names[:4])
+            + ("  (+{})".format(len(names) - 4) if len(names) > 4 else ""),
+            fg=TEXT_DIM)
+
+    def _render_queue_selection(self):
+        for i, (row, lbl) in enumerate(self._queue_rows):
+            bg = "#26304a" if i == self._sel_queue else BG_INPUT
+            row.configure(bg=bg)
+            lbl.configure(bg=bg)
+
+    def _render_plan_selection(self):
+        for i, widgets in enumerate(self._plan_rows):
+            bg = "#26304a" if i == self._sel_plan else widgets[-1]
+            for w in widgets[:-1]:
+                try:
+                    w.configure(bg=bg)
+                except Exception:      # ttk.Checkbutton has no bg option
+                    pass
 
     # ------------------------------------------------------------------
     # Destination
@@ -317,7 +437,8 @@ class CurveImportPanel(ttk.Frame):
 
         actions = ttk.Frame(card, style="Card.TFrame")
         actions.pack(fill="x", padx=8, pady=(0, 8))
-        self.convert_btn = ttk.Button(actions, text="Convert && Save",
+        # plain Tk renders "&" literally (no Win32-style && escaping)
+        self.convert_btn = ttk.Button(actions, text="Convert & Save",
                                       style="Accent.TButton",
                                       command=self._run_convert)
         self.convert_btn.pack(side="left")
@@ -330,8 +451,11 @@ class CurveImportPanel(ttk.Frame):
         self._name_vars = []
         self._include_vars = []
         self._exists_labels = []
+        self._plan_rows = []
+        self._sel_plan = -1
         for w in self.preview_inner.winfo_children():
             w.destroy()
+        self._render_queue_selection()   # queue highlight survives rebuild
 
         if not plans:
             tk.Label(self.preview_inner,
@@ -352,7 +476,7 @@ class CurveImportPanel(ttk.Frame):
             taken[final.lower()] = count + 1
 
             row_bg = BG_CARD if i % 2 == 0 else "#232736"
-            row = tk.Frame(self.preview_inner, bg=row_bg)
+            row = tk.Frame(self.preview_inner, bg=row_bg, cursor="hand2")
             row.pack(fill="x")
 
             inc_var = tk.BooleanVar(value=True)
@@ -365,7 +489,8 @@ class CurveImportPanel(ttk.Frame):
                 else (("SOLO", TEXT_DIM) if len(plan.sources) == 1
                       else ("GROUP", ACCENT_ORANGE)))
             badge = tk.Label(row, text=badge_text, bg=row_bg, fg=badge_fg,
-                             font=(self._font[0], 8, "bold"), width=11, anchor="center")
+                             font=(self._font[0], 8, "bold"), width=11, anchor="center",
+                             cursor="hand2")
             badge.pack(side="left", padx=(0, 6))
 
             name_var = tk.StringVar(value=final)
@@ -384,12 +509,19 @@ class CurveImportPanel(ttk.Frame):
             if len(srcs) > 58:
                 srcs = srcs[:57] + "\u2026"
             src_lbl = tk.Label(row, text=srcs, bg=row_bg, fg=TEXT_DIM,
-                               font=(self._font[0], 9), anchor="w")
+                               font=(self._font[0], 9), anchor="w",
+                               cursor="hand2")
             src_lbl.pack(side="left", fill="x", expand=True, padx=(0, 8))
+
+            # clicking a planned-output row previews its curve(s); the Entry
+            # and Checkbutton keep their own click behavior
+            for w in (row, badge, exists_lbl, src_lbl):
+                w.bind("<Button-1>", lambda e, i=i: self._select_plan_row(i))
 
             self._name_vars.append(name_var)
             self._include_vars.append((inc_var, plan))
             self._exists_labels.append(exists_lbl)
+            self._plan_rows.append((row, cb, badge, exists_lbl, src_lbl, row_bg))
 
         self._refresh_exists_markers()
         self._update_convert_state()
@@ -579,9 +711,11 @@ class CurveImportPanel(ttk.Frame):
                 pass
 
     def _poke_file_linker(self):
+        # One forced background rescan is enough: _invalidate_cache now
+        # delegates to the same walker, so calling both used to trigger a
+        # duplicate (and formerly UI-blocking) scan.
         try:
             self.app.editor.file_panel.poll_now(force=True)
-            self.app.editor.file_panel._invalidate_cache()
         except Exception:  # noqa: BLE001
             pass
 

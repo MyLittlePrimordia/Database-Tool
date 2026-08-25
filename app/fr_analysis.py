@@ -7,6 +7,9 @@ Fixes applied vs. original (see audit report):
         resolve_under_root() helper so linked paths cannot escape the
         data folder. All failures raise ValueError with friendly text
         that the GUI already displays.
+  F-H1   Field splitting now happens BEFORE decimal-comma normalization;
+        semicolon/tab-delimited rows ("20;50,5") previously merged into
+        garbage points (20 -> "20.5 Hz", SPL -> 0.5 dB) or were dropped.
 Analysis thresholds unchanged.
 """
 
@@ -19,8 +22,77 @@ import re
 # ("2.5e3" -> 2.5 + 3) and produced fake low-frequency data points.
 _NUM_RE = re.compile(r"[-+]?(?:\d+(?:[.,]\d+)?|[.,]\d+)(?:[eE][-+]?\d+)?")
 
+# European decimal-comma number ("20,5"). Only applied WITHIN a field,
+# after delimiters have already been split -- never before, or the comma
+# delimiter and the decimal comma become indistinguishable ("20;50,5"
+# would merge into the single token "20,50" -> 20.5 Hz).
+_DECIMAL_COMMA_RE = re.compile(r"^-?\d+,\d+$")
+
 MAX_FILE_BYTES = 20 * 1024 * 1024      # 20 MB is generous for FR sweeps
 MAX_POINTS = 500000
+
+
+def _normalize_decimal_comma(field):
+    """European decimal comma inside an isolated field -> dot ("50,5" ->
+    "50.5") so float() parses the intended value."""
+    if _DECIMAL_COMMA_RE.match(field):
+        return field.replace(",", ".")
+    return field
+
+
+def _split_fields(line):
+    """Hierarchical delimiter handling -- mirrors curve_logic._split_fields:
+
+      - ";" present anywhere: semicolon is unambiguously THE field
+        delimiter; any comma left inside a field is a decimal mark.
+      - elif tab present: tabs are the strong delimiter; commas inside a
+        field are decimal marks.
+      - else (no ; / tab): if whitespace-separated tokens ALL look like
+        bare decimal-comma numbers ("20,5 60,25"), spaces are the
+        delimiter and the commas are decimals. Otherwise fall back to the
+        combined comma/whitespace split, where a comma genuinely IS the
+        delimiter ("20,112.594") and must never be renormalized.
+    """
+    if ";" in line:
+        chunks = line.split(";")
+    elif "\t" in line:
+        chunks = line.split("\t")
+    else:
+        toks = line.split()
+        if len(toks) >= 2 and all(_DECIMAL_COMMA_RE.match(t) for t in toks):
+            return [_normalize_decimal_comma(t) for t in toks]
+        return [t for t in re.split(r"[,\s]+", line) if t]
+    fields = []
+    for chunk in chunks:
+        for sub in chunk.split():
+            if sub:
+                fields.append(_normalize_decimal_comma(sub))
+    return fields
+
+
+def _extract_pair(line):
+    """Pull the first two numbers (freq, SPL) out of one line.
+
+    Delimiters (; tab, or context-dependent comma/whitespace) are split
+    FIRST so a decimal comma can never swallow an adjacent field; only
+    then are fields parsed as floats. A lenient regex scan over the raw
+    line remains as a fallback for prose-wrapped rows
+    ("Freq = 20, SPL = 50"). Returns (freq, db) or None when the line
+    holds no usable pair."""
+    fields = _split_fields(line.strip())
+    nums = []
+    for fx in fields[:3]:
+        try:
+            nums.append(float(fx))
+        except ValueError:
+            break
+    if len(nums) >= 2:
+        return nums[0], nums[1]
+    vals = [_to_float(t) for t in _NUM_RE.findall(line)]
+    vals = [v for v in vals if v is not None]
+    if len(vals) >= 2:
+        return vals[0], vals[1]
+    return None
 
 
 def resolve_under_root(data_root, rel):
@@ -43,9 +115,11 @@ def parse_fr_file(path):
     """Parse 'frequency dB' pairs from a measurement .txt file.
 
     Tolerant of headers, comments (# // ;), tabs, commas and semicolons.
-    Returns a frequency-sorted list of (freq_hz, db) float tuples.
-    Raises OSError on unreadable files, ValueError when the input is too
-    large; returns [] if no data rows found."""
+    Delimiters are split before decimal-comma normalization, so European
+    exports ("20;50,5") parse as (20, 50.5) instead of being merged or
+    corrupted. Returns a frequency-sorted list of (freq_hz, db) float
+    tuples. Raises OSError on unreadable files, ValueError when the input
+    is too large; returns [] if no data rows found."""
     try:
         size = os.path.getsize(path)
     except OSError:
@@ -62,21 +136,7 @@ def parse_fr_file(path):
             line = line.strip()
             if not line or line.startswith("#") or line.startswith("//"):
                 continue
-            nums = _NUM_RE.findall(line.replace(";", ",").replace("\t", ","))
-            parts = [p for p in re.split(r"[,\s]+", line) if p]
-            vals = None
-            if len(parts) == 2 and len(_NUM_RE.findall(parts[0])) == 1 \
-                    and len(_NUM_RE.findall(parts[1])) == 1:
-                try:
-                    vals = (float(parts[0].replace(",", ".")),
-                            float(parts[1].replace(",", ".")))
-                except ValueError:
-                    vals = None
-            if vals is None:
-                nums = [_to_float(n) for n in nums]
-                nums = [n for n in nums if n is not None]
-                if len(nums) >= 2:
-                    vals = (nums[0], nums[1])
+            vals = _extract_pair(line)
             if vals is None:
                 continue
             freq, db = vals

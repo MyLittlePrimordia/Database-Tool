@@ -82,9 +82,12 @@ def compress_to_gz(entries=None, external_path=None, dest_dir=None):
 # --------------------------------------------------------------------------
 # Split
 # --------------------------------------------------------------------------
-def count_tokens(item):
-    """Rough dependency-free token estimate (~4 chars/token)."""
-    return max(1, len(json.dumps(item, ensure_ascii=False)) // 4)
+def count_tokens(item, indent=None):
+    """Rough dependency-free token estimate (~4 chars/token). Pass the same
+    `indent` used when writing so the estimate reflects the actual bytes on
+    disk (chunks are written with indent=2; compact JSON underestimates by
+    ~30-40%)."""
+    return max(1, len(json.dumps(item, ensure_ascii=False, indent=indent)) // 4)
 
 
 def split_into_chunks(entries=None, external_path=None,
@@ -97,6 +100,12 @@ def split_into_chunks(entries=None, external_path=None,
 
     if not isinstance(src_entries, list):
         raise ValueError("Database must be a top-level JSON array [].")
+
+    # Canonicalize exactly like the gzip export so both exporters always
+    # agree on schema order and never leak unknown fields into chunks
+    # (in-memory sources may carry unsaved edits; external files were
+    # already cleaned by load_database).
+    src_entries = [L.build_clean_entry(e) for e in src_entries]
 
     filename_only = (os.path.splitext(os.path.basename(src_path))[0]
                      if src_path else "database")
@@ -147,7 +156,9 @@ def split_into_chunks(entries=None, external_path=None,
         current_tokens = 0
 
     for index, item in enumerate(src_entries):
-        item_tokens = count_tokens(item)
+        # indent=2 matches flush()'s serialization so the token budget is
+        # computed against what actually lands on disk.
+        item_tokens = count_tokens(item, indent=2)
         if current_chunk and current_tokens + item_tokens > max_tokens:
             flush()
         current_chunk.append(item)

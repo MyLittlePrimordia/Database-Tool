@@ -30,6 +30,7 @@ from tkinter import ttk, filedialog, messagebox
 
 import db_logic as L
 import spell_logic as SP
+import fr_plot
 import theme
 from theme import (BG_MAIN, BG_PANEL, BG_CARD, BG_INPUT, BORDER,
                    BORDER_LIGHT, ACCENT_BLUE, ACCENT_ORANGE, ACCENT_PURPLE,
@@ -804,6 +805,9 @@ class HoverTooltip:
 
     def _cancel(self, _event=None):
         self._cancel_timer()
+        self._hide_window()
+
+    def _hide_window(self):
         if self._tw:
             try:
                 self._tw.destroy()
@@ -1169,6 +1173,10 @@ class FileLinkerPanel(ttk.Frame):
         self.linked = []
         self._all_files_cache = None
         self._cache_root = None
+        # optional callbacks fired on list selection changes (used by the
+        # FR preview: linked selection -> emphasis, available -> ghost)
+        self.on_linked_select = None
+        self.on_available_select = None
         # optional callback(n_linked) fired whenever the linked list changes;
         # used by MainApp to badge the Editor tab so auto-link feedback is
         # visible from any notebook tab.
@@ -1249,6 +1257,17 @@ class FileLinkerPanel(ttk.Frame):
         self.linked_list.bind("<Button-4>", self._on_mousewheel_linked)
         self.linked_list.bind("<Button-5>", self._on_mousewheel_linked)
 
+        # selection hooks for the FR preview (arrow-key browsing included:
+        # tk Listbox fires <<ListboxSelect>> on keyboard navigation too)
+        self.available_list.bind(
+            "<<ListboxSelect>>",
+            lambda e: self.on_available_select and self._fire(self.on_available_select),
+            add="+")
+        self.linked_list.bind(
+            "<<ListboxSelect>>",
+            lambda e: self.on_linked_select and self._fire(self.on_linked_select),
+            add="+")
+
         # ellipsization state: full strings kept for tooltips / re-widen
         self._available_full = []
         self._linked_full = []
@@ -1278,10 +1297,21 @@ class FileLinkerPanel(ttk.Frame):
                                wraplength=380)
         self.hint.grid(row=4, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 8))
 
+    def _fire(self, cb):
+        """Run an optional callback, never letting a plot hiccup break lists."""
+        try:
+            cb()
+        except Exception:
+            pass
+
     def _invalidate_cache(self):
+        """Mark the scan stale and refresh through the background walker.
+        Never walks synchronously: an 11k-file folder takes ~0.2 s warm and
+        seconds cold, which froze the UI thread when called from search
+        typing or right after a conversion."""
         self._all_files_cache = None
         self._cache_root = None
-        self._refresh_available()
+        self.poll_now(force=True)
 
     @staticmethod
     def _scroll_amount(event):
@@ -1348,20 +1378,16 @@ class FileLinkerPanel(ttk.Frame):
             return []
         if self._all_files_cache is not None and self._cache_root == root:
             return self._all_files_cache
-        results, data_dir = self._scan_data_dir(root)
-        if data_dir is None:
-            # hint if data subfolder missing
-            self.hint.configure(text="No 'data' subfolder found under {}. Use File > Set Data Folder...".format(root))
-            self._all_files_cache = []
-            self._cache_root = root
-            return []
-        self._all_files_cache = results
-        self._cache_root = root
-        if os.path.basename(os.path.normpath(root)).lower() == "data":
-            self.hint.configure(text="{} .txt files found under {} (selected data folder directly)".format(len(results), data_dir))
-        else:
-            self.hint.configure(text="{} .txt files found under {}".format(len(results), data_dir))
-        return results
+        # Unknown or stale: never walk on the UI thread. Show the last known
+        # snapshot (if any) and let the background walker refresh the list.
+        self.poll_now(force=True)
+        if self._all_files_cache is not None and self._cache_root == root:
+            return self._all_files_cache
+        try:
+            self.hint.configure(text="Scanning data folder\u2026")
+        except Exception:  # noqa: BLE001 - widget may be gone
+            pass
+        return []
 
     def _refresh_available(self):
         query = self.search_var.get().strip().lower()
@@ -1452,12 +1478,16 @@ class FileLinkerPanel(ttk.Frame):
                 self.linked.append(rel)
         self._refresh_linked()
         self._refresh_available()
+        if self.on_linked_select:
+            self._fire(self.on_linked_select)
 
     def _remove_selected(self):
         for i in reversed(self.linked_list.curselection()):
             del self.linked[i]
         self._refresh_linked()
         self._refresh_available()
+        if self.on_linked_select:
+            self._fire(self.on_linked_select)
 
     def get_files(self):
         return list(self.linked)
@@ -1466,6 +1496,8 @@ class FileLinkerPanel(ttk.Frame):
         self.linked = list(files or [])
         self._refresh_linked()
         self._refresh_available()
+        if self.on_linked_select:
+            self._fire(self.on_linked_select)
 
     def clear(self):
         self.set_files([])
@@ -1492,9 +1524,11 @@ class FileLinkerPanel(ttk.Frame):
         if getattr(self, "_walk_thread", None) is not None \
                 and self._walk_thread.is_alive():
             return
-        prev = tuple(self._all_files_cache or ())
-        self._all_files_cache = None
-        self._cache_root = None
+        # Keep the previous snapshot visible while scanning (stale-until-
+        # fresh); clearing it here used to push callers of _all_files() onto
+        # a synchronous fallback walk on the UI thread.
+        prev = tuple(self._all_files_cache or ()) \
+            if self._cache_root == root else None
 
         result = {}
 
@@ -1502,24 +1536,30 @@ class FileLinkerPanel(ttk.Frame):
             try:
                 result["cur"] = self._scan_data_dir(root)
             except Exception:  # noqa: BLE001 - treat as "no change"
-                result["cur"] = ([], root)
+                result["cur"] = ([], None)
 
         th = threading.Thread(target=_compute, daemon=True, name="file-walk")
 
         def _apply():
-            res, _data_dir = result.get("cur", ([], None))
+            res, data_dir = result.get("cur", ([], None))
             if self.get_data_root() != root:
                 return                      # user switched folder mid-walk
             cur = tuple(res or [])
             self._all_files_cache = list(cur)
             self._cache_root = root
-            if cur != prev:
+            changed = prev is None or cur != prev
+            if changed:
                 self._refresh_available()
-                try:
+            try:
+                if data_dir is None:
                     self.hint.configure(
-                        text="Data folder updated - {} measurement file(s) found.".format(len(cur)))
-                except Exception:  # noqa: BLE001 - widget may be gone
-                    pass
+                        text="No 'data' subfolder found under {}. "
+                             "Use File > Set Data Folder...".format(root))
+                elif changed or not cur:
+                    self.hint.configure(
+                        text="{} .txt files found under {}".format(len(cur), data_dir))
+            except Exception:  # noqa: BLE001 - widget may be gone
+                pass
 
         def poll():
             if th.is_alive():
@@ -1768,9 +1808,32 @@ class EntryEditor(ttk.Frame):
         self.tag_panel = TagSelectorPanel(inner, fr_provider=self._fr_suggestions)
         self.tag_panel.pack(fill="x", padx=10, pady=8)
 
+        # ---- FR preview (live curves above the file linker) ----
+        fr_card = ttk.Frame(inner, style="Card.TFrame")
+        fr_card.pack(fill="x", padx=10, pady=8)
+        fr_head = ttk.Frame(fr_card, style="Card.TFrame")
+        fr_head.pack(fill="x", padx=8, pady=(8, 2))
+        ttk.Label(fr_head, text="\U0001F4C8  FR PREVIEW",
+                  style="CardHeader.TLabel").pack(side="left")
+        self.fr_legend = ttk.Label(fr_head, text="", style="Card.TLabel",
+                                   foreground=TEXT_DIM)
+        self.fr_legend.pack(side="left", padx=(12, 0))
+        self.fr_avg_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(fr_head, text="Avg", variable=self.fr_avg_var,
+                        command=self._refresh_fr_plot).pack(side="right", padx=6)
+        self.fr_overlay_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(fr_head, text="Overlay all", variable=self.fr_overlay_var,
+                        command=self._refresh_fr_plot).pack(side="right")
+        self.fr_plot = fr_plot.CurvePlot(fr_card, height=230)
+        self.fr_plot.pack(fill="both", expand=True, padx=8, pady=(2, 8))
+
         # ---- files ----
         self.file_panel = FileLinkerPanel(inner, self.app.get_data_root)
         self.file_panel.pack(fill="x", padx=10, pady=8)
+        # plot follows list interactions: linked selection -> emphasis,
+        # available browsing -> dashed ghost preview of the unlinked file
+        self.file_panel.on_linked_select = self._refresh_fr_plot
+        self.file_panel.on_available_select = self._refresh_fr_plot
 
         # ---- action buttons ----
         actions = ttk.Frame(inner, style="TFrame")
@@ -1923,6 +1986,76 @@ class EntryEditor(ttk.Frame):
         return suggs, info
 
     # -- public API ------------------------------------------------------
+    # -- FR preview plotting -------------------------------------------------
+    def _load_linked_curve(self, rel):
+        """(abs_path, raw_points) for a linked rel-path, or (None, None)."""
+        root_dir = self.app.get_data_root()
+        if not root_dir or not rel:
+            return None, None
+        try:
+            import fr_analysis as FA
+            full = FA.resolve_under_root(root_dir, rel)
+        except Exception:               # noqa: BLE001 - audit flags bad paths
+            return None, None
+        pts = fr_plot.get_curve_points(full)
+        return full, pts
+
+    def _refresh_fr_plot(self, *_args):
+        linked = self.file_panel.get_files()
+        sel = set(self.file_panel.linked_list.curselection())
+        series = []
+        names = []
+        # solid curves: linked files (overlay-all off -> only the selected one)
+        for i, rel in enumerate(linked):
+            if not self.fr_overlay_var.get():
+                if sel and i not in sel:
+                    continue
+                if not sel and series:
+                    continue             # no selection -> first curve only
+            _full, pts = self._load_linked_curve(rel)
+            norm = fr_plot.normalized(pts) if pts else []
+            if not norm:
+                continue
+            color = fr_plot.PALETTE[i % len(fr_plot.PALETTE)]
+            if sel and i in sel:
+                width = 3                 # emphasized: bold, full color
+            elif sel:
+                width = 1                 # others recede while a file is picked
+                color = fr_plot.dim(color)
+            else:
+                width = 2
+            series.append({"name": os.path.basename(rel), "pts": norm,
+                           "color": color, "width": width})
+            names.append(os.path.basename(rel))
+        # ghost: browsing the Available list previews an unlinked file dashed
+        av = self.file_panel.available_list.curselection()
+        if av and 0 <= av[0] < len(self.file_panel._available_full):
+            ghost_rel = self.file_panel._available_full[av[0]]
+            _f, gpts = self._load_linked_curve(ghost_rel)
+            gnorm = fr_plot.normalized(gpts) if gpts else []
+            if gnorm:
+                series.insert(0, {"name": "~ " + os.path.basename(ghost_rel),
+                                  "pts": gnorm, "color": TEXT_DIM,
+                                  "width": 1, "dash": (5, 3)})
+                names.insert(0, os.path.basename(ghost_rel))
+        # average of the drawn solid curves (normalized domain)
+        solids = [s["pts"] for s in series if not s.get("dash")]
+        avg = fr_plot.average(solids) if (self.fr_avg_var.get() and
+                                          len(solids) >= 2) else None
+        if not series:
+            self.fr_plot.set_data(
+                [], msg="Select a linked file - or browse the Available list "
+                        "- to preview its curve")
+            self.fr_legend.configure(text="")
+            return
+        self.fr_plot.set_data(series, avg=avg)
+        shown = [("~ " + n if i == 0 and series[0].get("dash") else n)
+                 for i, n in enumerate(names)]
+        self.fr_legend.configure(
+            text=" \u00b7 ".join(n[:26] + ("\u2026" if len(n) > 26 else "")
+                                 for n in shown[:6])
+            + ("   (+{})".format(len(shown) - 6) if len(shown) > 6 else ""))
+
     def new_entry(self):
         self.original_id = None
         self.brand_entry.set("")
@@ -1944,8 +2077,8 @@ class EntryEditor(ttk.Frame):
         self.validation_label.configure(text="")
         self.year_hint.configure(text="")
         self.price_hint.configure(text="")
-        self._baseline_is_new = True
         self._capture_baseline()
+        self._refresh_fr_plot()
 
     def load_entry(self, entry):
         self.original_id = entry.get("id")
@@ -1969,11 +2102,11 @@ class EntryEditor(ttk.Frame):
         self.tag_panel.set_tags(entry.get("tags", []))
         self.tag_panel.update_price(entry.get("price_usd", 0))
         self.file_panel.set_files(entry.get("files", []))
+        self._refresh_fr_plot()
         self.tag_panel.clear_suggestions()
         self.validation_label.configure(text="")
         self.year_hint.configure(text="")
         self.price_hint.configure(text="")
-        self._baseline_is_new = False
         self._capture_baseline()
 
         if L.ENFORCE_TWS_ZERO_SPECS and entry.get("form_factor") == L.TWS_FORM_FACTOR:
@@ -2083,6 +2216,7 @@ class AuditPanel(ttk.Frame):
         self.app = app
         self.issues = []
         self.group_by_entry = tk.BooleanVar(value=True)
+        self.show_ignored = tk.BooleanVar(value=False)
         self._row_issues = {}      # leaf iid  -> AuditIssue
         self._group_items = {}     # group iid -> [AuditIssue, ...]
 
@@ -2095,6 +2229,14 @@ class AuditPanel(ttk.Frame):
                    command=self._fix_all).pack(side="left", padx=4)
         ttk.Button(top, text="Go to Entry", command=self._goto_selected).pack(side="left", padx=4)
         ttk.Button(top, text="Export Report...", command=self._export).pack(side="left", padx=4)
+        # waiver controls: verified-true advisories (e.g. 100k-ohm electrostatics)
+        # can be silenced permanently without touching the database itself
+        ttk.Button(top, text="Ignore Selected", command=self._ignore_selected
+                   ).pack(side="left", padx=4)
+        ttk.Button(top, text="Un-ignore Selected", command=self._unignore_selected
+                   ).pack(side="left", padx=4)
+        ttk.Checkbutton(top, text="Show ignored", variable=self.show_ignored,
+                        command=self.rerender).pack(side="left", padx=(14, 4))
         ttk.Checkbutton(top, text="Group by entry", variable=self.group_by_entry,
                         command=self.rerender).pack(side="left", padx=(14, 4))
         self.summary_label = ttk.Label(top, text="No audit run yet.", style="TLabel")
@@ -2134,6 +2276,7 @@ class AuditPanel(ttk.Frame):
         self.tree.tag_configure("error", foreground=ACCENT_RED)
         self.tree.tag_configure("warning", foreground=ACCENT_ORANGE)
         self.tree.tag_configure("info", foreground=TEXT_DIM)
+        self.tree.tag_configure("waived", foreground="#5a6478")
         self.tree.bind("<Double-1>", self._on_issue_activate)
         self.tree.bind("<Return>", self._on_issue_activate)
 
@@ -2180,22 +2323,37 @@ class AuditPanel(ttk.Frame):
             return (str(v).lower(),)
         return sorted(iss, key=key, reverse=self._sort_desc)
 
+    def _waived(self, iss):
+        return iss.waiver_key() in getattr(self.app, "waivers", set())
+
+    def _display_issues(self):
+        """Sorted issues, minus waived ones unless 'Show ignored' is on."""
+        iss = self._sorted_issues()
+        if self.show_ignored.get():
+            return iss
+        return [i for i in iss if not self._waived(i)]
+
     def show_issues(self, issues):
         self.issues = list(issues)
         self.rerender()
-        errors = sum(1 for i in issues if i.severity == "error")
-        warnings = sum(1 for i in issues if i.severity == "warning")
-        infos = sum(1 for i in issues if i.severity == "info")
-        self.summary_label.configure(
-            text="{} issues found  ({} errors, {} warnings, {} info)".format(
-                len(issues), errors, warnings, infos))
+        live = [i for i in issues if not self._waived(i)]
+        hidden = len(issues) - len(live)
+        errors = sum(1 for i in live if i.severity == "error")
+        warnings = sum(1 for i in live if i.severity == "warning")
+        infos = sum(1 for i in live if i.severity == "info")
+        text = "{} issues found  ({} errors, {} warnings, {} info)".format(
+            len(live), errors, warnings, infos)
+        if hidden:
+            text += "   \u00b7   {} ignored (tick 'Show ignored')".format(hidden)
+        self.summary_label.configure(text=text)
 
     def rerender(self):
         """Render the current issue list either flat or grouped by entry.
         Grouping coalesces ALL issues sharing the same entry signature into
         one parent (regardless of adjacency after sorting); file-level rows
         (summaries / unlinked files) always stay top-level. Display order
-        follows the active column sort."""
+        follows the active column sort. Waived issues are hidden unless
+        'Show ignored' is ticked (then rendered dim with an [ignored] mark)."""
         self.tree.delete(*self.tree.get_children())
         self._row_issues.clear()
         self._group_items.clear()
@@ -2204,15 +2362,24 @@ class AuditPanel(ttk.Frame):
             return (not isinstance(iss.entry_index, int) or iss.entry_index < 0
                     or iss.entry_id in ("(none)", "(summary)"))
 
-        ordered = self._sorted_issues()
+        ordered = self._display_issues()
+
+        def row_values(iss, category=None):
+            cat = iss.category if category is None else category
+            if self._waived(iss):
+                cat += "  [ignored]"
+            return (cat, iss.entry_id, iss.message,
+                    "Yes" if iss.fix else "No")
 
         if not self.group_by_entry.get():
             for n, iss in enumerate(ordered):
                 iid = "i{}".format(n)
                 self._row_issues[iid] = iss
-                self.tree.insert("", "end", iid=iid, values=(
-                    iss.category, iss.entry_id, iss.message,
-                    "Yes" if iss.fix else "No"), tags=(iss.severity,), open=True)
+                tags = (iss.severity,)
+                if self._waived(iss):
+                    tags = (iss.severity, "waived")
+                self.tree.insert("", "end", iid=iid, values=row_values(iss),
+                                 tags=tags, open=True)
             return
 
         # Coalesce by entry signature, preserving first-seen display order;
@@ -2235,10 +2402,10 @@ class AuditPanel(ttk.Frame):
                 for iss in items:
                     iid = "i{}".format(seq); seq += 1
                     self._row_issues[iid] = iss
-                    self.tree.insert("", "end", iid=iid, values=(
-                        iss.category, iss.entry_id, iss.message,
-                        "Yes" if iss.fix else "No"), tags=(iss.severity,),
-                        open=True)
+                    tags = (iss.severity, "waived") if self._waived(iss) \
+                        else (iss.severity,)
+                    self.tree.insert("", "end", iid=iid, values=row_values(iss),
+                                     tags=tags, open=True)
                 continue
             worst = min(items, key=lambda i: self._SEV_RANK.get(i.severity, 9))
             nfix = sum(1 for i in items if i.fix)
@@ -2246,8 +2413,12 @@ class AuditPanel(ttk.Frame):
             msg = worst.message
             if len(msg) > 140:
                 msg = msg[:139] + "\u2026"
+            n_ign = sum(1 for i in items if self._waived(i))
+            gcat = "{} issue(s)".format(len(items))
+            if n_ign:
+                gcat += "  [{} ignored]".format(n_ign)
             parent = self.tree.insert("", "end", iid=gid, values=(
-                "{} issue(s)".format(len(items)), worst.entry_id,
+                gcat, worst.entry_id,
                 msg + ("   [+]" if len(items) > 1 else ""),
                 "{}/{} auto".format(nfix, len(items))),
                 tags=(worst.severity,), open=False)
@@ -2255,9 +2426,61 @@ class AuditPanel(ttk.Frame):
             for iss in items:
                 iid = "i{}".format(seq); seq += 1
                 self._row_issues[iid] = iss
-                self.tree.insert(parent, "end", iid=iid, values=(
-                    iss.category, "", iss.message,
-                    "Yes" if iss.fix else "No"), tags=(iss.severity,))
+                tags = (iss.severity, "waived") if self._waived(iss) \
+                    else (iss.severity,)
+                self.tree.insert(parent, "end", iid=iid, values=row_values(iss),
+                                 tags=tags)
+
+    # ------------------------------------------------------------------
+    # waiver actions
+    # ------------------------------------------------------------------
+    def _ignore_selected(self):
+        chosen = self._issues_for_selection()
+        if not chosen:
+            messagebox.showinfo(APP_TITLE,
+                                "Select one or more issue rows first, then "
+                                "click 'Ignore Selected'.")
+            return
+        waived = getattr(self.app, "waivers", None)
+        if waived is None:
+            return
+        added = blocked = 0
+        for iss in chosen:
+            if iss.severity == "error":
+                blocked += 1        # errors are real rule violations: stay
+                continue
+            key = iss.waiver_key()
+            if key not in waived:
+                waived.add(key)
+                added += 1
+        if added:
+            self.app.save_waivers()
+        self.rerender()
+        self.show_issues(self.issues)
+        note = "  ({} error-level issue(s) cannot be ignored)".format(blocked) \
+            if blocked else ""
+        self.app.status_var.set(
+            "Ignored {} issue(s) - they will not be flagged again on future "
+            "audits.{}".format(added, note))
+
+    def _unignore_selected(self):
+        waived = getattr(self.app, "waivers", None)
+        if waived is None:
+            return
+        chosen = self._issues_for_selection()
+        removed = 0
+        for iss in chosen:
+            key = iss.waiver_key()
+            if key in waived:
+                waived.discard(key)
+                removed += 1
+        if removed:
+            self.app.save_waivers()
+        self.rerender()
+        self.show_issues(self.issues)
+        if removed:
+            self.app.status_var.set(
+                "Restored {} issue(s) to the active audit list.".format(removed))
 
     # ------------------------------------------------------------------
     # selection helpers
@@ -2298,7 +2521,10 @@ class AuditPanel(ttk.Frame):
         return None   # group header: let Treeview expand/collapse natively
 
     def _fix_all(self):
-        fixable = [i for i in self.issues if i.fix]
+        # waived issues are deliberately left alone by Fix All: the user
+        # said they are fine as-is (explicit selection still can fix them)
+        fixable = [i for i in self.issues
+                   if i.fix and not self._waived(i)]
         if not fixable:
             messagebox.showinfo(APP_TITLE, "No auto-fixable issues found.")
             return
@@ -2321,8 +2547,10 @@ class AuditPanel(ttk.Frame):
                 f.write("IEM Database Audit Report - {}\n".format(datetime.datetime.now()))
                 f.write("=" * 70 + "\n")
                 for issue in self.issues:
-                    f.write("[{}] {} :: {} :: {}\n".format(
-                        issue.severity.upper(), issue.category, issue.entry_id, issue.message))
+                    mark = " [ignored]" if self._waived(issue) else ""
+                    f.write("[{}] {} :: {} :: {}{}\n".format(
+                        issue.severity.upper(), issue.category,
+                        issue.entry_id, issue.message, mark))
         except OSError as e:
             messagebox.showerror(APP_TITLE, "Could not write report:\n{}".format(e))
             return
@@ -2506,6 +2734,9 @@ class MainApp(tk.Tk):
         self.data_root = None
         self.dirty = False
         self.editing_index = None  # index into self.entries currently loaded in editor, or None for "new"
+        # waived audit findings ("Ignore Selected" in the Audit tab);
+        # persisted in audit_waivers.json beside the database file
+        self.waivers = set()
 
         # undo/redo history (chronological ops; redo holds undone ops)
         self.history = []          # applied ops, oldest first
@@ -2597,7 +2828,11 @@ class MainApp(tk.Tk):
             self._as_thread = None
 
         with self._as_lock:
-            self._as_pending = (self.db_path, list(self.entries))
+            # Independent entry copies: the autosave worker serializes these
+            # on a background thread while the UI may commit edits to the
+            # live dicts (same rationale as the Export tab's snapshots).
+            self._as_pending = (self.db_path,
+                                [L.build_clean_entry(e) for e in self.entries])
 
         if self._as_thread is not None and self._as_thread.is_alive():
             return                      # worker will pick up the newest pending
@@ -2840,7 +3075,10 @@ class MainApp(tk.Tk):
                     self.after_cancel(self._search_debounce_id)
                 except Exception:
                     pass
-            self._search_debounce_id = self.after(150, self.populate_tree)
+            # populate_tree rebuilds every row; measured ~37 ms per 10k
+            # entries, so coalescing keystroke bursts keeps large databases
+            # smooth while staying responsive.
+            self._search_debounce_id = self.after(220, self.populate_tree)
         self.search_var.trace_add("write", _on_search_change)
 
         paned = ttk.PanedWindow(self, orient="horizontal")
@@ -2850,7 +3088,11 @@ class MainApp(tk.Tk):
         left = ttk.Frame(paned, style="Panel.TFrame")
         paned.add(left, weight=1)
 
-        ttk.Label(left, text="DATABASE ENTRIES", style="Header.TLabel").pack(anchor="w", padx=8, pady=(8, 4))
+        # live entry counter in the tree header (kept current by
+        # populate_tree, which runs after every add/delete/undo/fix/load)
+        self.entries_header_var = tk.StringVar(value="DATABASE ENTRIES  (0)")
+        ttk.Label(left, textvariable=self.entries_header_var,
+                  style="Header.TLabel").pack(anchor="w", padx=8, pady=(8, 4))
         tree_frame = ttk.Frame(left, style="Panel.TFrame")
         tree_frame.pack(fill="both", expand=True, padx=8, pady=4)
         tree_frame.rowconfigure(0, weight=1)
@@ -3007,6 +3249,7 @@ class MainApp(tk.Tk):
         self.entries = entries
         self.db_path = path
         self.data_root = os.path.dirname(os.path.abspath(path))
+        self.waivers = L.load_waivers(path)
         self.dirty = False
         self.editing_index = None
         self.editor.new_entry()
@@ -3070,6 +3313,14 @@ class MainApp(tk.Tk):
     def get_data_root(self):
         return self.data_root
 
+    def save_waivers(self):
+        """Persist the Audit tab's ignored-issue list beside the database."""
+        if self.db_path:
+            try:
+                L.save_waivers(self.db_path, self.waivers)
+            except OSError as e:
+                L.log("Waiver save failed: {}".format(e))
+
     def _on_tab_changed(self, _event=None):
         """Auto-freshness hooks:
         - entering the Audit tab with unsaved-audit mutations -> silent rerun
@@ -3113,11 +3364,12 @@ class MainApp(tk.Tk):
         if not self.entries:
             messagebox.showwarning(APP_TITLE, "Nothing to save -- no database loaded.")
             return
-        try:
-            issues = L.run_full_audit(self.entries, self.data_root)
-        except Exception as e:
-            messagebox.showwarning(APP_TITLE, "Audit failed before save:\n{}".format(e))
-            issues = []
+        # Advisory gate only: reuse the freshest cached audit results instead
+        # of re-running the full audit (incl. a data-folder walk) on the UI
+        # thread every save. The Audit tab auto-refreshes on mutations, so
+        # stale results simply mean "no prompt", never a wrong save.
+        issues = [] if getattr(self, "_audit_dirty", True) \
+            else list(getattr(self.audit_panel, "issues", []) or [])
         blocking = [i for i in issues if i.severity == "error"]
         dup_ids = {}
         for idx, e in enumerate(self.entries):
@@ -3173,7 +3425,19 @@ class MainApp(tk.Tk):
             messagebox.showerror(APP_TITLE, "Unexpected error while saving:\n{}".format(e))
             return
         self.entries = ordered
+        # Adopt the saved file as the working database so autosave backups,
+        # crash recovery, pre-overwrite snapshots, waiver storage and the
+        # overwrite-original check all track the file the user actually
+        # keeps editing. data_root is deliberately left alone: measurements
+        # stay where they are, and relinking is an explicit action.
+        self.db_path = path
         self.dirty = False
+        # carry any audit waivers along to the saved location so the edited
+        # database keeps its ignored-findings list
+        try:
+            L.save_waivers(path, self.waivers)
+        except OSError:
+            pass
         # FIX C6: everything is committed to disk now -- do not offer the
         # pre-save autosave as "recovery" on the next launch.
         L.mark_autosave_seen(self.db_path)
@@ -3205,7 +3469,36 @@ class MainApp(tk.Tk):
     # ------------------------------------------------------------------
     # TREE / SELECTION
     # ------------------------------------------------------------------
-    def populate_tree(self):
+    def populate_tree(self, restore_selection=True):
+        # Cancel any pending search-debounce rebuild: every mutation
+        # funnels through here, so the state we are rendering right now is
+        # the freshest. Without this, a queued debounce could fire AFTER a
+        # commit/undo/delete/reveal and repopulate the tree over a freshly
+        # made selection (same hazard reveal_entry already guards against).
+        if getattr(self, "_search_debounce_id", None):
+            try:
+                self.after_cancel(self._search_debounce_id)
+            except Exception:
+                pass
+            self._search_debounce_id = None
+        # header always shows the TOTAL database size, never the filtered view
+        self.entries_header_var.set("DATABASE ENTRIES  ({:,})".format(len(self.entries)))
+        # preserve the user's place across rebuilds: expanded brands, scroll
+        # position, and (when the row didn't move) the selected entry
+        prev_open = {iid for iid in self.tree.get_children("")
+                     if self.tree.item(iid, "open")}
+        try:
+            prev_scroll = self.tree.yview()[0]
+        except Exception:
+            prev_scroll = 0.0
+        prev_sel = self.tree.selection()
+        prev_sel_iid = prev_sel[0] if prev_sel else None
+        prev_sel_id = None
+        if prev_sel_iid and prev_sel_iid.startswith("entry:"):
+            try:
+                prev_sel_id = self.entries[int(prev_sel_iid.split(":", 1)[1])].get("id")
+            except Exception:
+                prev_sel_id = None
         self.tree.delete(*self.tree.get_children())
         self._full_labels = {}
         query = self.search_var.get().strip().lower()
@@ -3230,6 +3523,31 @@ class MainApp(tk.Tk):
                 iid = "entry:{}".format(idx)
                 self._full_labels[iid] = label
                 self.tree.insert(node, "end", iid=iid, text=label)
+        # restore what we captured (only where still valid after rebuild)
+        for iid in self.tree.get_children(""):
+            if iid in prev_open:
+                self.tree.item(iid, open=True)
+        if 0.0 < prev_scroll < 1.0:
+            try:
+                self.tree.yview_moveto(prev_scroll)
+            except Exception:
+                pass
+        if restore_selection and prev_sel_iid:
+            sel_ok = False
+            if prev_sel_iid.startswith("entry:") and prev_sel_id is not None \
+                    and self.tree.exists(prev_sel_iid):
+                # same list slot must still hold the same entry, otherwise
+                # indices shifted and silently re-selecting would be wrong
+                try:
+                    same = self.entries[
+                        int(prev_sel_iid.split(":", 1)[1])].get("id") == prev_sel_id
+                    if same:
+                        self.tree.selection_set(prev_sel_iid)
+                        sel_ok = True
+                except Exception:
+                    sel_ok = False
+            if not sel_ok and prev_sel_iid.startswith("entry:"):
+                pass    # row moved/gone: caller decides what to highlight
         self._apply_ellipsis()
 
     # -- overflow handling for the database tree ---------------------------
@@ -3392,7 +3710,10 @@ class MainApp(tk.Tk):
         self.editing_index = None
         self._selected_iid = None
         self.editor.new_entry()
-        self.populate_tree()
+        # restore_selection=False: the deleted row's index was consumed by
+        # the list shift, so re-selecting "the same iid" would load whatever
+        # neighbor slid into it. Expansion + scroll still come back.
+        self.populate_tree(restore_selection=False)
         self.status_var.set("Deleted entry '{}'. {} entries remain (unsaved).".format(e.get("id"), len(self.entries)))
         self._notify_db_changed()
         self._record_op("delete", "Deleted entry '{}' ({} {})".format(
@@ -3405,14 +3726,10 @@ class MainApp(tk.Tk):
 
     def validate_and_commit(self, entry, original_id):
         editor = self.editor
-        baseline_new = bool(getattr(editor, "_baseline_is_new", False))
         editing = self.editing_index is not None \
             and 0 <= self.editing_index < len(self.entries)
 
-        treat_as_add = editing and baseline_new \
-            and entry["id"] != self.entries[self.editing_index].get("id")
-
-        if editing and not treat_as_add:
+        if editing:
             old_id = self.entries[self.editing_index].get("id")
             if entry["id"] != old_id:
                 ok = messagebox.askyesno(
@@ -3421,21 +3738,17 @@ class MainApp(tk.Tk):
                     "form data for '{}'?".format(old_id, entry["id"]))
                 if not ok:
                     return ["Cancelled - '{}' was left unchanged.".format(old_id)]
-
-        if editing and not treat_as_add:
             existing_ids = {e.get("id") for i, e in enumerate(self.entries)
                             if i != self.editing_index}
         else:
-            editing_for_dup = self.editing_index if (editing and not treat_as_add) else None
-            existing_ids = {e.get("id") for i, e in enumerate(self.entries)
-                            if editing_for_dup is None or i != editing_for_dup}
+            existing_ids = {e.get("id") for e in self.entries}
 
         errors = L.validate_entry(entry, existing_ids=existing_ids, exclude_id=None)
         if errors:
             return errors
         clean = L.build_clean_entry(entry)
 
-        if editing and not treat_as_add:
+        if editing:
             idx = self.editing_index
             old_obj = self.entries[idx]
             old_copy = self._deepcopy(old_obj)
@@ -3458,7 +3771,6 @@ class MainApp(tk.Tk):
                 "ref_after": clean, "copy_after": self._deepcopy(clean),
             }])
 
-        editor._baseline_is_new = False          # future saves EDIT this entry
         editor.original_id = clean["id"]
         editor._capture_baseline()               # committed state == new baseline
         for key in ("brand", "model", "variant"):

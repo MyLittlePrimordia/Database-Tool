@@ -196,10 +196,10 @@ class ToolsPanel(ttk.Frame):
 
     def _require_source(self):
         """Ensure app.entries has content; offer to load a file otherwise.
-        The load must go through the SAME state reset as File > Open (tree,
-        spell vocab, undo history, editor form, panels) -- swapping
-        app.entries in place here used to leave stale history ops and a
-        desynced UI behind."""
+        Loading goes through MainApp._load_from_path so it gets the SAME
+        treatment as File > Open: crash-recovery prompt, coercion notes,
+        waiver loading, spell vocab, tree rebuild, and a post-load audit --
+        swapping app.entries in place here used to leave all of that out."""
         if getattr(self.app, "entries", None):
             return None
         path = filedialog.askopenfilename(
@@ -207,32 +207,9 @@ class ToolsPanel(ttk.Frame):
             filetypes=[("JSON database", "*.json"), ("All files", "*.*")])
         if not path:
             return "cancel"
-        try:
-            loaded, _notes = L.load_database(path)
-        except Exception as e:  # noqa: BLE001
-            messagebox.showerror(APP_TITLE_REF, "Could not load:\n{}".format(e))
-            return "cancel"
-        app = self.app
-        app.entries = loaded
-        if not app.db_path:
-            app.db_path = path
-        if hasattr(app, "data_root"):
-            app.data_root = os.path.dirname(os.path.abspath(path))
-        app.dirty = False
-        app.editing_index = None
-        # unsaved-change history cannot refer across databases
-        del app.history[:]
-        del app.redo_stack[:]
-        try:
-            app.editor.new_entry()
-        except Exception:  # noqa: BLE001 - editor may not exist yet in tests
-            pass
-        if hasattr(app, "refresh_spell_vocab"):
-            app.refresh_spell_vocab()
-        if hasattr(app, "populate_tree"):
-            app.populate_tree()
-        if hasattr(app, "_notify_db_changed"):
-            app._notify_db_changed()
+        self.app._load_from_path(path)
+        if not getattr(self.app, "entries", None):
+            return "cancel"     # load failed (error dialog already shown)
         self.refresh_state()
         return None
 
@@ -279,7 +256,12 @@ class ToolsPanel(ttk.Frame):
                     APP_TITLE_REF,
                     "{} already exists.\n\nOverwrite it?".format(gz_target)):
                 return
-        snapshot = list(self.app.entries)
+        # Independent copies: the worker thread serializes these while the
+        # UI thread may commit edits to the live entry dicts. A shallow
+        # list copy used to share the dicts, so an export could capture a
+        # half-applied logical state. build_clean_entry returns a fresh,
+        # schema-ordered dict with new tags/files lists.
+        snapshot = [L.build_clean_entry(e) for e in self.app.entries]
         dirty = getattr(self.app, "dirty", False)
         self.compress_btn.state(["disabled"])
 
@@ -313,7 +295,9 @@ class ToolsPanel(ttk.Frame):
         except Exception:  # noqa: BLE001
             messagebox.showerror(APP_TITLE_REF, "Max tokens must be a number >= 100.")
             return
-        snapshot = list(self.app.entries)
+        # Independent copies -- see _run_compress (worker thread must not
+        # serialize dicts the UI thread may mutate mid-run).
+        snapshot = [L.build_clean_entry(e) for e in self.app.entries]
         self.split_btn.state(["disabled"])
 
         def work():

@@ -112,6 +112,7 @@ class SpellChecker:
         self._ranks = {}          # word -> common-rank (lower == more common)
         self._dynamic = set()     # vocab derived from the loaded database
         self._pool_cache = None   # cached small-pool buckets for fast suggestions
+        self._sorted_known = None  # cached sorted(self._known) for deterministic scans
         self._flag_cache = {}     # memoized per-token flag results
         self._full_loaded = False
         self._ready = False
@@ -121,33 +122,43 @@ class SpellChecker:
     # Dictionary loading
     # ------------------------------------------------------------------
     def load_sync(self):
+        """Read both dictionary files OUTSIDE the lock (a 4 MB word list can
+        take hundreds of ms on slow disks; holding the lock that long stalled
+        UI-thread callers such as add_vocab), then merge under the lock."""
         base = self._base()
         cpath = os.path.join(base, "assets", "spell", "common_english.txt")
         fpath = os.path.join(base, "assets", "spell", "full_english.txt")
+        local_ranks = {}
+        rank = 0
+        try:
+            with open(cpath, "r", encoding="utf-8") as f:
+                for line in f:
+                    w = line.strip().lower()
+                    if w and w not in local_ranks:
+                        local_ranks[w] = rank
+                        rank += 1
+        except OSError:
+            pass
+        local_full = set()
+        try:
+            with open(fpath, "r", encoding="utf-8") as f:
+                for line in f:
+                    w = line.strip()
+                    if w:
+                        local_full.add(w)
+        except OSError:
+            pass
         with self._lock:
-            try:
-                with open(cpath, "r", encoding="utf-8") as f:
-                    rank = 0
-                    for line in f:
-                        w = line.strip().lower()
-                        if w and w not in self._ranks:
-                            self._ranks[w] = rank
-                            rank += 1
-                            self._known.add(w)
-            except OSError:
-                pass
-            try:
-                with open(fpath, "r", encoding="utf-8") as f:
-                    for line in f:
-                        w = line.strip()
-                        if w:
-                            self._known.add(w)
-            except OSError:
-                pass
+            for w, r in local_ranks.items():
+                if w not in self._ranks:
+                    self._ranks[w] = r
+                    self._known.add(w)
+            self._known.update(local_full)
             self._known.update(self._dynamic)
             self._full_loaded = True
             self._ready = True
             self._pool_cache = None
+            self._sorted_known = None
             self._flag_cache = {}
 
     def load_async(self):
@@ -188,14 +199,11 @@ class SpellChecker:
             dyn.update(self._vocab_keys(text))
         with self._lock:
             self._dynamic = dyn
-            if self._ready:
-                # rebuild combined set cheaply: remove old dynamic members?
-                pass
-        # simplest correct approach: union into known (stale entries from a
-        # previously loaded DB only cause *fewer* false flags, never errors)
-        with self._lock:
+            # Stale entries from a previously loaded DB only cause *fewer*
+            # false flags, never errors, so union into known.
             self._known.update(dyn)
             self._pool_cache = None
+            self._sorted_known = None
             self._flag_cache = {}
 
     def add_vocab(self, text):
@@ -205,6 +213,7 @@ class SpellChecker:
             self._dynamic.update(keys)
             self._known.update(keys)
             self._pool_cache = None
+            self._sorted_known = None
             self._flag_cache = {}
 
     # ------------------------------------------------------------------
@@ -290,12 +299,20 @@ class SpellChecker:
     # ------------------------------------------------------------------
     def _full_dict_scan(self, core, budget=SUGGEST_TIME_BUDGET):
         """On-demand scan of the full bundled dictionary, pruned by length
-        and character-bigram overlap, under a wall-clock budget."""
+        and character-bigram overlap, under a wall-clock budget.
+
+        Iterates a cached sorted snapshot of the dictionary so suggestion
+        sets are deterministic across runs (plain set iteration order is
+        not). Yields (word, distance) pairs so callers never recompute the
+        distance."""
         found = []
         bigrams = {core[i:i + 2] for i in range(len(core) - 1)}
+        if self._sorted_known is None:
+            self._sorted_known = sorted(self._known)
+        words = self._sorted_known
         start = time.time()
         checked = 0
-        for w in self._known:
+        for w in words:
             checked += 1
             # F-C8: check far more often so worst-case stall stays small,
             # and stop once we already have plenty of candidates.
@@ -309,8 +326,9 @@ class SpellChecker:
                 wb = {w[i:i + 2] for i in range(len(w) - 1)}
                 if not wb & bigrams:
                     continue
-            if damerau_distance(core, w) <= MAX_DIST:
-                found.append(w)
+            d = damerau_distance(core, w)
+            if d <= MAX_DIST:
+                found.append((w, d))
                 if time.time() - start > budget:
                     break
         return found
@@ -327,11 +345,8 @@ class SpellChecker:
         dists = dict(self._fast_candidates(core, exclude=core))
         remaining = deadline - time.time()
         if len(dists) < limit and self._full_loaded and remaining > 0.01:
-            for w in self._full_dict_scan(core, budget=remaining):
-                if w == core or w in dists:
-                    continue
-                d = damerau_distance(core, w)
-                if d <= MAX_DIST:
+            for w, d in self._full_dict_scan(core, budget=remaining):
+                if w != core and w not in dists:
                     dists[w] = d
                 if time.time() > deadline:
                     break

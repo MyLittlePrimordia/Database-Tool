@@ -227,15 +227,29 @@ def interp_spl(freqs, spls, target_freqs):
     return out
 
 
+def overlap_bounds(row_lists):
+    """Common frequency band covered by EVERY curve in `row_lists`.
+    Rows must be frequency-sorted ascending (parse_curve_file guarantees
+    this). Returns (lo, hi); lo > hi means the curves do not overlap."""
+    return (max(rows[0][0] for rows in row_lists),
+            min(rows[-1][0] for rows in row_lists))
+
+
 def pair_mismatch_severity(rows_a, rows_b):
     """Mean absolute SPL difference between two curves over their
     overlapping frequency range. A real stereo pair (or two repeat
     measurement passes) differs by a fraction of a dB on average; two
     genuinely different measurements that merely share a "<name> 1"/
     "<name> 2" filename pattern typically differ by many dB.
-    """
-    freqs_a = [r[0] for r in rows_a]
-    spls_a = [r[1] for r in rows_a]
+    Disjoint ranges -> inf (definitely not the same measurement)."""
+    lo, hi = overlap_bounds([rows_a, rows_b])
+    if lo > hi:
+        return float("inf")
+    # Index [0]/[1] rather than unpacking: parse_curve_file rows are
+    # (freq, spl, phase_or_None) triples.
+    grid = [(r[0], r[1]) for r in rows_a if lo <= r[0] <= hi]
+    freqs_a = [f for f, _s in grid]
+    spls_a = [s for _f, s in grid]
     freqs_b = [r[0] for r in rows_b]
     spls_b = [r[1] for r in rows_b]
     interp_b_on_a = interp_spl(freqs_b, spls_b, freqs_a)
@@ -245,10 +259,17 @@ def pair_mismatch_severity(rows_a, rows_b):
 
 def average_group(file_rows_list):
     """Average multiple parsed curves (list of row-lists) onto a common
-    frequency grid (the grid of the first file). Returns list of
-    (freq, avg_spl) tuples.
-    """
-    base_freqs = [r[0] for r in file_rows_list[0]]
+    frequency grid (the first file's grid restricted to the band covered
+    by ALL sources). Restricting to the overlap prevents endpoint-clamp
+    extrapolation from silently fabricating averaged values outside a
+    shorter curve's measured range. Returns list of (freq, avg_spl)
+    tuples; [] when the ranges are disjoint."""
+    lo, hi = overlap_bounds(file_rows_list)
+    if lo > hi:
+        return []
+    base_freqs = [r[0] for r in file_rows_list[0] if lo <= r[0] <= hi]
+    if not base_freqs:
+        return []
     all_spls = []
     for rows in file_rows_list:
         freqs = [r[0] for r in rows]
@@ -348,7 +369,12 @@ def convert_plan(plan, out_path, log=print):
 
     if plan.averaged and len(good) == 2:
         mismatch = pair_mismatch_severity(good[0][1], good[1][1])
-        if mismatch > PAIR_MISMATCH_WARN_DB:
+        if mismatch == float("inf"):
+            # Disjoint frequency ranges: cannot be the same measurement.
+            log("[SKIPPED] {}  (no overlapping frequency range - "
+                 "converting each file separately)".format(plan.key.upper()))
+            plan.averaged = False
+        elif mismatch > PAIR_MISMATCH_WARN_DB:
             # Filenames look like a pair, but the actual curves are too
             # different to plausibly be two channels/passes of the same
             # unit - fall back to converting each file separately.
@@ -360,12 +386,20 @@ def convert_plan(plan, out_path, log=print):
         else:
             try:
                 averaged = average_group([rows for _p, rows in good])
-                write_output(out_path, averaged)
-                log("[OK]      {}  <-  averaged {} + {}".format(
-                    os.path.basename(out_path),
-                    os.path.basename(good[0][0]),
-                    os.path.basename(good[1][0])))
-                return [out_path]
+                if not averaged:
+                    # Defensive: ranges overlapped for the mismatch check
+                    # but produced no common grid points.
+                    log("[SKIPPED] {}  (no overlapping frequency range - "
+                         "converting each file separately)".format(
+                             plan.key.upper()))
+                    plan.averaged = False
+                else:
+                    write_output(out_path, averaged)
+                    log("[OK]      {}  <-  averaged {} + {}".format(
+                        os.path.basename(out_path),
+                        os.path.basename(good[0][0]),
+                        os.path.basename(good[1][0])))
+                    return [out_path]
             except Exception:  # noqa: BLE001
                 err = traceback.format_exc(limit=1).strip().splitlines()[-1]
                 log("[FAILED]  {}  ({})".format(os.path.basename(out_path), err))
