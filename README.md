@@ -95,6 +95,7 @@ Build scripts are included in the repository:
 chmod +x build_macos.sh build_linux_appimage.sh
 ./build_macos.sh
 ./build_linux_appimage.sh
+```
 
 ---
 
