@@ -1,4 +1,4 @@
-"""
+﻿"""
 fr_plot.py -- lightweight FR curve plotting for the Database Tool.
 
 A pure-tkinter canvas plotter (no matplotlib / zero new dependencies) used
@@ -23,14 +23,18 @@ import bisect
 import math
 import tkinter as tk
 
-from theme import (BG_INPUT, BORDER, BORDER_LIGHT, TEXT_DIM, TEXT_MAIN,
-                   ACCENT_BLUE, ACCENT_GREEN, ACCENT_ORANGE, ACCENT_PURPLE,
-                   ACCENT_RED, pick_font_family)
+import theme
 
 FMIN = 20.0
 FMAX = 20000.0
+# Default Y window -- used only when there is no data to autoscale from
+# (empty state). With data, the window adapts to the curve (see
+# _nice_bounds) so curves fill the plot like squig.link instead of
+# swimming in a fixed 50 dB frame.
 DB_MIN = -30.0
 DB_MAX = 20.0
+DB_WINDOW_FLOOR = 20.0     # never zoom tighter than this many dB total
+DB_PAD = 3.0               # headroom above/below the data, in dB
 
 # log-frequency mapping constants (squig.link style: each decade of
 # 20-100-1k-10k gets an equal third of the plot width)
@@ -53,7 +57,26 @@ def frac_to_f(t):
     t = max(0.0, min(1.0, t))
     return 10.0 ** (_LOG_MIN + t * _LOG_SPAN)
 
-PALETTE = [ACCENT_BLUE, ACCENT_GREEN, ACCENT_ORANGE, ACCENT_PURPLE, ACCENT_RED]
+
+def _nice_bounds(lo, hi):
+    """squig.link-style adaptive Y window: pad the data range, round
+    outward to the nearest 5 dB and enforce a minimum span so a near-flat
+    curve is not blown up into visual noise."""
+    lo -= DB_PAD
+    hi += DB_PAD
+    if hi - lo < DB_WINDOW_FLOOR:
+        mid = (hi + lo) / 2.0
+        lo = mid - DB_WINDOW_FLOOR / 2.0
+        hi = mid + DB_WINDOW_FLOOR / 2.0
+    lo = max(-60.0, 5.0 * math.floor(lo / 5.0))
+    hi = min(40.0, 5.0 * math.ceil(hi / 5.0))
+    return lo, hi
+
+def palette():
+    """Curve colors, resolved at call time so theme switches re-palette
+    the next redraw (the accent color is per-theme)."""
+    return [theme.ACCENT_BLUE, theme.ACCENT_GREEN, theme.ACCENT_ORANGE,
+            theme.ACCENT_PURPLE, theme.ACCENT_RED]
 
 # parsed-curve cache: abspath -> (mtime_ns, size, [(f, db), ...])
 _CACHE = {}
@@ -77,7 +100,7 @@ def blend(a, b, t):
 
 def dim(color, t=0.55):
     """Fade a curve color into the plot background (fake alpha for tk)."""
-    return blend(color, BG_INPUT, t)
+    return blend(color, theme.BG_INPUT, t)
 
 
 # ---------------------------------------------------------------------------
@@ -203,17 +226,25 @@ class CurvePlot(tk.Canvas):
     PAD_B = 24
 
     def __init__(self, parent, height=230, **kw):
-        super().__init__(parent, bg=BG_INPUT, highlightthickness=1,
-                         highlightbackground=BORDER, height=height, **kw)
+        super().__init__(parent, bg=theme.BG_INPUT, highlightthickness=1,
+                         highlightbackground=theme.BORDER, height=height, **kw)
         self._series = []
         self._avg = None
         self._msg = ""
         # (freqs, dbs, color) per solid series, precomputed once per redraw
         # so the <Motion> handler never re-zips full point lists per event.
         self._hover_data = []
-        family = pick_font_family()
-        self._font_small = (family, 8)
+        self._font_small = theme.font(12)
         self.bind("<Configure>", lambda e: self.redraw(), add="+")
+        # live retheme: redraw with the new palette (unhooked on destroy)
+        theme.add_retheme_hook(self.redraw)
+
+    def destroy(self):
+        try:
+            theme.remove_retheme_hook(self.redraw)
+        except Exception:
+            pass
+        super().destroy()
 
     # public API -----------------------------------------------------------
     def set_data(self, series, avg=None, msg=""):
@@ -236,27 +267,50 @@ class CurvePlot(tk.Canvas):
         x0, x1 = self.PAD_L, w - self.PAD_R
         y0, y1 = self.PAD_T, h - self.PAD_B
 
+        # adaptive Y window: autoscale to the plotted data (snapped to
+        # 5 dB) so curves fill the vertical space like squig.link
+        all_d = [d for s in self._series for _, d in s["pts"]]
+        if self._avg:
+            all_d += [d for _, d in self._avg]
+        if all_d:
+            db_min, db_max = _nice_bounds(min(all_d), max(all_d))
+        else:
+            db_min, db_max = DB_MIN, DB_MAX
+        self._db_min, self._db_max = db_min, db_max
+        span = max(1.0, db_max - db_min)
+
         def x_of(f):
             return x0 + f_to_frac(f) * (x1 - x0)
 
         def y_of(db):
-            t = (DB_MAX - db) / (DB_MAX - DB_MIN)
+            t = (db_max - db) / span
             return y0 + max(0.0, min(1.0, t)) * (y1 - y0)
+
+        # hover crosshair always uses the CURRENT mapping (a resize rebuilds
+        # these; see _bind_hover)
+        self._x_of, self._y_of = x_of, y_of
 
         self._draw_grid(w, h, x_of, y_of)
 
         if not self._series:
             self._hover_data = []
+            # width= wraps the message inside the plot area instead of
+            # spilling across the full canvas on one line and overlapping
+            # the Y-axis tick labels at the left/right margins.
             self.create_text(
                 (x0 + x1) // 2, (y0 + y1) // 2, text=self._msg,
-                fill=TEXT_DIM, font=self._font_small, justify="center")
+                fill=theme.TEXT_DIM, font=self._font_small, justify="center",
+                width=max(120, (x1 - x0) - 20))
             return
 
         for s in self._series:
             coords = self._polyline(s["pts"], x_of, y_of, w)
             if len(coords) >= 4:
+                # smooth=True rounds the per-pixel-column transitions without
+                # erasing real peaks (each peak is its own bucket), giving
+                # the anti-aliased look of squig.link's rendering
                 kw = {"fill": s["color"], "width": s.get("width", 2),
-                      "tags": ("curve",)}
+                      "smooth": True, "splinesteps": 8, "tags": ("curve",)}
                 if s.get("dash"):
                     kw["dash"] = s["dash"]
                 self.create_line(*coords, **kw)
@@ -272,33 +326,38 @@ class CurvePlot(tk.Canvas):
         if self._avg:
             coords = self._polyline(self._avg, x_of, y_of, w)
             if len(coords) >= 4:
-                self.create_line(*coords, fill=TEXT_MAIN, width=1,
+                self.create_line(*coords, fill=theme.TEXT_MAIN, width=1,
+                                 smooth=True, splinesteps=8,
                                  dash=(6, 4), tags=("avg",))
 
         # hover readout lives with the cursor position, cheap and useful
-        self._bind_hover(x_of, y_of)
+        self._bind_hover()
 
     # internals -------------------------------------------------------------
     def _draw_grid(self, w, h, x_of, y_of):
         x0, x1 = self.PAD_L, w - self.PAD_R
         y0, y1 = self.PAD_T, h - self.PAD_B
-        grid = "#232838"
+        grid = theme.blend(theme.BG_INPUT, theme.TEXT_MAIN, 0.08)
         label_w = 34 if w < 430 else 0
         for i, (f, lab) in enumerate(FREQ_TICKS):
             px = x_of(f)
             self.create_line(px, y0, px, y1, fill=grid)
             skip = (i % 2 == 1) and label_w
             if not skip:
-                self.create_text(px, y1 + 10, text=lab, fill=TEXT_DIM,
+                self.create_text(px, y1 + 10, text=lab, fill=theme.TEXT_DIM,
                                  font=self._font_small)
-        for db in range(int(DB_MIN), int(DB_MAX) + 1, 5):
+        db_min = getattr(self, "_db_min", DB_MIN)
+        db_max = getattr(self, "_db_max", DB_MAX)
+        lo = int(math.ceil(db_min / 5.0) * 5)
+        hi = int(math.floor(db_max / 5.0) * 5)
+        for db in range(lo, hi + 1, 5):
             py = y_of(db)
             major = (db == 0)
             self.create_line(x0, py, x1, py,
-                             fill=BORDER_LIGHT if major else grid)
+                             fill=theme.TEXT_DIM if major else grid)
             # label every 5 dB like squig.link does
             self.create_text(x0 - 8, py, text="{:+d}".format(db) if db
-                             else "0", fill=TEXT_DIM,
+                             else "0", fill=theme.TEXT_DIM,
                              font=self._font_small, anchor="e")
 
     def _polyline(self, pts, x_of, y_of, width):
@@ -331,8 +390,10 @@ class CurvePlot(tk.Canvas):
             prev = b
         return tuple(coords)
 
-    def _bind_hover(self, x_of, y_of):
-        """Crosshair readout: nearest curve value under the mouse."""
+    def _bind_hover(self):
+        """Crosshair readout: nearest curve value under the mouse. The
+        bind() happens once; the coordinate mapping is read from
+        self._x_of at event time so resizes never leave it stale."""
         if getattr(self, "_hover_bound", False):
             return
         self._hover_bound = True
@@ -352,10 +413,13 @@ class CurvePlot(tk.Canvas):
             if best is None:
                 return
             f, d, col = best
-            px = x_of(f)
+            # always the CURRENT mapping (rebuilt on every redraw/resize --
+            # a stale closure used to drift the crosshair off-position)
+            px = self._x_of(f)
             self.create_line(px, self.PAD_T, px,
                              int(self.winfo_height()) - self.PAD_B,
-                             fill="#333a4e", tags=("hover",))
+                             fill=theme.blend(theme.BG_INPUT, theme.ACCENT_BLUE, 0.25),
+                             tags=("hover",))
             self.create_text(
                 event.x, max(10, event.y - 12),
                 text="{:.0f} Hz  {:+.1f} dB".format(f, d),

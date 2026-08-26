@@ -104,8 +104,10 @@ def split_into_chunks(entries=None, external_path=None,
     # Canonicalize exactly like the gzip export so both exporters always
     # agree on schema order and never leak unknown fields into chunks
     # (in-memory sources may carry unsaved edits; external files were
-    # already cleaned by load_database).
-    src_entries = [L.build_clean_entry(e) for e in src_entries]
+    # already cleaned by load_database). Sorted by Brand -> Model -> Variant
+    # like compress_to_gz, so AI-audit batches per chunk are coherent.
+    src_entries = [L.build_clean_entry(e) for e in
+                   sorted(src_entries, key=L.sort_key)]
 
     filename_only = (os.path.splitext(os.path.basename(src_path))[0]
                      if src_path else "database")

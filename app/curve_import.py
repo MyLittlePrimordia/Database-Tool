@@ -1,4 +1,4 @@
-"""
+﻿"""
 curve_import.py -- the "Import Curves" notebook tab.
 
 Replaces the standalone Curve Converter app and wires it directly into
@@ -15,6 +15,7 @@ the editor's data-folder workflow:
 """
 
 import os
+import sys
 import threading
 import queue as _q
 
@@ -23,9 +24,7 @@ from tkinter import ttk, filedialog, messagebox, simpledialog
 
 import curve_logic as CL
 import fr_plot
-from theme import (BG_MAIN, BG_INPUT, BG_CARD, TEXT_MAIN, TEXT_DIM,
-                   ACCENT_GREEN, ACCENT_BLUE, ACCENT_RED, ACCENT_ORANGE,
-                   pick_font_family)
+import theme
 
 
 def _sanitize_folder(name):
@@ -37,7 +36,7 @@ class CurveImportPanel(ttk.Frame):
     def __init__(self, parent, app):
         super().__init__(parent, style="TFrame")
         self.app = app
-        self._font = (pick_font_family(), 10)
+        self._font = theme.font(13)
         self.files = []            # queued raw input paths
         self._plans = []           # GroupPlans for the current queue
         self._busy = False
@@ -50,7 +49,7 @@ class CurveImportPanel(ttk.Frame):
         # viewport on normal screens, which clipped the PLANNED OUTPUTS card
         # and its "Convert & Save" button below the fold with no way to
         # reach them (same scrollable-canvas pattern as the Editor tab).
-        self.scroll_canvas = tk.Canvas(self, background=BG_MAIN,
+        self.scroll_canvas = tk.Canvas(self, background=theme.BG_MAIN,
                                        highlightthickness=0)
         vsb = ttk.Scrollbar(self, orient="vertical",
                             command=self.scroll_canvas.yview)
@@ -92,10 +91,10 @@ class CurveImportPanel(ttk.Frame):
     # Queue
     # ------------------------------------------------------------------
     def _build_queue_section(self, host):
-        wrap = ttk.Frame(host, style="Card.TFrame")
-        wrap.pack(fill="x", padx=10, pady=(10, 6))
+        wrap_outer, wrap = theme.make_card(host)
+        wrap_outer.pack(fill="x", padx=10, pady=(10, 6))
 
-        header = ttk.Frame(wrap, style="Card.TFrame")
+        header = ttk.Frame(wrap, style="CardFlat.TFrame")
         header.pack(fill="x", padx=8, pady=(8, 2))
         ttk.Label(header, text="\U0001F4C8  RAW CURVE FILES (.txt / .csv)",
                   style="CardHeader.TLabel").pack(side="left")
@@ -104,22 +103,29 @@ class CurveImportPanel(ttk.Frame):
         ttk.Button(header, text="Clear all", command=self._clear_files).pack(
             side="right", padx=2)
 
-        ttk.Label(wrap,
-                  text="Drop files anywhere on this window. Pairs ending in "
-                       "[1]/[2] or L/R are detected automatically and averaged "
-                       "(with a sanity check); everything else converts as-is.",
-                  style="Card.TLabel", foreground=TEXT_DIM, wraplength=760,
-                  justify="left").pack(anchor="w", padx=8, pady=(0, 4))
+        # Native OS drag & drop is a Windows-only ctypes hook (win_drop);
+        # on macOS/Linux it silently no-ops, so say "Select files..." there
+        # instead of pointing users at a gesture that does nothing.
+        if sys.platform.startswith("win"):
+            drop_hint = "Drag measurement files here to convert them."
+        else:
+            drop_hint = ("Drag & drop is Windows-only -- use 'Select "
+                         "files...' instead.")
+        drop_label = ttk.Label(wrap, text=drop_hint,
+                  style="Card.TLabel", foreground=theme.TEXT_DIM,
+                  justify="left")
+        drop_label.pack(anchor="w", fill="x", padx=8, pady=(0, 4))
+        theme.bind_dynamic_wrap(drop_label, source=wrap)
 
         # scrollable row list (same pattern as the converter's queue list)
-        outer = tk.Frame(wrap, bg=BG_INPUT, highlightthickness=1,
-                         highlightbackground=BG_CARD, highlightcolor=BG_CARD)
+        outer = tk.Frame(wrap, bg=theme.BG_INPUT, highlightthickness=1,
+                         highlightbackground=theme.BG_CARD, highlightcolor=theme.BG_CARD)
         outer.pack(fill="x", padx=8, pady=(0, 8))
-        self.queue_canvas = tk.Canvas(outer, bg=BG_INPUT, highlightthickness=0,
+        self.queue_canvas = tk.Canvas(outer, bg=theme.BG_INPUT, highlightthickness=0,
                                       height=96)
         vsb = ttk.Scrollbar(outer, orient="vertical",
                             command=self.queue_canvas.yview)
-        self.queue_inner = tk.Frame(self.queue_canvas, bg=BG_INPUT)
+        self.queue_inner = tk.Frame(self.queue_canvas, bg=theme.BG_INPUT)
         self.queue_inner.bind("<Configure>", lambda e:
             self.queue_canvas.configure(scrollregion=self.queue_canvas.bbox("all")))
         self._queue_window = self.queue_canvas.create_window(
@@ -132,7 +138,7 @@ class CurveImportPanel(ttk.Frame):
 
         self.count_var = tk.StringVar(value="0 file(s) queued")
         ttk.Label(wrap, textvariable=self.count_var, style="Card.TLabel",
-                  foreground=TEXT_DIM).pack(anchor="e", padx=8, pady=(0, 6))
+                  foreground=theme.TEXT_DIM).pack(anchor="e", padx=8, pady=(0, 6))
 
     def add_paths(self, paths, quiet=False):
         """Add paths to the queue (deduped). Called by drag & drop and by
@@ -178,7 +184,7 @@ class CurveImportPanel(ttk.Frame):
             tk.Label(self.queue_inner,
                      text="No files queued yet - use \"Select files...\" or "
                           "drag & drop .txt/.csv files onto this window",
-                     bg=BG_INPUT, fg=TEXT_DIM, font=self._font, anchor="w",
+                     bg=theme.BG_INPUT, fg=theme.TEXT_DIM, font=self._font, anchor="w",
                  ).pack(fill="x", padx=10, pady=8)
             self._set_plans([])
             self._show_preview_empty()
@@ -188,18 +194,18 @@ class CurveImportPanel(ttk.Frame):
         self._set_plans(CL.plan_groups(self.files))
 
     def _add_queue_row(self, path, idx):
-        row = tk.Frame(self.queue_inner, bg=BG_INPUT)
+        row = tk.Frame(self.queue_inner, bg=theme.BG_INPUT)
         row.pack(fill="x")
-        lbl = tk.Label(row, text=os.path.basename(path), bg=BG_INPUT,
-                       fg=TEXT_MAIN, font=self._font, anchor="w",
+        lbl = tk.Label(row, text=os.path.basename(path), bg=theme.BG_INPUT,
+                       fg=theme.TEXT_MAIN, font=self._font, anchor="w",
                        cursor="hand2")
         lbl.pack(side="left", fill="x", expand=True, padx=(10, 4), pady=2)
-        x_btn = tk.Label(row, text="\u2715", bg=BG_INPUT, fg=TEXT_DIM,
-                         font=(self._font[0], 10, "bold"), cursor="hand2", padx=4)
+        x_btn = tk.Label(row, text="\u2715", bg=theme.BG_INPUT, fg=theme.TEXT_DIM,
+                         font=theme.font(13, "bold"), cursor="hand2", padx=4)
         x_btn.pack(side="right", padx=(4, 10))
         x_btn.bind("<Button-1>", lambda e, p=path: self._remove_file(p))
-        x_btn.bind("<Enter>", lambda e, b=x_btn: b.configure(fg=ACCENT_RED))
-        x_btn.bind("<Leave>", lambda e, b=x_btn: b.configure(fg=TEXT_DIM))
+        x_btn.bind("<Enter>", lambda e, b=x_btn: b.configure(fg=theme.ACCENT_RED))
+        x_btn.bind("<Leave>", lambda e, b=x_btn: b.configure(fg=theme.TEXT_DIM))
         # clicking a queued file previews its raw curve
         for w in (row, lbl):
             w.bind("<Button-1>", lambda e, i=idx: self._select_queue_row(i))
@@ -216,17 +222,17 @@ class CurveImportPanel(ttk.Frame):
     # Curve preview (live plot of the selected queued file / plan)
     # ------------------------------------------------------------------
     def _build_curve_preview_card(self, host):
-        card = ttk.Frame(host, style="Card.TFrame")
-        card.pack(fill="x", padx=10, pady=6)
-        head = ttk.Frame(card, style="Card.TFrame")
+        card_outer, card = theme.make_card(host)
+        card_outer.pack(fill="x", padx=10, pady=6)
+        head = ttk.Frame(card, style="CardFlat.TFrame")
         head.pack(fill="x", padx=8, pady=(8, 2))
         ttk.Label(head, text="\U0001F4C9  CURVE PREVIEW",
                   style="CardHeader.TLabel").pack(side="left")
-        self.preview_info = tk.Label(head, text="", bg=BG_CARD, fg=TEXT_DIM,
-                                     font=(self._font[0], 9), anchor="w")
+        self.preview_info = tk.Label(head, text="", bg=theme.BG_CARD, fg=theme.TEXT_DIM,
+                                     font=theme.font(12), anchor="w")
         self.preview_info.pack(side="left", padx=(12, 0))
         ttk.Label(head, text="click a queued file or a planned-output row",
-                  style="Card.TLabel", foreground=TEXT_DIM).pack(side="right")
+                  style="Card.TLabel", foreground=theme.TEXT_DIM).pack(side="right")
         self.preview_plot = fr_plot.CurvePlot(card, height=190)
         self.preview_plot.pack(fill="both", expand=True, padx=8, pady=(2, 8))
         self._show_preview_empty()
@@ -243,7 +249,7 @@ class CurveImportPanel(ttk.Frame):
         self._sel_queue = idx
         self._sel_plan = -1
         for i, (row, lbl) in enumerate(self._queue_rows):
-            bg = "#26304a" if i == idx else BG_INPUT
+            bg = "#26304a" if i == idx else theme.BG_INPUT
             row.configure(bg=bg)
             lbl.configure(bg=bg)
         self._render_plan_selection()
@@ -253,14 +259,14 @@ class CurveImportPanel(ttk.Frame):
         if norm:
             self.preview_plot.set_data(
                 [{"name": name, "pts": norm,
-                  "color": fr_plot.PALETTE[0], "width": 2}])
+                  "color": fr_plot.palette()[0], "width": 2}])
             self.preview_info.configure(
                 text="RAW  \u00b7  {}".format(name),
-                fg=TEXT_DIM)
+                fg=theme.TEXT_DIM)
         else:
             self.preview_plot.clear(msg="No parsable data rows in this file")
             self.preview_info.configure(
-                text="RAW  \u00b7  {}  (no data)".format(name), fg=ACCENT_RED)
+                text="RAW  \u00b7  {}  (no data)".format(name), fg=theme.ACCENT_RED)
 
     def _select_plan_row(self, idx):
         if not (0 <= idx < len(self._plans)):
@@ -278,7 +284,7 @@ class CurveImportPanel(ttk.Frame):
             if not norm:
                 continue
             series.append({"name": os.path.basename(p), "pts": norm,
-                           "color": fr_plot.PALETTE[k % len(fr_plot.PALETTE)],
+                           "color": fr_plot.palette()[k % len(fr_plot.palette())],
                            "width": 2})
             names.append(os.path.basename(p))
         badge = ("PAIR\u2192AVG" if plan.averaged else
@@ -287,7 +293,7 @@ class CurveImportPanel(ttk.Frame):
         if not series:
             self.preview_plot.clear(msg="No parsable data rows in this plan")
             self.preview_info.configure(text=label + "  (no data)",
-                                        fg=ACCENT_RED)
+                                        fg=theme.ACCENT_RED)
             return
         avg = None
         if plan.averaged and len(series) == 2:
@@ -301,11 +307,11 @@ class CurveImportPanel(ttk.Frame):
         self.preview_info.configure(
             text=label + "   \u00b7   " + "  +  ".join(names[:4])
             + ("  (+{})".format(len(names) - 4) if len(names) > 4 else ""),
-            fg=TEXT_DIM)
+            fg=theme.TEXT_DIM)
 
     def _render_queue_selection(self):
         for i, (row, lbl) in enumerate(self._queue_rows):
-            bg = "#26304a" if i == self._sel_queue else BG_INPUT
+            bg = "#26304a" if i == self._sel_queue else theme.BG_INPUT
             row.configure(bg=bg)
             lbl.configure(bg=bg)
 
@@ -322,8 +328,8 @@ class CurveImportPanel(ttk.Frame):
     # Destination
     # ------------------------------------------------------------------
     def _build_destination_card(self, host):
-        card = ttk.Frame(host, style="Card.TFrame")
-        card.pack(fill="x", padx=10, pady=6)
+        card_outer, card = theme.make_card(host)
+        card_outer.pack(fill="x", padx=10, pady=6)
 
         ttk.Label(card, text="\U0001F4C2  DESTINATION", style="CardHeader.TLabel").grid(
             row=0, column=0, columnspan=4, sticky="w", padx=8, pady=(8, 0))
@@ -331,9 +337,14 @@ class CurveImportPanel(ttk.Frame):
         ttk.Label(card, text="Data folder:", style="Card.TLabel").grid(
             row=1, column=0, sticky="w", padx=8, pady=(6, 2))
         self.root_var = tk.StringVar(value="(not set)")
-        ttk.Label(card, textvariable=self.root_var, style="Card.TLabel",
-                  foreground=ACCENT_BLUE).grid(row=1, column=1, columnspan=2,
-                                               sticky="w", padx=4, pady=(6, 2))
+        root_lbl = ttk.Label(card, textvariable=self.root_var, style="Card.TLabel",
+                  foreground=theme.ACCENT_BLUE, justify="left")
+        root_lbl.grid(row=1, column=1, columnspan=2,
+                      sticky="w", padx=4, pady=(6, 2))
+        # long absolute paths used to force this column wide enough to show
+        # the whole string on one line, which pushed "Change..." (and the
+        # rest of the card) past the tab's right edge -- wrap instead.
+        theme.bind_dynamic_wrap(root_lbl, source=card, min_wrap=160)
         ttk.Button(card, text="Change...", command=self._change_root,
                    width=10).grid(row=1, column=3, sticky="e", padx=8, pady=(6, 2))
 
@@ -345,22 +356,27 @@ class CurveImportPanel(ttk.Frame):
                                   padx=4, pady=(4, 2))
         self.subfolder_combo.bind("<<ComboboxSelected>>", lambda e: self._refresh_exists_markers())
         ttk.Button(card, text="\u2795 New Folder...", command=self._new_subfolder,
-                   width=12).grid(row=2, column=3, sticky="ew", padx=8, pady=(4, 2))
+                   width=15).grid(row=2, column=3, sticky="ew", padx=8, pady=(4, 2))
+        # column 1 absorbs the extra width instead of the folder-path label
+        # or the sub-folder combo forcing the card wider than the tab.
+        card.columnconfigure(1, weight=1)
 
         self.autolink_var = tk.BooleanVar(value=False)
         self.autolink_check = ttk.Checkbutton(
             card, text="Link converted files into the entry being edited",
-            variable=self.autolink_var, command=self._autolink_toggled)
+            variable=self.autolink_var, style="Card.TCheckbutton",
+            command=self._autolink_toggled)
         self.autolink_check.grid(row=3, column=0, columnspan=3, sticky="w",
                                  padx=8, pady=(6, 2))
 
         hint = ("\u26a0 Set the data folder first (File \u25b8 Set Data Folder...)"
                 if not self.app.get_data_root() else "")
         self.dest_hint = ttk.Label(card, text=hint, style="Card.TLabel",
-                                   foreground=ACCENT_ORANGE, wraplength=700,
+                                   foreground=theme.ACCENT_ORANGE,
                                    justify="left")
         self.dest_hint.grid(row=4, column=0, columnspan=4, sticky="w",
                             padx=8, pady=(2, 8))
+        theme.bind_dynamic_wrap(self.dest_hint, source=card)
 
         card.columnconfigure(1, weight=1)
 
@@ -441,14 +457,14 @@ class CurveImportPanel(ttk.Frame):
     # Output preview
     # ------------------------------------------------------------------
     def _build_preview_card(self, host):
-        card = ttk.Frame(host, style="Card.TFrame")
-        card.pack(fill="x", padx=10, pady=6)
+        card_outer, card = theme.make_card(host)
+        card_outer.pack(fill="x", padx=10, pady=6)
 
         # The action button lives in the CARD HEADER (not below the output
         # list) so it stays visible even before any scrolling -- it used to
         # sit under the list at the bottom of the tab and was routinely
         # clipped off-screen entirely.
-        header = ttk.Frame(card, style="Card.TFrame")
+        header = ttk.Frame(card, style="CardFlat.TFrame")
         header.pack(fill="x", padx=8, pady=(8, 0))
         ttk.Label(header, text="\U0001F4DD  PLANNED OUTPUTS",
                   style="CardHeader.TLabel").pack(side="left")
@@ -457,22 +473,25 @@ class CurveImportPanel(ttk.Frame):
                                       command=self._run_convert)
         self.convert_btn.pack(side="right")
         self.convert_status = tk.StringVar(value="")
-        ttk.Label(header, textvariable=self.convert_status, style="Card.TLabel",
-                  foreground=ACCENT_BLUE, wraplength=430,
-                  justify="right").pack(side="right", padx=12)
-        ttk.Label(card,
+        convert_status_lbl = ttk.Label(header, textvariable=self.convert_status,
+                  style="Card.TLabel", foreground=theme.ACCENT_BLUE,
+                  justify="right")
+        convert_status_lbl.pack(side="right", padx=12)
+        theme.bind_dynamic_wrap(convert_status_lbl, source=header, min_wrap=100)
+        rename_hint = ttk.Label(card,
                   text="Rename freely before converting. \u26a0 marks files that already exist.",
-                  style="Card.TLabel", foreground=TEXT_DIM).pack(
-            anchor="w", padx=8)
+                  style="Card.TLabel", foreground=theme.TEXT_DIM, justify="left")
+        rename_hint.pack(anchor="w", fill="x", padx=8)
+        theme.bind_dynamic_wrap(rename_hint, source=card)
 
-        outer = tk.Frame(card, bg=BG_CARD, highlightthickness=1,
-                         highlightbackground=BG_CARD, highlightcolor=BG_CARD)
+        outer = tk.Frame(card, bg=theme.BG_CARD, highlightthickness=1,
+                         highlightbackground=theme.BG_CARD, highlightcolor=theme.BG_CARD)
         outer.pack(fill="x", padx=8, pady=(4, 8))
-        self.preview_canvas = tk.Canvas(outer, bg=BG_CARD, highlightthickness=0,
+        self.preview_canvas = tk.Canvas(outer, bg=theme.BG_CARD, highlightthickness=0,
                                         height=150)
         vsb = ttk.Scrollbar(outer, orient="vertical",
                             command=self.preview_canvas.yview)
-        self.preview_inner = tk.Frame(self.preview_canvas, bg=BG_CARD)
+        self.preview_inner = tk.Frame(self.preview_canvas, bg=theme.BG_CARD)
         self.preview_inner.bind("<Configure>", lambda e:
             self.preview_canvas.configure(scrollregion=self.preview_canvas.bbox("all")))
         self._preview_window = self.preview_canvas.create_window(
@@ -497,7 +516,7 @@ class CurveImportPanel(ttk.Frame):
         if not plans:
             tk.Label(self.preview_inner,
                      text="Planned outputs appear here once files are queued.",
-                     bg=BG_CARD, fg=TEXT_DIM, font=self._font, anchor="w",
+                     bg=theme.BG_CARD, fg=theme.TEXT_DIM, font=self._font, anchor="w",
                      ).pack(fill="x", padx=10, pady=8)
             self._update_convert_state()
             return
@@ -512,7 +531,7 @@ class CurveImportPanel(ttk.Frame):
                 final = "{} ({}){}".format(stem, count + 1, ext.lower())
             taken[final.lower()] = count + 1
 
-            row_bg = BG_CARD if i % 2 == 0 else "#232736"
+            row_bg = theme.BG_CARD if i % 2 == 0 else "#232736"
             row = tk.Frame(self.preview_inner, bg=row_bg, cursor="hand2")
             row.pack(fill="x")
 
@@ -522,31 +541,31 @@ class CurveImportPanel(ttk.Frame):
             cb.pack(side="left", padx=(8, 2), pady=4)
 
             badge_text, badge_fg = (
-                ("PAIR \u2192 AVG", ACCENT_GREEN) if plan.averaged
-                else (("SOLO", TEXT_DIM) if len(plan.sources) == 1
-                      else ("GROUP", ACCENT_ORANGE)))
+                ("PAIR \u2192 AVG", theme.ACCENT_GREEN) if plan.averaged
+                else (("SOLO", theme.TEXT_DIM) if len(plan.sources) == 1
+                      else ("GROUP", theme.ACCENT_ORANGE)))
             badge = tk.Label(row, text=badge_text, bg=row_bg, fg=badge_fg,
-                             font=(self._font[0], 8, "bold"), width=11, anchor="center",
+                             font=theme.font(12, "bold"), width=11, anchor="center",
                              cursor="hand2")
             badge.pack(side="left", padx=(0, 6))
 
             name_var = tk.StringVar(value=final)
-            entry = tk.Entry(row, textvariable=name_var, bg=BG_INPUT, fg=TEXT_MAIN,
-                             insertbackground=TEXT_MAIN, relief="flat",
+            entry = tk.Entry(row, textvariable=name_var, bg=theme.BG_INPUT, fg=theme.TEXT_MAIN,
+                             insertbackground=theme.TEXT_MAIN, relief="flat",
                              font=self._font, width=34)
             entry.pack(side="left", padx=(0, 6), pady=3, ipady=2)
             entry.bind("<FocusOut>", lambda e, v=name_var: self._on_name_edit(v))
             entry.bind("<Return>", lambda e, v=name_var: self._on_name_edit(v))
 
-            exists_lbl = tk.Label(row, text="", bg=row_bg, fg=ACCENT_RED,
-                                  font=(self._font[0], 9, "bold"))
+            exists_lbl = tk.Label(row, text="", bg=row_bg, fg=theme.ACCENT_RED,
+                                  font=theme.font(12, "bold"))
             exists_lbl.pack(side="left", padx=(0, 6))
 
             srcs = "  +  ".join(plan.source_names)
             if len(srcs) > 58:
                 srcs = srcs[:57] + "\u2026"
-            src_lbl = tk.Label(row, text=srcs, bg=row_bg, fg=TEXT_DIM,
-                               font=(self._font[0], 9), anchor="w",
+            src_lbl = tk.Label(row, text=srcs, bg=row_bg, fg=theme.TEXT_DIM,
+                               font=theme.font(12), anchor="w",
                                cursor="hand2")
             src_lbl.pack(side="left", fill="x", expand=True, padx=(0, 8))
 
@@ -790,16 +809,16 @@ class CurveImportPanel(ttk.Frame):
     # Log console
     # ------------------------------------------------------------------
     def _build_log(self, host):
-        wrap = ttk.Frame(host, style="Card.TFrame")
-        wrap.pack(fill="x", padx=10, pady=(0, 10))
+        wrap_outer, wrap = theme.make_card(host)
+        wrap_outer.pack(fill="both", expand=True, padx=10, pady=(0, 10))
         ttk.Label(wrap, text="CONVERSION LOG", style="CardHeader.TLabel").pack(
             anchor="w", padx=8, pady=(6, 2))
-        self.log = tk.Text(wrap, height=7, bg=BG_INPUT, fg=TEXT_MAIN,
-                           insertbackground=TEXT_MAIN, font=self._font,
+        self.log = tk.Text(wrap, height=7, bg=theme.BG_INPUT, fg=theme.TEXT_MAIN,
+                           insertbackground=theme.TEXT_MAIN, font=self._font,
                            relief="flat", wrap="word", padx=10, pady=8)
         self.log.pack(fill="both", expand=True, padx=8, pady=(0, 8))
-        self.log.tag_configure("ok", foreground=ACCENT_GREEN)
-        self.log.tag_configure("fail", foreground=ACCENT_RED)
+        self.log.tag_configure("ok", foreground=theme.ACCENT_GREEN)
+        self.log.tag_configure("fail", foreground=theme.ACCENT_RED)
         self.log.configure(state="disabled")
 
     def _log(self, text, tag=None):

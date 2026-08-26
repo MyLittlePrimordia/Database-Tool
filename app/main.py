@@ -32,12 +32,9 @@ import db_logic as L
 import spell_logic as SP
 import fr_plot
 import theme
-from theme import (BG_MAIN, BG_PANEL, BG_CARD, BG_INPUT, BORDER,
-                   BORDER_LIGHT, ACCENT_BLUE, ACCENT_ORANGE, ACCENT_PURPLE,
-                   ACCENT_GREEN, ACCENT_RED, TEXT_MAIN, TEXT_DIM,
-                   PREFERRED_FONTS, pick_emoji_font, pick_font_family)
 import tools_panel
 import curve_import
+import ai_import
 import win_drop
 
 APP_TITLE = "Database Tool"
@@ -47,41 +44,43 @@ _autosave_lock = threading.Lock()
 APP_VERSION = "2.0"
 
 # ---------------------------------------------------------------------------
-# THEME -- colors, fonts and font pickers live in theme.py (shared with the
-# Import Curves / Export panels so every surface stays consistent).
+# THEME -- colors and fonts live in theme.py (shared with the Import
+# Curves / Export panels so every surface stays consistent). Theme
+# switching happens through the View menu; the app always renders in the
+# OS's own default UI font.
 # ---------------------------------------------------------------------------
 
 # Display-only emoji shown next to each tag in the picker so tags are faster
 # to scan visually. The underlying tag strings saved to database.json are
 # never changed -- this is purely cosmetic in the UI.
 TAG_EMOJI = {
-    "Basshead": "💥",
-    "Sub-Bass": "🌊",
-    "Punchy Bass": "🥊",
-    "Warm": "🌿",
-    "Neutral": "⚖️",
-    "V-Shaped": "🔺",
-    "U-Shaped": "🧲",
-    "Balanced": "☯️",
-    "Bright": "✨",
-    "Treblehead": "⚡",
-    "Dark": "🌑",
-    "Vocal-Focused": "🗣️",
-    "Detailed": "💎",
-    "Resolving": "🔍",
-    "Technical": "🔬",
-    "Wide-Stage": "🏟️",
-    "Good-Imaging": "🔭",
-    "Smooth": "🧈",
-    "Reference": "📐",
-    "Analytical": "🧠",
-    "Fun": "🔥",
-    "Relaxed": "😌",
-    "Gaming": "🎮",
-    "Competitive-Gaming": "🏆",
-    "Studio-Monitoring": "🎛️",
-    "Collab": "🤝",
-    "Limited-Edition": "🌟",
+    "Basshead": "\U0001F4A5",
+    "Sub-Bass": "\U0001F30A",
+    "Punchy Bass": "\U0001F94A",
+    "Warm": "\U0001F33F",
+    "Neutral": "\u2696\uFE0F",
+    "V-Shaped": "\U0001F53A",
+    "U-Shaped": "\U0001F9F2",
+    "Balanced": "\u262F\uFE0F",
+    "Bright": "\u2728",
+    "Treblehead": "\u26A1",
+    "Dark": "\U0001F311",
+    "Vocal-Focused": "\U0001F5E3\uFE0F",
+    "Detailed": "\U0001F48E",
+    "Resolving": "\U0001F50D",
+    "Technical": "\U0001F52C",
+    "Wide-Stage": "\U0001F3DF\uFE0F",
+    "Good-Imaging": "\U0001F52D",
+    "Smooth": "\U0001F9C8",
+    "Reference": "\U0001F4D0",
+    "Analytical": "\U0001F9E0",
+    "Fun": "\U0001F525",
+    "Relaxed": "\U0001F60C",
+    "Gaming": "\U0001F3AE",
+    "Competitive-Gaming": "\U0001F3C6",
+    "Studio-Monitoring": "\U0001F39B\uFE0F",
+    "Collab": "\U0001F91D",
+    "Limited-Edition": "\U0001F31F",
 }
 
 
@@ -178,9 +177,9 @@ def attach_entry_context_menu(entry, extra_items=None):
         has_sel = _has_selection()
         has_text = len(entry.get()) > 0
         menu = tk.Menu(entry, tearoff=0,
-                       background=BG_CARD, foreground=TEXT_MAIN,
-                       activebackground=BORDER_LIGHT, activeforeground=TEXT_MAIN,
-                       font=(pick_font_family(), 10))
+                       background=theme.BG_CARD, foreground=theme.TEXT_MAIN,
+                       activebackground=theme.BORDER_LIGHT, activeforeground=theme.TEXT_MAIN,
+                       font=theme.font(13))
         if extra_items:
             try:
                 extra_items(event, menu)
@@ -412,85 +411,61 @@ def tag_icon(tag):
 
 
 def setup_styles(root):
-    font_family = pick_font_family()
-    root.option_add("*Font", "{{{}}} 10".format(font_family))
-    style = ttk.Style(root)
+    """Delegate to theme.apply_styles (the full retro style sheet lives in
+    theme.py so theme/font switching can simply call it again)."""
+    return theme.apply_styles(root)
+
+
+def make_card(parent, style="Card.TFrame"):
+    """IEM Tool-style offset-shadow card (implementation in theme.py)."""
+    return theme.make_card(parent, style)
+
+
+def restyle_app(root):
+    """Full live re-theme: re-apply the ttk style sheet, retint every tk
+    widget, then run the registered hooks (canvas art, menus, tree tags).
+
+    A theme switch reconfigures a LOT of individual widgets one at a time
+    (every raw tk widget's colors via retint(), every canvas redraw via
+    the retheme hooks). Tk normally coalesces redraws until idle, but a
+    change set this large still tends to paint in visible waves -- old
+    colors here, new colors there, a frame or two apart -- which reads as
+    a flicker even though nothing is actually wrong. Hiding the window for
+    the duration (alpha 0 -> do everything -> alpha 1) means the person
+    only ever sees the before frame and the after frame, never the
+    in-between. -alpha is supported on Windows and macOS; where it isn't
+    (some Linux window managers) the calls quietly no-op and the switch
+    still applies, just without the anti-flicker step.
+
+    The reveal itself is deferred a couple of scheduler turns: the menubar
+    is recolored LAST (menus are restyled by a retheme hook), and its
+    redraw lands on a later event-loop pass than update_idletasks().
+    Restoring alpha immediately used to show that straggler menubar
+    repaint as a visible flash across File/Edit/Audit/Tools/View/Help.
+    Waiting ~2 frames lets every queued repaint -- menubar included --
+    finish into the hidden buffer before the window comes back."""
+    def _reveal():
+        try:
+            root.attributes("-alpha", 1.0)
+        except Exception:
+            pass
+
     try:
-        style.theme_use("clam")
+        root.attributes("-alpha", 0.0)
     except Exception:
         pass
-
-    style.configure(".", background=BG_MAIN, foreground=TEXT_MAIN,
-                    fieldbackground=BG_INPUT, bordercolor=BORDER,
-                    darkcolor=BG_PANEL, lightcolor=BG_PANEL, font=(font_family, 10))
-    style.configure("TFrame", background=BG_MAIN)
-    style.configure("Panel.TFrame", background=BG_PANEL)
-    style.configure("Card.TFrame", background=BG_CARD, relief="solid", borderwidth=1)
-    style.configure("TLabel", background=BG_MAIN, foreground=TEXT_MAIN, font=(font_family, 10))
-    style.configure("Panel.TLabel", background=BG_PANEL, foreground=TEXT_MAIN)
-    style.configure("Card.TLabel", background=BG_CARD, foreground=TEXT_MAIN)
-    style.configure("Dim.TLabel", background=BG_MAIN, foreground=TEXT_DIM)
-    style.configure("Header.TLabel", background=BG_MAIN, foreground=ACCENT_ORANGE,
-                     font=(font_family, 13, "bold"))
-    style.configure("CardHeader.TLabel", background=BG_CARD, foreground=ACCENT_BLUE,
-                     font=(font_family, 10, "bold"))
-    style.configure("Status.TLabel", background=BG_PANEL, foreground=TEXT_DIM, font=(font_family, 9))
-
-    style.configure("TButton", background=BG_CARD, foreground=TEXT_MAIN,
-                     bordercolor=BORDER_LIGHT, focusthickness=1, padding=6)
-    style.map("TButton", background=[("active", BORDER_LIGHT)])
-
-    style.configure("Accent.TButton", background=ACCENT_ORANGE, foreground="#1a1a1a",
-                     bordercolor=ACCENT_ORANGE, padding=6, font=(font_family, 10, "bold"))
-    style.map("Accent.TButton", background=[("active", "#f2a75a")])
-
-    style.configure("Danger.TButton", background=ACCENT_RED, foreground="#1a1a1a", padding=6)
-    style.map("Danger.TButton", background=[("active", "#ea7d76")])
-
-    style.configure("Blue.TButton", background=ACCENT_BLUE, foreground="#0c1a2a", padding=6)
-    style.map("Blue.TButton", background=[("active", "#7bb2e6")])
-
-    style.configure("TEntry", fieldbackground=BG_INPUT, foreground=TEXT_MAIN,
-                     bordercolor=BORDER_LIGHT, insertcolor=TEXT_MAIN)
-    style.configure("TCombobox", fieldbackground=BG_INPUT, foreground=TEXT_MAIN,
-                     background=BG_INPUT, arrowcolor=TEXT_MAIN)
-    style.map("TCombobox", fieldbackground=[("readonly", BG_INPUT)],
-              foreground=[("readonly", TEXT_MAIN)])
-
-    style.configure("TCheckbutton", background=BG_CARD, foreground=TEXT_MAIN)
-    style.map("TCheckbutton", background=[("active", BG_CARD)])
-    style.configure("Panel.TCheckbutton", background=BG_PANEL, foreground=TEXT_MAIN)
-
-    style.configure("Treeview", background=BG_INPUT, fieldbackground=BG_INPUT,
-                     foreground=TEXT_MAIN, bordercolor=BORDER, rowheight=22)
-    style.configure("Treeview.Heading", background=BG_CARD, foreground=ACCENT_BLUE,
-                     font=(font_family, 10, "bold"))
-    style.map("Treeview", background=[("selected", ACCENT_BLUE)],
-              foreground=[("selected", "#0c1a2a")])
-
-    style.configure("TNotebook", background=BG_MAIN, bordercolor=BORDER)
-    style.configure("TNotebook.Tab", background=BG_CARD, foreground=TEXT_MAIN, padding=(12, 6))
-    style.map("TNotebook.Tab", background=[("selected", ACCENT_BLUE)],
-              foreground=[("selected", "#0c1a2a")])
-
-    style.configure("TPanedwindow", background=BG_MAIN)
-    style.configure("Vertical.TScrollbar", background=BG_CARD, troughcolor=BG_MAIN,
-                     bordercolor=BORDER, arrowcolor=TEXT_MAIN)
-    style.configure("Horizontal.TScrollbar", background=BG_CARD, troughcolor=BG_MAIN,
-                     bordercolor=BORDER, arrowcolor=TEXT_MAIN)
-    style.configure("TSpinbox", fieldbackground=BG_INPUT, foreground=TEXT_MAIN,
-                     bordercolor=BORDER_LIGHT, arrowcolor=TEXT_MAIN)
-
-    # menubutton-based dropdown pickers must stay dark on hover/press too
-    # (clam's default active state is near-white)
-    style.configure("TMenubutton", background=BG_CARD, foreground=TEXT_MAIN,
-                     arrowcolor=TEXT_MAIN, bordercolor=BORDER_LIGHT,
-                     relief="flat", padding=(8, 4))
-    style.map("TMenubutton",
-              background=[("pressed", BG_INPUT), ("active", BORDER_LIGHT)],
-              foreground=[("pressed", TEXT_MAIN), ("active", TEXT_MAIN)],
-              arrowcolor=[("pressed", TEXT_MAIN), ("active", TEXT_MAIN)])
-    return font_family
+    try:
+        theme.apply_styles(root)
+        theme.retint(root)
+        theme.run_retheme_hooks()
+        root.update_idletasks()
+        # give Tk two idle turns to drain every pending repaint (widgets,
+        # canvases AND the native menubar) while nothing is visible
+        root.after(16, lambda: root.after(16, _reveal))
+        return True
+    except Exception:
+        _reveal()
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -513,18 +488,19 @@ class AutocompleteEntry(ttk.Frame):
 
     def __init__(self, parent, suggestions_provider, on_change=None,
                  spell_checker=None, **kwargs):
-        super().__init__(parent, style="Card.TFrame")
+        # borderless: this widget sits INSIDE a shadow card, so a bordered
+        # Card.TFrame surface here would draw a box around the entry
+        super().__init__(parent, style="CardFlat.TFrame")
         self.suggestions_provider = suggestions_provider  # callable(text) -> list[str]
         self.on_change = on_change
         self.spell_checker = spell_checker
         self.var = tk.StringVar()
-        font_family = pick_font_family()
-        kwargs.setdefault("font", (font_family, 10))
+        kwargs.setdefault("font", theme.font(13))
         self.entry = ttk.Entry(self, textvariable=self.var, **kwargs)
         self.entry.pack(fill="x")
         # Thin canvas directly under the entry used to draw red bars beneath
         # flagged words (monospace font => exact per-character pixel math).
-        self.underline = tk.Canvas(self, height=3, background=BG_CARD,
+        self.underline = tk.Canvas(self, height=3, background=theme.BG_CARD,
                                    highlightthickness=0)
         self.underline.pack(fill="x")
         self._flags = []          # [(start, end, word)] currently flagged spans
@@ -623,7 +599,7 @@ class AutocompleteEntry(ttk.Frame):
             if x2 <= 0 or x1 >= width:
                 continue  # scrolled off-screen
             canvas.create_rectangle(max(0, x1), 0, min(width - 1, x2), 2,
-                                    fill=ACCENT_RED, width=0)
+                                    fill=theme.ACCENT_RED, width=0)
 
     def _flag_at_column(self, col):
         """Flagged span containing character column `col` (or None)."""
@@ -681,7 +657,8 @@ class AutocompleteEntry(ttk.Frame):
                 fixed = self._match_case(s, word)
                 menu.add_command(
                     label="\u27f2 {}".format(fixed),
-                    background=BORDER, foreground="#ffd9a0",
+                    background=theme.BORDER,
+                    foreground=theme.ACCENT_ORANGE,
                     command=lambda st=start, en=end, fx=fixed: self._replace_span(st, en, fx))
         menu.add_separator()
 
@@ -710,10 +687,12 @@ class AutocompleteEntry(ttk.Frame):
             self.popup = tk.Toplevel(self)
             self.popup.wm_overrideredirect(True)
             self.popup.attributes("-topmost", True)
-            self.listbox = tk.Listbox(self.popup, background=BG_INPUT, foreground=TEXT_MAIN,
-                                       selectbackground=ACCENT_BLUE, selectforeground="#0c1a2a",
-                                       highlightthickness=1, highlightbackground=BORDER_LIGHT,
-                                       activestyle="none", height=min(8, len(items)))
+            self.listbox = tk.Listbox(self.popup, background=theme.BG_INPUT, foreground=theme.TEXT_MAIN,
+                                       selectbackground=theme.ACCENT_BLUE,
+                                       selectforeground=theme.contrast_text(theme.ACCENT_BLUE),
+                                       highlightthickness=1, highlightbackground=theme.BORDER,
+                                       activestyle="none", height=min(8, len(items)),
+                                       font=theme.font(13))
             self.listbox.pack(fill="both", expand=True)
             self.listbox.bind("<<ListboxSelect>>", self._on_select)
             self.listbox.bind("<Return>", self._on_select)
@@ -776,6 +755,21 @@ def ellipsize(text, max_chars):
     return text[:max_chars - 1].rstrip() + "\u2026"
 
 
+def ellipsize_path(text, max_chars):
+    """Truncate a folder/file path from the FRONT, keeping the filename
+    intact (...\u2026/ADEN/AB123_measurement.txt). Measurement paths
+    mostly share the same leading "data/..." folder, so tail-ellipsizing
+    (the general ellipsize() above) hid the one part -- the filename --
+    that actually tells rows apart."""
+    if not text:
+        return text
+    if max_chars is None or len(text) <= max_chars:
+        return text
+    if max_chars < 4:
+        return ellipsize(text, max_chars)
+    return "\u2026" + text[-(max_chars - 1):]
+
+
 class HoverTooltip:
     """Delayed tooltip that reveals the FULL (untruncated) row text for
     tree/listbox widgets. text_for(x, y) -> str; empty string hides."""
@@ -828,9 +822,9 @@ class HoverTooltip:
         self._hide_window()
         tw = tk.Toplevel(self.widget)
         tw.wm_overrideredirect(True)
-        tk.Label(tw, text=txt, justify="left", background="#20242f",
-                 foreground="#e7e9f0", borderwidth=1, relief="solid",
-                 font=(pick_font_family(), 9), wraplength=560
+        tk.Label(tw, text=txt, justify="left", background=theme.BG_CARD,
+                 foreground=theme.TEXT_MAIN, borderwidth=1, relief="solid",
+                 font=theme.font(12), wraplength=560
                  ).pack(ipadx=6, ipady=3)
         sx = self.widget.winfo_rootx() + x + 14
         sy = self.widget.winfo_rooty() + y + 22
@@ -844,66 +838,104 @@ class HoverTooltip:
 # ---------------------------------------------------------------------------
 class DriverConfigPanel(ttk.Frame):
     def __init__(self, parent, on_change=None):
-        super().__init__(parent, style="Card.TFrame")
+        # borderless card surface: the make_card() wrapper supplies the
+        # 1px border + offset shadow (Card.TFrame here would double it)
+        super().__init__(parent, style="CardFlat.TFrame")
         self.on_change = on_change
-        self.vars = {}
-        self.counts = {}
-        self.count_widgets = {}
+        self.counts = {}          # tech -> StringVar("0".."16"); 0 = unused
+        self.count_widgets = {}   # tech -> (minus_btn, plus_btn)
+        self.labels = {}          # tech -> clickable icon+name label
+        self._tech_frames = {}
+        self._cols = 2            # current grid columns (responsive)
 
         ttk.Label(self, text="DRIVER CONFIGURATION", style="CardHeader.TLabel").grid(
             row=0, column=0, columnspan=4, sticky="w", padx=8, pady=(8, 4))
-        ttk.Label(self, text="Check each driver technology used and enter its count.\n"
-                              "The type (DD / Hybrid / Tribrid / etc.) is derived automatically.",
-                  style="Card.TLabel", foreground=TEXT_DIM).grid(
+        ttk.Label(self, text="Select the driver technology & count.",
+                  style="Card.TLabel", foreground=theme.TEXT_DIM).grid(
             row=1, column=0, columnspan=4, sticky="w", padx=8, pady=(0, 6))
 
-        row = 2
-        col = 0
-        for tech in L.DRIVER_TECH_ORDER:
-            frame = ttk.Frame(self, style="Card.TFrame")
-            frame.grid(row=row, column=col, sticky="w", padx=8, pady=3)
-            var = tk.BooleanVar(value=False)
-            self.vars[tech] = var
+        for i, tech in enumerate(L.DRIVER_TECH_ORDER):
+            frame = ttk.Frame(self, style="CardFlat.TFrame")
+            frame.grid(row=2 + i // self._cols, column=i % self._cols,
+                       sticky="w", padx=8, pady=3)
+            self._tech_frames[tech] = frame
             icon = ICONS.get(L.DRIVER_TYPE_ICON.get(tech, tech.lower()))
-            cb = ttk.Checkbutton(frame, text=L.DRIVER_TECH_LABELS[tech], variable=var, image=icon,
-                                  compound="left" if icon else "none",
-                                  command=lambda t=tech: self._toggle(t))
-            cb.image = icon
-            cb.pack(side="left")
-            count_var = tk.StringVar(value="1")
+            # the icon+name label doubles as a toggle: click = 0 <-> 1
+            lbl = ttk.Label(frame, text=L.DRIVER_TECH_LABELS[tech],
+                            image=icon, compound="left" if icon else "none",
+                            style="Card.TLabel", cursor="hand2")
+            lbl.image = icon
+            lbl.pack(side="left")
+            lbl.bind("<Button-1>", lambda _e, t=tech: self._toggle(t))
+            self.labels[tech] = lbl
+            count_var = tk.StringVar(value="0")
             self.counts[tech] = count_var
-            spin = ttk.Spinbox(frame, from_=1, to=16, width=4, textvariable=count_var,
-                                state="disabled", command=self._recompute)
-            spin.pack(side="left", padx=(6, 0))
-            count_var.trace_add("write", lambda *a: self._recompute())
-            self.count_widgets[tech] = spin
-            col += 1
-            if col >= 2:
-                col = 0
-                row += 1
-        row += 1
+            # horizontal -/+ stepper: [ - ] count [ + ]. 0 = driver unused;
+            # pressing + to 1 enables it, back down to 0 removes it.
+            stepper = ttk.Frame(frame, style="CardFlat.TFrame")
+            minus = ttk.Button(stepper, text="\u2212", width=3,
+                               command=lambda t=tech: self._bump(t, -1))
+            minus.pack(side="left")
+            val = ttk.Label(stepper, textvariable=count_var, style="Card.TLabel",
+                            width=2, anchor="center")
+            val.pack(side="left", padx=2)
+            plus = ttk.Button(stepper, text="+", width=3,
+                              command=lambda t=tech: self._bump(t, +1))
+            plus.pack(side="left")
+            stepper.pack(side="left", padx=(6, 0))
+            self.count_widgets[tech] = (minus, plus)
 
+        result_row = 2 + (len(L.DRIVER_TECH_ORDER) + self._cols - 1) // self._cols + 1
         self.result_label = ttk.Label(self, text="Driver Type: (none)      Config: (none)",
-                                       style="Card.TLabel", foreground=ACCENT_GREEN,
-                                       font=(pick_font_family(), 10, "bold"))
-        self.result_label.grid(row=row, column=0, columnspan=4, sticky="w", padx=8, pady=(8, 8))
+                                       style="Card.TLabel", foreground=theme.ACCENT_GREEN,
+                                       font=theme.font(13, "bold"))
+        self.result_label.grid(row=result_row, column=0, columnspan=4,
+                               sticky="w", padx=8, pady=(8, 8))
+        self.set("", "")
+
+    def set_columns(self, cols):
+        """Responsive: 2 columns on wide windows, 1 stacked column when the
+        form is too narrow for both side-by-side rows to fit."""
+        cols = 1 if cols <= 1 else 2
+        if cols == self._cols:
+            return
+        self._cols = cols
+        n = len(L.DRIVER_TECH_ORDER)
+        for i, tech in enumerate(L.DRIVER_TECH_ORDER):
+            self._tech_frames[tech].grid_configure(row=2 + i // cols,
+                                                    column=i % cols)
+        result_row = 2 + (n + cols - 1) // cols + 1
+        self.result_label.grid_configure(row=result_row)
+
+    def _count(self, tech):
+        try:
+            return max(0, min(16, int(self.counts[tech].get())))
+        except (TypeError, ValueError):
+            return 0
+
+    def _refresh_row(self, tech):
+        """Dim unused drivers; the minus button has nothing to remove at 0."""
+        active = self._count(tech) > 0
+        self.labels[tech].configure(
+            foreground=theme.TEXT_MAIN if active else theme.TEXT_DIM)
+        minus, _plus = self.count_widgets[tech]
+        minus.state(["disabled"] if not active else ["!disabled"])
+
+    def _bump(self, tech, delta):
+        c = max(0, min(16, self._count(tech) + delta))
+        self.counts[tech].set(str(c))
+        self._refresh_row(tech)
+        self._recompute()
 
     def _toggle(self, tech):
-        state = "normal" if self.vars[tech].get() else "disabled"
-        self.count_widgets[tech].configure(state=state)
+        # click the name: 0 <-> 1
+        self.counts[tech].set("0" if self._count(tech) > 0 else "1")
+        self._refresh_row(tech)
         self._recompute()
 
     def _recompute(self):
-        components = {}
-        for tech, var in self.vars.items():
-            if var.get():
-                try:
-                    c = int(self.counts[tech].get())
-                    if c < 1:
-                        c = 1
-                except (TypeError, ValueError):
-                    c = 1
-                components[tech] = c
+        components = {t: self._count(t) for t in self.counts
+                      if self._count(t) > 0}
         dtype, dconfig = L.classify_driver(components)
         label = "Driver Type: {}      Config: {}".format(dtype or "(unknown/unverified)",
                                                           dconfig or "(none)")
@@ -912,27 +944,15 @@ class DriverConfigPanel(ttk.Frame):
             self.on_change(dtype, dconfig)
 
     def get(self):
-        components = {}
-        for tech, var in self.vars.items():
-            if var.get():
-                try:
-                    c = int(self.counts[tech].get())
-                except (TypeError, ValueError):
-                    c = 1
-                components[tech] = max(1, c)
+        components = {t: self._count(t) for t in self.counts
+                      if self._count(t) > 0}
         return L.classify_driver(components)
 
     def set(self, driver_type, driver_config):
         parsed = L.parse_driver_config(driver_config)
-        for tech, var in self.vars.items():
-            if tech in parsed:
-                var.set(True)
-                self.counts[tech].set(str(parsed[tech]))
-                self.count_widgets[tech].configure(state="normal")
-            else:
-                var.set(False)
-                self.counts[tech].set("1")
-                self.count_widgets[tech].configure(state="disabled")
+        for tech in self.counts:
+            self.counts[tech].set(str(parsed.get(tech, 0)))
+            self._refresh_row(tech)
         self._recompute()
 
     def clear(self):
@@ -944,7 +964,9 @@ class DriverConfigPanel(ttk.Frame):
 # ---------------------------------------------------------------------------
 class TagSelectorPanel(ttk.Frame):
     def __init__(self, parent, on_change=None, fr_provider=None):
-        super().__init__(parent, style="Card.TFrame")
+        # borderless card surface: the make_card() wrapper supplies the
+        # 1px border + offset shadow (Card.TFrame here would double it)
+        super().__init__(parent, style="CardFlat.TFrame")
         self.on_change = on_change
         self.fr_provider = fr_provider   # callable -> (suggestions, info_text)
         self.vars = {tag: tk.BooleanVar(value=False) for tag in L.APPROVED_TAGS}
@@ -952,10 +974,10 @@ class TagSelectorPanel(ttk.Frame):
         self._auto_tier_tag = "Budget"
         self._suggestions = []
 
-        ttk.Label(self, text="TAGS  (pick 4–12 total)", style="CardHeader.TLabel").grid(
+        ttk.Label(self, text="TAGS  (pick 4-12 total)", style="CardHeader.TLabel").grid(
             row=0, column=0, sticky="w", padx=8, pady=(8, 2))
         self.count_label = ttk.Label(self, text="0 / 12 selected", style="Card.TLabel",
-                                      foreground=TEXT_DIM)
+                                      foreground=theme.TEXT_DIM)
         self.count_label.grid(row=0, column=1, sticky="e", padx=8)
 
         self.suggest_btn = ttk.Button(
@@ -966,43 +988,52 @@ class TagSelectorPanel(ttk.Frame):
             self.suggest_btn.configure(state="disabled")
         self.suggest_btn.grid(row=1, column=0, sticky="w", padx=8, pady=(2, 4))
 
-        self.emoji_font = pick_emoji_font()
+        self.emoji_font = theme.pick_emoji_font()
 
         # groups start below the suggestion button row
         r = 2
         for group_name, tags in L.TAG_GROUPS.items():
-            ttk.Label(self, text=group_name, style="Card.TLabel", foreground=ACCENT_BLUE,
-                      font=(pick_font_family(), 9, "bold")).grid(
+            ttk.Label(self, text=group_name, style="Card.TLabel", foreground=theme.ACCENT_BLUE,
+                      font=theme.font(12, "bold")).grid(
                 row=r, column=0, columnspan=2, sticky="w", padx=8, pady=(8, 2))
             r += 1
             if group_name.startswith("Price Tier"):
                 self.tier_label = ttk.Label(self, text="Auto: Budget ($0-99)",
-                                             style="Card.TLabel", foreground=ACCENT_ORANGE)
+                                             style="Card.TLabel", foreground=theme.ACCENT_ORANGE)
                 self.tier_label.grid(row=r, column=0, columnspan=2, sticky="w", padx=16)
                 r += 1
                 continue
-            col_frame = ttk.Frame(self, style="Card.TFrame")
+            # flat 4-column grid: emoji + checkbox + name packed tight so a
+            # whole group fits on one or two rows (no boxes, no dividers).
+            # Icons are COLOR emoji PNGs rendered from Segoe UI Emoji
+            # (Tk's text emoji are monochrome); falls back to the plain
+            # text glyph when color rendering is unavailable.
+            col_frame = ttk.Frame(self, style="CardFlat.TFrame")
             col_frame.grid(row=r, column=0, columnspan=2, sticky="w", padx=12)
             r += 1
             # alphabetical within each group for faster scanning
             for i, tag in enumerate(sorted(tags)):
-                cell = ttk.Frame(col_frame, style="Card.TFrame")
-                cell.grid(row=i // 3, column=i % 3, sticky="w", padx=4, pady=2)
+                cell = ttk.Frame(col_frame, style="CardFlat.TFrame")
+                cell.grid(row=i // 4, column=i % 4, sticky="w", padx=(0, 10),
+                          pady=1)
+                emoji = TAG_EMOJI.get(tag)
                 e_label = None
-                icon = tag_icon(tag)          # colored PNG (preferred)
-                if icon is not None:
-                    e_label = ttk.Label(cell, image=icon,
-                                         background=BG_CARD, cursor="hand2")
-                    e_label.image = icon
-                else:
-                    emoji = TAG_EMOJI.get(tag)
-                    if emoji and self.emoji_font:
+                if emoji:
+                    photo = theme.emoji_photo(emoji, 16)
+                    if photo is not None:
+                        e_label = ttk.Label(cell, image=photo,
+                                             style="Card.TLabel",
+                                             cursor="hand2")
+                        e_label.image = photo
+                    elif self.emoji_font:
                         e_label = ttk.Label(cell, text=emoji,
                                              font=(self.emoji_font, 10),
-                                             background=BG_CARD, cursor="hand2")
+                                             background=theme.BG_CARD,
+                                             cursor="hand2")
                 if e_label is not None:
                     e_label.pack(side="left")
                 cb = ttk.Checkbutton(cell, text=tag, variable=self.vars[tag],
+                                      style="Card.TCheckbutton",
                                       command=lambda t=tag: self._on_toggle(t))
                 cb.pack(side="left")
                 if e_label is not None:
@@ -1012,11 +1043,12 @@ class TagSelectorPanel(ttk.Frame):
         # FR-analysis suggestion strip (populated by "Suggest from FR Data")
         r += 1
         self.fr_status = ttk.Label(self, text="", style="Card.TLabel",
-                                    foreground=TEXT_DIM, wraplength=0,
+                                    foreground=theme.TEXT_DIM,
                                     justify="left")
         self.fr_status.grid(row=r, column=0, columnspan=2, sticky="w", padx=8)
+        theme.bind_dynamic_wrap(self.fr_status, source=self)
         r += 1
-        self.fr_chips = ttk.Frame(self, style="Card.TFrame")
+        self.fr_chips = ttk.Frame(self, style="CardFlat.TFrame")
         self.fr_chips.grid(row=r, column=0, columnspan=2, sticky="w", padx=12,
                             pady=(2, 8))
 
@@ -1131,11 +1163,11 @@ class TagSelectorPanel(ttk.Frame):
         n = len(self._selected_set()) + 1  # +1 for automatic price tier tag
         self.count_label.configure(text="{} / {} selected".format(n, L.MAX_TAGS))
         if n < L.MIN_TAGS:
-            self.count_label.configure(foreground=ACCENT_RED)
+            self.count_label.configure(foreground=theme.ACCENT_RED)
         elif n > L.MAX_TAGS:
-            self.count_label.configure(foreground=ACCENT_RED)
+            self.count_label.configure(foreground=theme.ACCENT_RED)
         else:
-            self.count_label.configure(foreground=ACCENT_GREEN)
+            self.count_label.configure(foreground=theme.ACCENT_GREEN)
 
     def update_price(self, price_usd):
         self.current_price = price_usd
@@ -1168,7 +1200,9 @@ class TagSelectorPanel(ttk.Frame):
 # ---------------------------------------------------------------------------
 class FileLinkerPanel(ttk.Frame):
     def __init__(self, parent, get_data_root):
-        super().__init__(parent, style="Card.TFrame")
+        # borderless card surface: the make_card() wrapper supplies the
+        # 1px border + offset shadow
+        super().__init__(parent, style="CardFlat.TFrame")
         self.get_data_root = get_data_root
         self.linked = []
         self._all_files_cache = None
@@ -1182,13 +1216,13 @@ class FileLinkerPanel(ttk.Frame):
         # visible from any notebook tab.
         self.on_files_changed = None
 
-        header = ttk.Frame(self, style="Card.TFrame")
+        header = ttk.Frame(self, style="CardFlat.TFrame")
         header.grid(row=0, column=0, columnspan=3, sticky="ew", padx=8, pady=(8, 4))
         ttk.Label(header, text="MEASUREMENT FILES (.txt)",
                   style="CardHeader.TLabel").pack(side="left")
         self.linked_count_var = tk.StringVar(value="")
         ttk.Label(header, textvariable=self.linked_count_var,
-                  style="Card.TLabel", foreground=ACCENT_GREEN).pack(
+                  style="Card.TLabel", foreground=theme.ACCENT_GREEN).pack(
             side="left", padx=(10, 0))
 
         ttk.Label(self, text="Available", style="Card.TLabel").grid(row=1, column=0, sticky="w", padx=8)
@@ -1208,50 +1242,48 @@ class FileLinkerPanel(ttk.Frame):
             self._search_debounce = self.after(150, self._refresh_available)
         self.search_var.trace_add("write", _on_search_change)
 
-        avail_frame = ttk.Frame(self, style="Card.TFrame")
+        avail_frame = ttk.Frame(self, style="CardFlat.TFrame")
         avail_frame.grid(row=3, column=0, sticky="nsew", padx=8, pady=4)
         avail_frame.rowconfigure(0, weight=1)
         avail_frame.columnconfigure(0, weight=1)
-        self.available_list = tk.Listbox(avail_frame, background=BG_INPUT, foreground=TEXT_MAIN,
-                                          selectbackground=ACCENT_BLUE, selectmode="extended",
-                                          height=6, exportselection=False)
+        self.available_list = tk.Listbox(avail_frame, background=theme.BG_INPUT, foreground=theme.TEXT_MAIN,
+                                          selectbackground=theme.ACCENT_BLUE, selectmode="extended",
+                                          height=8, width=28, exportselection=False,
+                                          font=theme.font(13))
         self.available_list.grid(row=0, column=0, sticky="nsew")
         avail_scroll = ttk.Scrollbar(avail_frame, orient="vertical",
                                       command=self.available_list.yview)
         avail_scroll.grid(row=0, column=1, sticky="ns")
         self.available_list.configure(yscrollcommand=avail_scroll.set)
-        avail_hscroll = ttk.Scrollbar(avail_frame, orient="horizontal",
-                                       command=self.available_list.xview)
-        avail_hscroll.grid(row=1, column=0, sticky="ew")
-        self.available_list.configure(xscrollcommand=avail_hscroll.set)
+        # no horizontal scrollbar: clipped paths marquee when selected
         attach_touch_scroll(self.available_list)
         # Mouse wheel scrolls the list even without clicking into it first.
         self.available_list.bind("<MouseWheel>", self._on_mousewheel_available)
         self.available_list.bind("<Button-4>", self._on_mousewheel_available)
         self.available_list.bind("<Button-5>", self._on_mousewheel_available)
 
-        btns = ttk.Frame(self, style="Card.TFrame")
+        btns = ttk.Frame(self, style="CardFlat.TFrame")
         btns.grid(row=3, column=1, sticky="ns")
-        ttk.Button(btns, text="Add >>", command=self._add_selected, width=8).pack(pady=4)
-        ttk.Button(btns, text="<< Remove", command=self._remove_selected, width=8).pack(pady=4)
-        ttk.Button(btns, text="Refresh", command=self._invalidate_cache, width=8).pack(pady=4)
+        # width is in characters, not pixels -- 8 was one short of fitting
+        # "<< Remove" (9 chars), which is what clipped it to "<< Remov".
+        ttk.Button(btns, text="Add >>", command=self._add_selected, width=10).pack(pady=4)
+        ttk.Button(btns, text="<< Remove", command=self._remove_selected, width=10).pack(pady=4)
+        ttk.Button(btns, text="Refresh", command=self._invalidate_cache, width=10).pack(pady=4)
 
-        linked_frame = ttk.Frame(self, style="Card.TFrame")
+        linked_frame = ttk.Frame(self, style="CardFlat.TFrame")
         linked_frame.grid(row=3, column=2, sticky="nsew", padx=8, pady=4)
         linked_frame.rowconfigure(0, weight=1)
         linked_frame.columnconfigure(0, weight=1)
-        self.linked_list = tk.Listbox(linked_frame, background=BG_INPUT, foreground=TEXT_MAIN,
-                                       selectbackground=ACCENT_BLUE, selectmode="extended",
-                                       height=6, exportselection=False)
+        self.linked_list = tk.Listbox(linked_frame, background=theme.BG_INPUT, foreground=theme.TEXT_MAIN,
+                                       selectbackground=theme.ACCENT_BLUE, selectmode="extended",
+                                       height=8, width=28, exportselection=False,
+                                       font=theme.font(13))
         self.linked_list.grid(row=0, column=0, sticky="nsew")
         linked_scroll = ttk.Scrollbar(linked_frame, orient="vertical",
                                        command=self.linked_list.yview)
         linked_scroll.grid(row=0, column=1, sticky="ns")
         self.linked_list.configure(yscrollcommand=linked_scroll.set)
-        linked_hscroll = ttk.Scrollbar(linked_frame, orient="horizontal",
-                                        command=self.linked_list.xview)
-        linked_hscroll.grid(row=1, column=0, sticky="ew")
-        self.linked_list.configure(xscrollcommand=linked_hscroll.set)
+        # no horizontal scrollbar: clipped paths marquee when selected
         attach_touch_scroll(self.linked_list)
         self.linked_list.bind("<MouseWheel>", self._on_mousewheel_linked)
         self.linked_list.bind("<Button-4>", self._on_mousewheel_linked)
@@ -1283,6 +1315,15 @@ class FileLinkerPanel(ttk.Frame):
                      lambda x, y: self._full_text_at(
                          self.linked_list, self._linked_full, y))
 
+        # marquee: the selected path auto-scrolls when too long for the box
+        # (there are no horizontal scrollbars in this app)
+        self._list_marquee_after = None
+        self._list_marquee_pos = {}
+        self.available_list.bind("<<ListboxSelect>>",
+                                 lambda _e: self._start_list_marquee(), add="+")
+        self.linked_list.bind("<<ListboxSelect>>",
+                              lambda _e: self._start_list_marquee(), add="+")
+
         # data-folder watcher state + lazy start
         self._last_walk = 0.0
         self._walk_thread = None
@@ -1293,9 +1334,14 @@ class FileLinkerPanel(ttk.Frame):
         self.columnconfigure(0, weight=1)
         self.columnconfigure(2, weight=1)
 
-        self.hint = ttk.Label(self, text="", style="Card.TLabel", foreground=TEXT_DIM,
+        self.hint = ttk.Label(self, text="", style="Card.TLabel", foreground=theme.TEXT_DIM,
                                wraplength=380)
         self.hint.grid(row=4, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 8))
+        # keep the wraplength tied to the card's actual width instead of a
+        # fixed guess, so a long hint never pushes the card wider than the
+        # tab and spills text past the window edge on a narrow layout.
+        self.bind("<Configure>", lambda e: self.hint.configure(
+            wraplength=max(120, e.width - 16)), add="+")
 
     def _fire(self, cb):
         """Run an optional callback, never letting a plot hiccup break lists."""
@@ -1450,7 +1496,7 @@ class FileLinkerPanel(ttk.Frame):
         sel = set(lb.curselection())
         lb.delete(0, tk.END)
         for n, it in enumerate(items):
-            lb.insert(tk.END, ellipsize(it, cap) if cap else it)
+            lb.insert(tk.END, ellipsize_path(it, cap) if cap else it)
         try:
             lb.yview_moveto(y0)
             for n in sorted(sel & set(range(len(items)))):
@@ -1463,6 +1509,54 @@ class FileLinkerPanel(ttk.Frame):
         if 0 <= idx < len(full_items):
             return full_items[idx]
         return ""
+
+    # -- marquee for clipped measurement paths -----------------------------
+    LIST_MARQUEE_TICK_MS = 160
+
+    def _start_list_marquee(self):
+        if self._list_marquee_after:
+            try:
+                self.after_cancel(self._list_marquee_after)
+            except Exception:
+                pass
+        self._list_marquee_after = None
+        self._list_marquee_pos = {}
+        self._list_marquee_tick()
+
+    def _list_marquee_tick(self):
+        scrolling = False
+        for key, lb, full_list in (
+                ("avail", self.available_list, self._available_full),
+                ("linked", self.linked_list, self._linked_full)):
+            sel = lb.curselection()
+            if not sel:
+                continue
+            idx = sel[0]
+            if idx >= len(full_list):
+                continue
+            full = full_list[idx]
+            try:
+                disp = lb.get(idx)
+            except Exception:
+                continue
+            if not disp or disp == full:
+                continue                    # fits: nothing to scroll
+            budget = len(disp)
+            pos = self._list_marquee_pos.get(key, 0)
+            pos = (pos + 1) % max(1, len(full) + 4)
+            self._list_marquee_pos[key] = pos
+            window = full[pos:]
+            if len(window) < budget:        # loop gap before wrapping
+                window = window + "     " + full
+            lb.delete(idx)
+            lb.insert(idx, window[:budget])
+            lb.selection_set(idx)
+            scrolling = True
+        if scrolling:
+            self._list_marquee_after = self.after(
+                self.LIST_MARQUEE_TICK_MS, self._list_marquee_tick)
+        else:
+            self._list_marquee_after = None
 
     def _add_selected(self):
         # Resolve from _available_full (the untruncated strings): the listbox
@@ -1600,23 +1694,43 @@ class IconCombobox(ttk.Frame):
     dynamic value lists and lock/disable."""
 
     def __init__(self, parent, values, icon_for, textvariable,
-                 on_change=None, width=22, **kw):
-        super().__init__(parent, style="Card.TFrame")
+                 on_change=None, width=22, button_icon_for=None, **kw):
+        # borderless: sits INSIDE the specs card (the card supplies borders)
+        super().__init__(parent, style="CardFlat.TFrame")
         self.icon_for = icon_for            # callable(value) -> PhotoImage|None
+        self.button_icon_for = button_icon_for
         self.textvariable = textvariable
         self.on_change = on_change
         self.values = []
         self._locked = False
+        self._btn_image = None
         self.button = ttk.Menubutton(self, textvariable=textvariable,
                                       direction="flush", width=width)
-        self.button.pack(fill="x")
+        self.button.pack(fill="x", ipady=2)
         self.menu = tk.Menu(self.button, tearoff=0,
-                            background=BG_CARD, foreground=TEXT_MAIN,
-                            activebackground=BORDER_LIGHT,
-                            activeforeground=TEXT_MAIN,
-                            font=(pick_font_family(), 10))
-        self.button.configure(menu=self.menu)
+                            background=theme.BG_CARD, foreground=theme.TEXT_MAIN,
+                            activebackground=theme.ACCENT_BLUE,
+                            activeforeground=theme.contrast_text(theme.ACCENT_BLUE),
+                            font=theme.font(13), borderwidth=1,
+                            relief="solid")
+        # NOT attached to the button: attaching lets the WM place the
+        # popdown wherever it likes (offset / mis-sized on Windows). We post
+        # it ourselves exactly below the button, left edges aligned, so the
+        # dropdown lines up like a real combobox.
+        self.button.bind("<Button-1>", self._post_menu)
         self.set_values(values)
+
+    def _post_menu(self, _event=None):
+        if self._locked:
+            return
+        self.button.update_idletasks()
+        x = self.button.winfo_rootx()
+        y = self.button.winfo_rooty() + self.button.winfo_height()
+        try:
+            self.menu.tk_popup(x, y)
+        except Exception:
+            self.menu.post(x, y)
+        return "break"
 
     def set_values(self, values):
         """Rebuild the dropdown list (keeps current selection if still valid)."""
@@ -1631,12 +1745,25 @@ class IconCombobox(ttk.Frame):
             self.menu.add_command(**kwargs)
         if self.textvariable.get() not in self.values:
             self.textvariable.set(self.values[0] if self.values else "")
+        self._refresh_button_icon()
+
+    def _refresh_button_icon(self):
+        """Show the selected value's emoji on the closed button too."""
+        if self.button_icon_for is None:
+            return
+        icon = self.button_icon_for(self.textvariable.get())
+        if icon is not None:
+            self._btn_image = icon     # keep a reference (GC)
+            self.button.configure(image=icon, compound="left")
+        else:
+            self.button.configure(image=None, compound="none")
 
     def _choose(self, value):
         if self._locked:
             return
         if value != self.textvariable.get():
             self.textvariable.set(value)
+            self._refresh_button_icon()
             if self.on_change:
                 self.on_change()
 
@@ -1646,6 +1773,7 @@ class IconCombobox(ttk.Frame):
     def set(self, value):
         if value in self.values:
             self.textvariable.set(value)
+            self._refresh_button_icon()
 
     def set_locked(self, locked):
         """Locked = selection visible but changing it is disallowed."""
@@ -1668,8 +1796,7 @@ class EntryEditor(ttk.Frame):
         self._build()
 
     def _build(self):
-        font_family = pick_font_family()
-        canvas = tk.Canvas(self, background=BG_MAIN, highlightthickness=0)
+        canvas = tk.Canvas(self, background=theme.BG_MAIN, highlightthickness=0)
         vsb = ttk.Scrollbar(self, orient="vertical", command=canvas.yview)
         canvas.configure(yscrollcommand=vsb.set)
         canvas.pack(side="left", fill="both", expand=True)
@@ -1698,8 +1825,8 @@ class EntryEditor(ttk.Frame):
         pad = dict(padx=10, pady=4)
 
         # ---- identity row ----
-        card = ttk.Frame(inner, style="Card.TFrame")
-        card.pack(fill="x", padx=10, pady=8)
+        card_outer, card = make_card(inner)
+        card_outer.pack(fill="x", padx=10, pady=8)
         ttk.Label(card, text="IDENTITY", style="CardHeader.TLabel").grid(
             row=0, column=0, columnspan=6, sticky="w", padx=8, pady=(8, 4))
 
@@ -1724,56 +1851,53 @@ class EntryEditor(ttk.Frame):
         for c in range(3):
             card.columnconfigure(c, weight=1)
 
-        ttk.Label(card, text="Auto-generated ID:", style="Card.TLabel", foreground=TEXT_DIM).grid(
+        ttk.Label(card, text="Auto-generated ID:", style="Card.TLabel", foreground=theme.TEXT_DIM).grid(
             row=3, column=0, sticky="w", padx=8)
         self.id_var = tk.StringVar(value="")
         id_label = ttk.Label(card, textvariable=self.id_var, style="Card.TLabel",
-                              foreground=ACCENT_GREEN, font=(font_family, 10, "bold"))
+                              foreground=theme.ACCENT_GREEN, font=theme.font(13, "bold"))
         id_label.grid(row=3, column=1, columnspan=2, sticky="w", padx=8, pady=(0, 8))
 
-        # ---- specs card (responsive: numeric fields on one row, the two
-        # wide dropdowns on their own row so they never clip in half-screen
-        # snapped windows) ----
-        specs = ttk.Frame(inner, style="Card.TFrame")
-        specs.pack(fill="x", padx=10, pady=8)
+        # ---- specs card (responsive: numeric fields lay out 4-across on
+        # wide windows and 2x2 on narrow ones -- see _apply_spec_layout) ----
+        specs_outer, specs = make_card(inner)
+        specs_outer.pack(fill="x", padx=10, pady=8)
         ttk.Label(specs, text="SPECIFICATIONS", style="CardHeader.TLabel").grid(
             row=0, column=0, columnspan=6, sticky="w", padx=8, pady=(8, 4))
         for col in range(6):
             specs.columnconfigure(col, weight=1, uniform="speccol")
+        self._specs = specs
 
-        ttk.Label(specs, text="Year (0 = unknown)", style="Card.TLabel").grid(row=1, column=0, sticky="w", padx=8)
+        def _spec_label(text):
+            return ttk.Label(specs, text=text, style="Card.TLabel")
+
         self.year_var = tk.StringVar(value="0")
-        year_entry = ttk.Entry(specs, textvariable=self.year_var, width=8)
-        year_entry.grid(row=2, column=0, sticky="ew", padx=8, pady=(0, 6))
-        year_entry.bind("<FocusOut>", self._validate_year)
-        attach_entry_context_menu(year_entry)
-
-        ttk.Label(specs, text="Price (USD)", style="Card.TLabel").grid(row=1, column=1, sticky="w", padx=8)
         self.price_var = tk.StringVar(value="0")
-        price_entry = ttk.Entry(specs, textvariable=self.price_var, width=8)
-        price_entry.grid(row=2, column=1, sticky="ew", padx=8, pady=(0, 6))
-        price_entry.bind("<FocusOut>", self._validate_price)
-        attach_entry_context_menu(price_entry)
-
-        ttk.Label(specs, text="Impedance (Ω)", style="Card.TLabel").grid(row=1, column=2, sticky="w", padx=8)
         self.impedance_var = tk.StringVar(value="0")
+        self.sensitivity_var = tk.StringVar(value="0")
+
+        year_lbl = _spec_label("Year")
+        self.year_entry = ttk.Entry(specs, textvariable=self.year_var, width=8)
+        self.year_entry.bind("<FocusOut>", self._validate_year)
+        attach_entry_context_menu(self.year_entry)
+
+        price_lbl = _spec_label("Price USD")
+        self.price_entry = ttk.Entry(specs, textvariable=self.price_var, width=8)
+        self.price_entry.bind("<FocusOut>", self._validate_price)
+        attach_entry_context_menu(self.price_entry)
+
+        imp_lbl = _spec_label("Impedance \u03A9")
         self.impedance_entry = ttk.Entry(specs, textvariable=self.impedance_var, width=8)
-        self.impedance_entry.grid(row=2, column=2, sticky="ew", padx=8, pady=(0, 6))
         attach_entry_context_menu(self.impedance_entry)
 
-        ttk.Label(specs, text="Sensitivity (dB/mW)", style="Card.TLabel").grid(row=1, column=3, sticky="w", padx=8)
-        self.sensitivity_var = tk.StringVar(value="0")
+        sen_lbl = _spec_label("Sensitivity dB")
         self.sensitivity_entry = ttk.Entry(specs, textvariable=self.sensitivity_var, width=8)
-        self.sensitivity_entry.grid(row=2, column=3, sticky="ew", padx=8, pady=(0, 6))
         attach_entry_context_menu(self.sensitivity_entry)
 
-        self.year_hint = ttk.Label(specs, text="", style="Card.TLabel", foreground=ACCENT_RED)
-        self.year_hint.grid(row=3, column=0, sticky="w", padx=8)
-        self.price_hint = ttk.Label(specs, text="", style="Card.TLabel", foreground=ACCENT_ORANGE)
-        self.price_hint.grid(row=3, column=1, sticky="w", padx=8)
+        self.year_hint = ttk.Label(specs, text="", style="Card.TLabel", foreground=theme.ACCENT_RED)
+        self.price_hint = ttk.Label(specs, text="", style="Card.TLabel", foreground=theme.ACCENT_ORANGE)
 
-        ttk.Label(specs, text="Form Factor", style="Card.TLabel").grid(
-            row=4, column=0, columnspan=2, sticky="w", padx=8, pady=(4, 0))
+        ff_lbl = _spec_label("Form Factor")
         self.form_var = tk.StringVar(value=L.FORM_FACTORS[0])
         self.form_picker = IconCombobox(
             specs, L.FORM_FACTORS,
@@ -1784,52 +1908,68 @@ class EntryEditor(ttk.Frame):
             self.form_var,
             on_change=lambda: self._on_form_change(user_initiated=True),
             width=16)
-        self.form_picker.grid(row=5, column=0, columnspan=2, sticky="ew", padx=8, pady=(0, 6))
 
-        ttk.Label(specs, text="Connector", style="Card.TLabel").grid(
-            row=4, column=2, columnspan=2, sticky="w", padx=8, pady=(4, 0))
+        conn_lbl = _spec_label("Connector")
         self.connector_var = tk.StringVar(value="")
         self.connector_picker = IconCombobox(
             specs, L.FORM_CONNECTOR_MAP[L.FORM_FACTORS[0]],
             lambda v: ICONS.get(L.CONNECTOR_ICON.get(v, "")),
             self.connector_var, width=12)
-        self.connector_picker.grid(row=5, column=2, columnspan=2, sticky="ew", padx=8, pady=(0, 6))
 
         self.spec_hint = ttk.Label(specs, text="", style="Card.TLabel",
-                                    foreground=ACCENT_ORANGE, wraplength=260,
+                                    foreground=theme.ACCENT_ORANGE, wraplength=260,
                                     justify="left")
-        self.spec_hint.grid(row=5, column=4, columnspan=2, sticky="w", padx=8, pady=(0, 6))
+
+        # widget refs used by the responsive re-layout
+        self._spec_widgets = {
+            "year": (year_lbl, self.year_entry),
+            "price": (price_lbl, self.price_entry),
+            "imp": (imp_lbl, self.impedance_entry),
+            "sens": (sen_lbl, self.sensitivity_entry),
+        }
+        self._spec_dropdowns = ((ff_lbl, self.form_picker),
+                                (conn_lbl, self.connector_picker))
+        self._specs_narrow = None
+        self._apply_spec_layout(False)
 
         # ---- driver config ----
-        self.driver_panel = DriverConfigPanel(inner)
-        self.driver_panel.pack(fill="x", padx=10, pady=8)
+        dp_outer, dp_card = make_card(inner)
+        self.driver_panel = DriverConfigPanel(dp_card)
+        self.driver_panel.pack(fill="both", expand=True)
+        dp_outer.pack(fill="x", padx=10, pady=8)
 
         # ---- tags ----
-        self.tag_panel = TagSelectorPanel(inner, fr_provider=self._fr_suggestions)
-        self.tag_panel.pack(fill="x", padx=10, pady=8)
+        tg_outer, tg_card = make_card(inner)
+        self.tag_panel = TagSelectorPanel(tg_card, fr_provider=self._fr_suggestions)
+        self.tag_panel.pack(fill="both", expand=True)
+        tg_outer.pack(fill="x", padx=10, pady=8)
 
         # ---- FR preview (live curves above the file linker) ----
-        fr_card = ttk.Frame(inner, style="Card.TFrame")
-        fr_card.pack(fill="x", padx=10, pady=8)
-        fr_head = ttk.Frame(fr_card, style="Card.TFrame")
+        fr_outer, fr_card = make_card(inner)
+        fr_outer.pack(fill="x", padx=10, pady=8)
+        fr_head = ttk.Frame(fr_card, style="CardFlat.TFrame")
         fr_head.pack(fill="x", padx=8, pady=(8, 2))
         ttk.Label(fr_head, text="\U0001F4C8  FR PREVIEW",
                   style="CardHeader.TLabel").pack(side="left")
         self.fr_legend = ttk.Label(fr_head, text="", style="Card.TLabel",
-                                   foreground=TEXT_DIM)
+                                   foreground=theme.TEXT_DIM)
         self.fr_legend.pack(side="left", padx=(12, 0))
         self.fr_avg_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(fr_head, text="Avg", variable=self.fr_avg_var,
+                        style="Card.TCheckbutton",
                         command=self._refresh_fr_plot).pack(side="right", padx=6)
         self.fr_overlay_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(fr_head, text="Overlay all", variable=self.fr_overlay_var,
+                        style="Card.TCheckbutton",
                         command=self._refresh_fr_plot).pack(side="right")
         self.fr_plot = fr_plot.CurvePlot(fr_card, height=230)
         self.fr_plot.pack(fill="both", expand=True, padx=8, pady=(2, 8))
 
         # ---- files ----
-        self.file_panel = FileLinkerPanel(inner, self.app.get_data_root)
-        self.file_panel.pack(fill="x", padx=10, pady=8)
+        fl_outer, fl_card = make_card(inner)
+        self.file_panel = FileLinkerPanel(fl_card, self.app.get_data_root)
+        self.file_panel.pack(fill="both", expand=True)
+        fl_outer.pack(fill="x", padx=10, pady=8)
         # plot follows list interactions: linked selection -> emphasis,
         # available browsing -> dashed ghost preview of the unlinked file
         self.file_panel.on_linked_select = self._refresh_fr_plot
@@ -1841,14 +1981,118 @@ class EntryEditor(ttk.Frame):
         ttk.Button(actions, text="Save Entry", style="Accent.TButton",
                    command=self._on_save).pack(side="left", padx=4)
         ttk.Button(actions, text="Clear / New", command=self.new_entry).pack(side="left", padx=4)
-        self.validation_label = ttk.Label(actions, text="", style="TLabel", foreground=ACCENT_RED,
-                                           wraplength=600)
+        self.validation_label = ttk.Label(actions, text="", style="TLabel", foreground=theme.ACCENT_RED,
+                                           justify="left")
         self.validation_label.pack(side="left", padx=12)
+        # account for the two buttons already sitting in this row when
+        # computing how much width is left for the message.
+        theme.bind_dynamic_wrap(self.validation_label, source=actions, pad=240)
 
         # touch-style drag panning for the whole editor form (passive areas)
         attach_touch_scroll_canvas(canvas, inner)
 
+        # responsive layout: switch specs to 2x2 and driver rows to a single
+        # column when the form gets too narrow for the wide layout
+        self._resp_after = None
+        canvas.bind("<Configure>", self._schedule_responsive, add="+")
+
         self._on_form_change()
+
+    # -- responsive layout -------------------------------------------------
+    def _schedule_responsive(self, event=None):
+        if self._resp_after is not None:
+            try:
+                self.after_cancel(self._resp_after)
+            except Exception:
+                pass
+        width = event.width if event is not None else self.winfo_width()
+        self._resp_after = self.after(120, lambda: self._responsive(width))
+
+    def _wide_specs_min_width(self):
+        """Minimum card width the 4-across spec row needs, measured from
+        the ACTUAL current font instead of a guessed pixel constant -- a
+        fixed number only happened to work for whichever font was active
+        when it was written, and clipped labels the moment someone picked
+        a wider bundled font."""
+        import tkinter.font as tkfont
+        fm = tkfont.Font(font=theme.font(13))
+        longest = max(fm.measure(t) for t in
+                      ("Sensitivity dB", "Impedance \u03A9", "Price USD", "Year"))
+        # 4 field columns + 2 hint columns, ~16px padding each, plus a
+        # small safety margin so wrapping never lands right on the edge
+        return int((longest + 16) * 6 * 1.08) + 24
+
+    def _responsive(self, width):
+        self._resp_after = None
+        narrow = max(200, width) < self._wide_specs_min_width()
+        if narrow != self._specs_narrow:
+            self._apply_spec_layout(narrow)
+        # 2-across driver rows need ~780px; below that stack them
+        self.driver_panel.set_columns(2 if width >= 780 else 1)
+
+    def _grid_pair(self, key, row, col, span=1):
+        lbl, ent = self._spec_widgets[key]
+        lbl.grid(row=row, column=col, columnspan=span, sticky="w", padx=8)
+        ent.grid(row=row + 1, column=col, columnspan=span, sticky="ew",
+                 padx=8, pady=(0, 6))
+
+    def _apply_spec_layout(self, narrow):
+        """WIDE: Year/Price/Impedance/Sensitivity on one 4-column row.
+        NARROW: 2x2 grid so no label ever clips. Dropdown rows and hints
+        re-grid accordingly.
+
+        Columns are reconfigured from scratch every call: the two modes
+        use a different number of "live" columns (4 vs 6), and leaving
+        the other mode's uniform group in place used to force 4-6 equal
+        slices of the card no matter how many of them actually held a
+        widget -- e.g. narrow mode used only columns 0 and 2 out of 6
+        uniform columns, so each field got squeezed into 1/6 of the
+        card's width and every label clipped ("Impedance..." -> "IMPEDAI").
+        Resetting first, then only weighting the columns this mode
+        actually uses, is what keeps that from happening again."""
+        g = self._specs
+        for col in range(6):
+            g.columnconfigure(col, weight=0, uniform="")
+        if narrow:
+            # 2 fields per row, each spanning 2 of 4 live columns so the
+            # full card width splits evenly between exactly two boxes.
+            for col in range(4):
+                g.columnconfigure(col, weight=1, uniform="specs_narrow")
+            self._grid_pair("year", 1, 0, span=2)
+            self._grid_pair("price", 1, 2, span=2)
+            self._grid_pair("imp", 3, 0, span=2)
+            self._grid_pair("sens", 3, 2, span=2)
+            self.year_hint.grid(row=5, column=0, columnspan=2, sticky="w", padx=8)
+            self.price_hint.grid(row=5, column=2, columnspan=2, sticky="w", padx=8)
+            ff_lbl, ff_pick = self._spec_dropdowns[0]
+            cn_lbl, cn_pick = self._spec_dropdowns[1]
+            ff_lbl.grid(row=6, column=0, columnspan=2, sticky="w", padx=8, pady=(4, 0))
+            ff_pick.grid(row=7, column=0, columnspan=2, sticky="ew", padx=8, pady=(0, 6))
+            cn_lbl.grid(row=6, column=2, columnspan=2, sticky="w", padx=8, pady=(4, 0))
+            cn_pick.grid(row=7, column=2, columnspan=2, sticky="ew", padx=8, pady=(0, 6))
+            self.spec_hint.grid(row=8, column=0, columnspan=4, sticky="w", padx=8,
+                                pady=(0, 6))
+            self.spec_hint.configure(wraplength=320)
+        else:
+            # 4 fields + a hint column, all 6 columns live and equal.
+            for col in range(6):
+                g.columnconfigure(col, weight=1, uniform="specs_wide")
+            self._grid_pair("year", 1, 0)
+            self._grid_pair("price", 1, 1)
+            self._grid_pair("imp", 1, 2)
+            self._grid_pair("sens", 1, 3)
+            self.year_hint.grid(row=3, column=0, sticky="w", padx=8)
+            self.price_hint.grid(row=3, column=1, sticky="w", padx=8)
+            ff_lbl, ff_pick = self._spec_dropdowns[0]
+            cn_lbl, cn_pick = self._spec_dropdowns[1]
+            ff_lbl.grid(row=4, column=0, columnspan=2, sticky="w", padx=8, pady=(4, 0))
+            ff_pick.grid(row=5, column=0, columnspan=2, sticky="ew", padx=8, pady=(0, 6))
+            cn_lbl.grid(row=4, column=2, columnspan=2, sticky="w", padx=8, pady=(4, 0))
+            cn_pick.grid(row=5, column=2, columnspan=2, sticky="ew", padx=8, pady=(0, 6))
+            self.spec_hint.grid(row=5, column=4, columnspan=2, sticky="w", padx=8,
+                                pady=(0, 6))
+            self.spec_hint.configure(wraplength=260)
+        self._specs_narrow = narrow
 
     # -- helpers -------------------------------------------------------
     def _on_identity_change(self, _value=None):
@@ -2016,7 +2260,7 @@ class EntryEditor(ttk.Frame):
             norm = fr_plot.normalized(pts) if pts else []
             if not norm:
                 continue
-            color = fr_plot.PALETTE[i % len(fr_plot.PALETTE)]
+            color = fr_plot.palette()[i % len(fr_plot.palette())]
             if sel and i in sel:
                 width = 3                 # emphasized: bold, full color
             elif sel:
@@ -2035,7 +2279,7 @@ class EntryEditor(ttk.Frame):
             gnorm = fr_plot.normalized(gpts) if gpts else []
             if gnorm:
                 series.insert(0, {"name": "~ " + os.path.basename(ghost_rel),
-                                  "pts": gnorm, "color": TEXT_DIM,
+                                  "pts": gnorm, "color": theme.TEXT_DIM,
                                   "width": 1, "dash": (5, 3)})
                 names.insert(0, os.path.basename(ghost_rel))
         # average of the drawn solid curves (normalized domain)
@@ -2208,6 +2452,237 @@ class EntryEditor(ttk.Frame):
 
 
 # ---------------------------------------------------------------------------
+# MERGE DUPLICATE ENTRIES DIALOG
+# ---------------------------------------------------------------------------
+_MERGE_FIELDS = [
+    ("brand", "Brand"),
+    ("model", "Model"),
+    ("variant", "Variant"),
+    ("year", "Year"),
+    ("price_usd", "Price USD"),
+    ("driver_type", "Driver Type"),
+    ("driver_config", "Driver Config"),
+    ("impedance", "Impedance"),
+    ("sensitivity", "Sensitivity"),
+    ("connector", "Connector"),
+    ("form_factor", "Form Factor"),
+    ("tags", "Tags"),
+]
+
+
+class MergeDialog(tk.Toplevel):
+    """Side-by-side merge for a flagged duplicate pair: pick a winner per
+    field (tags are picked per side too -- unioning two tag sets could
+    create forbidden conflicts). The price-tier tag is stripped from the
+    chosen set and re-added automatically to match the winning price.
+    Measurement files always merge as a union. The surviving entry keeps
+    the first entry's list position; its id is rebuilt from the winning
+    Brand/Model/Variant, and the second entry is deleted."""
+
+    def __init__(self, master, app, pos_a, pos_b):
+        super().__init__(master)
+        self.app = app
+        self.pos_a, self.pos_b = pos_a, pos_b
+        self.a = app.entries[pos_a]
+        self.b = app.entries[pos_b]
+        self.merged_id = None
+        self.title("Merge Duplicate Entries")
+        self.configure(background=theme.BG_MAIN)
+        self.transient(master)
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+
+        id_a = self.a.get("id") or "(no id)"
+        id_b = self.b.get("id") or "(no id)"
+
+        outer, card = make_card(self)
+        outer.pack(fill="both", expand=True, padx=12, pady=12)
+
+        ttk.Label(card, text="\u2694  MERGE DUPLICATE ENTRIES",
+                  style="CardHeader.TLabel").pack(anchor="w", padx=8,
+                                                  pady=(8, 2))
+        ttk.Label(
+            card,
+            text="Pick a winner for each field -- including tags, so "
+                 "conflicting tag sets can never sneak into the merge. The "
+                 "price-tier tag follows the winning price automatically, "
+                 "and measurement files from both entries are combined. The "
+                 "entry that is not kept is deleted. Everything applies as "
+                 "a single undoable step.",
+            style="Card.TLabel", foreground=theme.TEXT_DIM,
+            wraplength=660, justify="left").pack(anchor="w", padx=8,
+                                                 pady=(0, 8))
+
+        grid = ttk.Frame(card, style="CardFlat.TFrame")
+        grid.pack(fill="x", padx=8)
+        for c, w in ((0, 0), (1, 1), (2, 0), (3, 0), (4, 1)):
+            grid.columnconfigure(c, weight=w)
+
+        ttk.Label(grid, text="Field", style="Card.TLabel",
+                  foreground=theme.TEXT_DIM).grid(row=0, column=0, sticky="w",
+                                                  padx=(0, 8))
+        ttk.Label(grid, text="A:  " + id_a, style="Card.TLabel",
+                  foreground=theme.ACCENT_BLUE).grid(row=0, column=1,
+                                                     sticky="w", padx=(0, 4))
+        ttk.Label(grid, text="Keep", style="Card.TLabel",
+                  foreground=theme.TEXT_DIM).grid(row=0, column=2,
+                                                  columnspan=2, sticky="w")
+        ttk.Label(grid, text="B:  " + id_b, style="Card.TLabel",
+                  foreground=theme.ACCENT_BLUE).grid(row=0, column=4,
+                                                     sticky="w", padx=(8, 0))
+
+        self._vars = {}
+        for r, (key, label) in enumerate(_MERGE_FIELDS, start=1):
+            ttk.Label(grid, text=label, style="Card.TLabel").grid(
+                row=r, column=0, sticky="w", padx=(0, 8), pady=2)
+            va, vb = self._fmt(self.a.get(key)), self._fmt(self.b.get(key))
+            ttk.Label(grid, text=va or "\u2014",
+                      style="Card.TLabel",
+                      foreground=theme.TEXT_MAIN if va else theme.TEXT_DIM,
+                      wraplength=250, justify="left").grid(
+                row=r, column=1, sticky="w", padx=(0, 4), pady=2)
+            var = tk.StringVar(
+                value=self._default_side(key, self.a.get(key), self.b.get(key)))
+            self._vars[key] = var
+            for side, col in (("A", 2), ("B", 3)):
+                ttk.Radiobutton(grid, text=side, value=side, variable=var,
+                                style="Card.TRadiobutton").grid(
+                    row=r, column=col, sticky="w", padx=(2, 2))
+            ttk.Label(grid, text=vb or "\u2014",
+                      style="Card.TLabel",
+                      foreground=theme.TEXT_MAIN if vb else theme.TEXT_DIM,
+                      wraplength=250, justify="left").grid(
+                row=r, column=4, sticky="w", padx=(8, 0), pady=2)
+
+        # measurement files always merge as a union
+        self.files_union = list(dict.fromkeys(
+            list(self.a.get("files") or []) + list(self.b.get("files") or [])))
+        union_row = len(_MERGE_FIELDS) + 1
+        ttk.Label(grid, text="Files", style="Card.TLabel").grid(
+            row=union_row, column=0, sticky="w", padx=(0, 8), pady=(6, 2))
+        ttk.Label(grid, text="{} + {} -> {} unique (combined)".format(
+            len(self.a.get("files") or []), len(self.b.get("files") or []),
+            len(self.files_union)), style="Card.TLabel",
+            foreground=theme.ACCENT_GREEN).grid(row=union_row, column=1,
+                                                columnspan=4, sticky="w")
+        ttk.Label(grid, text="(price-tier tag follows the winning price)",
+                  style="Card.TLabel",
+                  foreground=theme.TEXT_DIM).grid(row=union_row + 1, column=0,
+                                                  columnspan=5, sticky="w",
+                                                  pady=(4, 0))
+
+        self.status_lbl = ttk.Label(card, text="", style="Card.TLabel",
+                                    foreground=theme.ACCENT_RED,
+                                    wraplength=660, justify="left")
+        self.status_lbl.pack(anchor="w", padx=8, pady=(8, 0))
+
+        btns = ttk.Frame(card, style="CardFlat.TFrame")
+        btns.pack(fill="x", padx=8, pady=(8, 10))
+        ttk.Button(btns, text="Merge", style="Accent.TButton",
+                   command=self._apply).pack(side="left")
+        ttk.Button(btns, text="Cancel",
+                   command=self.destroy).pack(side="left", padx=8)
+
+        self.bind("<Escape>", lambda _e: self.destroy())
+        self.update_idletasks()
+        self.minsize(760, 0)
+        self.grab_set()
+
+    @staticmethod
+    def _fmt(value):
+        if isinstance(value, list):
+            return ", ".join(str(v) for v in value)
+        return str(value) if value not in (None, "") else ""
+
+    @staticmethod
+    def _default_side(key, va, vb):
+        """Non-empty beats empty; non-zero beats 0 on numeric fields; the
+        richer tag set wins on ties; everything else keeps A (the entry
+        the audit row pointed at)."""
+        if key == "tags":
+            la = len(va) if isinstance(va, list) else 0
+            lb = len(vb) if isinstance(vb, list) else 0
+            return "A" if la >= lb else "B"
+        if key in ("year", "price_usd", "impedance", "sensitivity"):
+            try:
+                na, nb = int(str(va or 0)), int(str(vb or 0))
+            except (TypeError, ValueError):
+                na, nb = 0, 0
+            if na == 0 and nb != 0:
+                return "B"
+            return "A"
+        sa, sb = str(va or "").strip(), str(vb or "").strip()
+        if sa and not sb:
+            return "A"
+        if sb and not sa:
+            return "B"
+        return "A"
+
+    def _apply(self):
+        merged = dict(self.a)
+        for key, var in self._vars.items():
+            merged[key] = self.b.get(key) if var.get() == "B" \
+                else self.a.get(key)
+        # tags: the chosen side's set, with the price-tier tag stripped
+        # and re-added to match the WINNING price (unioning two tag sets
+        # could create forbidden conflicts or double tiers)
+        chosen_tags = list(merged.get("tags") or [])
+        merged["tags"] = [t for t in chosen_tags if t not in L.PRICE_TIER_TAGS]
+        merged["tags"].append(L.price_tier_for(merged.get("price_usd", 0)))
+        merged["files"] = list(self.files_union)
+        merged["id"] = L.build_id(str(merged.get("brand") or ""),
+                                  str(merged.get("model") or ""),
+                                  str(merged.get("variant") or ""))
+        if not merged["id"]:
+            self.status_lbl.configure(
+                text="Cannot build a valid id from the winning "
+                     "Brand/Model/Variant.")
+            return
+        others = {e.get("id") for i, e in enumerate(self.app.entries)
+                  if i not in (self.pos_a, self.pos_b) and e.get("id")}
+        errors = L.validate_entry(merged, existing_ids=others)
+        if errors:
+            self.status_lbl.configure(
+                text="Cannot merge:\n- " + "\n- ".join(errors))
+            return
+
+        app = self.app
+        pos_a, pos_b = self.pos_a, self.pos_b
+        a_obj, b_obj = app.entries[pos_a], app.entries[pos_b]
+        merged_final = L.build_clean_entry(merged)
+        app.entries[pos_a] = merged_final
+        del app.entries[pos_b]
+        changes = [{
+            "pos_hint": pos_a,
+            "ref_before": a_obj, "copy_before": app._deepcopy(a_obj),
+            "ref_after": merged_final, "copy_after": app._deepcopy(merged_final),
+        }, {
+            "pos_hint": pos_b,
+            "ref_before": b_obj, "copy_before": app._deepcopy(b_obj),
+            "ref_after": None, "copy_after": None,
+        }]
+        app._record_op("merge", "Merged '{}' into '{}' (duplicate repair)"
+                       .format(b_obj.get("id") or "?",
+                               merged_final.get("id") or "?"), changes)
+        app.dirty = True
+        app._mark_audit_dirty()
+        app.populate_tree()
+        # if the editor is holding one of the merged entries, follow it
+        new_pos = app._find_slot(None, {"id": merged_final["id"]})
+        if app.editing_index is not None and \
+                0 <= app.editing_index < len(app.entries) and \
+                app.entries[app.editing_index] in (a_obj, b_obj):
+            if new_pos >= 0:
+                app.editing_index = new_pos
+                app.editor.load_entry(app.entries[new_pos])
+        app.refresh_spell_vocab()
+        app._autosave()
+        app.status_var.set("Merged '{}' and '{}' into '{}'.".format(
+            a_obj.get("id") or "?", b_obj.get("id") or "?", merged_final["id"]))
+        self.merged_id = merged_final["id"]
+        self.destroy()
+
+
+# ---------------------------------------------------------------------------
 # AUDIT PANEL
 # ---------------------------------------------------------------------------
 class AuditPanel(ttk.Frame):
@@ -2215,70 +2690,107 @@ class AuditPanel(ttk.Frame):
         super().__init__(parent, style="TFrame")
         self.app = app
         self.issues = []
-        self.group_by_entry = tk.BooleanVar(value=True)
-        self.show_ignored = tk.BooleanVar(value=False)
+        # exclusive filter: unticked = ignored issues hidden; ticked = ONLY
+        # ignored issues shown (ready to review / un-ignore)
+        self.show_ignored_only = tk.BooleanVar(value=False)
         self._row_issues = {}      # leaf iid  -> AuditIssue
         self._group_items = {}     # group iid -> [AuditIssue, ...]
 
+        # primary actions as buttons; row-specific actions (Go to Entry,
+        # Merge Duplicate, Ignore/Un-ignore) live in the right-click
+        # context menu so the tab stays uncluttered
         top = ttk.Frame(self, style="TFrame")
         top.pack(fill="x", padx=10, pady=8)
-        ttk.Button(top, text="Run Full Audit", style="Accent.TButton",
-                   command=self.app.run_audit).pack(side="left", padx=4)
-        ttk.Button(top, text="Fix Selected", command=self._fix_selected).pack(side="left", padx=4)
-        ttk.Button(top, text="Fix All Auto-Fixable", style="Blue.TButton",
-                   command=self._fix_all).pack(side="left", padx=4)
-        ttk.Button(top, text="Go to Entry", command=self._goto_selected).pack(side="left", padx=4)
-        ttk.Button(top, text="Export Report...", command=self._export).pack(side="left", padx=4)
-        # waiver controls: verified-true advisories (e.g. 100k-ohm electrostatics)
-        # can be silenced permanently without touching the database itself
-        ttk.Button(top, text="Ignore Selected", command=self._ignore_selected
-                   ).pack(side="left", padx=4)
-        ttk.Button(top, text="Un-ignore Selected", command=self._unignore_selected
-                   ).pack(side="left", padx=4)
-        ttk.Checkbutton(top, text="Show ignored", variable=self.show_ignored,
-                        command=self.rerender).pack(side="left", padx=(14, 4))
-        ttk.Checkbutton(top, text="Group by entry", variable=self.group_by_entry,
-                        command=self.rerender).pack(side="left", padx=(14, 4))
-        self.summary_label = ttk.Label(top, text="No audit run yet.", style="TLabel")
-        self.summary_label.pack(side="left", padx=16)
+        btn_row = ttk.Frame(top, style="TFrame")
+        btn_row.pack(fill="x")
+        ttk.Button(btn_row, text="Run Audit", style="Accent.Compact.TButton",
+                   command=self.app.run_audit).pack(side="left", padx=(3, 2))
+        ttk.Button(btn_row, text="Fix Selected", style="Compact.TButton",
+                   command=self._fix_selected).pack(side="left", padx=2)
+        ttk.Button(btn_row, text="Fix All", style="Blue.Compact.TButton",
+                   command=self._fix_all).pack(side="left", padx=2)
+        ttk.Button(btn_row, text="Export Report", style="Compact.TButton",
+                   command=self._export).pack(side="left", padx=2)
 
-        columns = ("category", "entry", "message", "fixable")
-        self._base_headings = {"category": "Category", "entry": "Entry",
-                               "message": "Issue", "fixable": "Auto-fixable"}
+        opt_row = ttk.Frame(top, style="TFrame")
+        opt_row.pack(fill="x", pady=(6, 0))
+        ttk.Checkbutton(opt_row, text="Ignored only",
+                        variable=self.show_ignored_only,
+                        command=self.rerender).pack(side="left", padx=(4, 4))
+
+        # summary lives on its own row: packed alongside the checkbox it
+        # used to get squeezed out of view (or overlap it) on a narrow
+        # pane, since a Label has no natural stopping point to wrap at.
+        summary_row = ttk.Frame(top, style="TFrame")
+        summary_row.pack(fill="x", pady=(4, 0))
+        self.summary_label = ttk.Label(summary_row, text="No audit run yet.", style="TLabel")
+        self.summary_label.pack(side="left", padx=4)
+        theme.bind_dynamic_wrap(self.summary_label, source=top)
+
+        # tree+headings: the #0 tree column carries the hierarchy (group
+        # header = entry id with real expand/collapse arrows, leaves =
+        # issue category), exactly like the brand tree in the left column.
+        columns = ("message", "fixable")
+        self._base_headings = {"message": "Issue", "fixable": "Fixable"}
         self._sort_col = None
         self._sort_desc = False
         tree_frame = ttk.Frame(self, style="TFrame")
         tree_frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
-        self.tree = ttk.Treeview(tree_frame, columns=columns, show="headings", selectmode="extended")
+        self.tree = ttk.Treeview(tree_frame, columns=columns,
+                                 show="tree headings", selectmode="extended")
+        self.tree.heading("#0", text="Entry / Category")
         for col in columns:
             self.tree.heading(col, text=self._base_headings[col],
                               command=lambda c=col: self._sort_by(c))
-        def _col_width(col):
-            return {"category": 140, "entry": 180,
-                    "message": 520, "fixable": 90}[col]
-        for col in columns:
-            self.tree.column(col, width=_col_width(col),
+        # initial widths; _fit_columns redistributes proportionally on every
+        # resize so ALL columns stay visible (nothing clips off-pane)
+        self.tree.column("#0", width=240, stretch=True)
+        for col, width in (("message", 520), ("fixable", 90)):
+            self.tree.column(col, width=width, stretch=True,
                              anchor="center" if col == "fixable" else "w")
+        self.tree.bind("<Configure>", self._fit_columns, add="+")
+        # vertical only: clipped issue text shows in full via the tooltip
         vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
-        hsb = ttk.Scrollbar(tree_frame, orient="horizontal", command=self.tree.xview)
-        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        self.tree.configure(yscrollcommand=vsb.set)
         self.tree.grid(row=0, column=0, sticky="nsew")
         vsb.grid(row=0, column=1, sticky="ns")
-        hsb.grid(row=1, column=0, sticky="ew")
         tree_frame.rowconfigure(0, weight=1)
         tree_frame.columnconfigure(0, weight=1)
-        attach_touch_scroll(self.tree)
+        # NO touch-style drag panning here: this is a MULTI-SELECT list, and
+        # the pan handler swallows drags past 5px, which would kill the
+        # native click & drag (and Ctrl/Shift+click) row selection. The
+        # scrollbar and mouse wheel cover scrolling. Ctrl+A selects all.
+        self.tree.bind("<Control-a>", self._select_all_issues)
+        self.tree.bind("<Control-A>", self._select_all_issues)
         # Mouse wheel scrolls the audit list even without clicking into it first.
         self.tree.bind("<MouseWheel>", self._on_mousewheel)
         self.tree.bind("<Button-4>", self._on_mousewheel)
         self.tree.bind("<Button-5>", self._on_mousewheel)
+        HoverTooltip(self.tree, self._issue_text_at)
+        # right-click context menu (row-specific actions)
+        self.tree.bind("<Button-3>", self._show_context_menu)
+        if sys.platform == "darwin":
+            self.tree.bind("<Button-2>", self._show_context_menu)
 
-        self.tree.tag_configure("error", foreground=ACCENT_RED)
-        self.tree.tag_configure("warning", foreground=ACCENT_ORANGE)
-        self.tree.tag_configure("info", foreground=TEXT_DIM)
-        self.tree.tag_configure("waived", foreground="#5a6478")
+        self.tree.tag_configure("error", foreground=theme.ACCENT_RED)
+        self.tree.tag_configure("warning", foreground=theme.ACCENT_ORANGE)
+        self.tree.tag_configure("info", foreground=theme.TEXT_DIM)
+        self.tree.tag_configure("waived", foreground=theme.TEXT_DIM)
         self.tree.bind("<Double-1>", self._on_issue_activate)
         self.tree.bind("<Return>", self._on_issue_activate)
+
+    # column proportions (of the visible tree width): tree 26%,
+    # issue 65%, fixable 9%, each with a usable floor
+    _COL_FIT = (("#0", 0.26, 150), ("message", 0.65, 260), ("fixable", 0.09, 88))
+
+    def _fit_columns(self, _event=None):
+        """Redistribute column widths so the whole table always fits the
+        pane -- no clipped AUTO-FIXABLE column at any window size."""
+        w = self.tree.winfo_width() - 24      # scrollbar + border margin
+        if w < 300:
+            return
+        for col, frac, floor in self._COL_FIT:
+            self.tree.column(col, width=max(floor, int(w * frac)))
 
     def _on_mousewheel(self, event):
         # Windows/macOS send <MouseWheel> with event.delta (+/-120 per notch);
@@ -2292,8 +2804,27 @@ class AuditPanel(ttk.Frame):
         self.tree.yview_scroll(amount, "units")
         return "break"
 
+    def _issue_text_at(self, x, y):
+        """Tooltip text for the row under the cursor: the full, untruncated
+        issue description (the message column has no horizontal scrollbar)."""
+        iid = self.tree.identify_row(y)
+        if not iid:
+            return None
+        iss = self._row_issues.get(iid)
+        if iss is not None:
+            sev = {"error": "ERROR", "warning": "WARNING", "info": "INFO"}.get(
+                iss.severity, iss.severity.upper())
+            return "[{}] {} \u00b7 {}\n{}".format(sev, iss.category,
+                                                   iss.entry_id, iss.message)
+        group = self._group_items.get(iid)
+        if group:
+            eid = group[0].entry_id if group else ""
+            return "{}  ({} issue(s) -- double-click to jump)".format(
+                eid, len(group))
+        return None
+
     # ------------------------------------------------------------------
-    # rendering (flat OR grouped-by-entry, optionally sorted)
+    # rendering (always grouped by entry, optionally sorted)
     # ------------------------------------------------------------------
     _SEV_RANK = {"error": 0, "warning": 1, "info": 2}
 
@@ -2319,18 +2850,18 @@ class AuditPanel(ttk.Frame):
         def key(i):
             if col == "fixable":
                 return (1 if i.fix else 0,)
-            v = getattr(i, "entry_id" if col == "entry" else col, "")
-            return (str(v).lower(),)
+            return (str(getattr(i, col, "")).lower(),)
         return sorted(iss, key=key, reverse=self._sort_desc)
 
     def _waived(self, iss):
         return iss.waiver_key() in getattr(self.app, "waivers", set())
 
     def _display_issues(self):
-        """Sorted issues, minus waived ones unless 'Show ignored' is on."""
+        """Exclusive filter: normal mode shows active issues only;
+        'Ignored only' shows ONLY the waived ones (review / un-ignore)."""
         iss = self._sorted_issues()
-        if self.show_ignored.get():
-            return iss
+        if self.show_ignored_only.get():
+            return [i for i in iss if self._waived(i)]
         return [i for i in iss if not self._waived(i)]
 
     def show_issues(self, issues):
@@ -2339,21 +2870,32 @@ class AuditPanel(ttk.Frame):
         live = [i for i in issues if not self._waived(i)]
         hidden = len(issues) - len(live)
         errors = sum(1 for i in live if i.severity == "error")
-        warnings = sum(1 for i in live if i.severity == "warning")
-        infos = sum(1 for i in live if i.severity == "info")
-        text = "{} issues found  ({} errors, {} warnings, {} info)".format(
-            len(live), errors, warnings, infos)
+        text = "{} Issue{} Found".format(len(live),
+                                         "" if len(live) == 1 else "s")
+        parts = []
+        if errors:
+            parts.append("{} Error{}".format(errors,
+                                             "" if errors == 1 else "s"))
         if hidden:
-            text += "   \u00b7   {} ignored (tick 'Show ignored')".format(hidden)
+            parts.append("{} Ignored".format(hidden))
+        if parts:
+            text += " ({})".format(", ".join(parts))
         self.summary_label.configure(text=text)
 
     def rerender(self):
-        """Render the current issue list either flat or grouped by entry.
-        Grouping coalesces ALL issues sharing the same entry signature into
-        one parent (regardless of adjacency after sorting); file-level rows
-        (summaries / unlinked files) always stay top-level. Display order
-        follows the active column sort. Waived issues are hidden unless
-        'Show ignored' is ticked (then rendered dim with an [ignored] mark)."""
+        """Render the current issue list grouped by entry. Grouping
+        coalesces ALL issues sharing the same entry signature into one
+        collapsible parent (regardless of adjacency after sorting);
+        file-level rows (summaries / unlinked files) stay top-level.
+        Display order follows the active column sort. In normal mode
+        waived issues are hidden entirely; 'Ignored only' flips the
+        filter to show just those (dim, with an [ignored] mark)."""
+        # severity tag colors follow the live theme (rerender doubles as
+        # the Audit tab's registered retheme hook)
+        self.tree.tag_configure("error", foreground=theme.ACCENT_RED)
+        self.tree.tag_configure("warning", foreground=theme.ACCENT_ORANGE)
+        self.tree.tag_configure("info", foreground=theme.TEXT_DIM)
+        self.tree.tag_configure("waived", foreground=theme.TEXT_DIM)
         self.tree.delete(*self.tree.get_children())
         self._row_issues.clear()
         self._group_items.clear()
@@ -2364,23 +2906,11 @@ class AuditPanel(ttk.Frame):
 
         ordered = self._display_issues()
 
-        def row_values(iss, category=None):
-            cat = iss.category if category is None else category
+        def leaf_label(iss):
+            cat = iss.category
             if self._waived(iss):
                 cat += "  [ignored]"
-            return (cat, iss.entry_id, iss.message,
-                    "Yes" if iss.fix else "No")
-
-        if not self.group_by_entry.get():
-            for n, iss in enumerate(ordered):
-                iid = "i{}".format(n)
-                self._row_issues[iid] = iss
-                tags = (iss.severity,)
-                if self._waived(iss):
-                    tags = (iss.severity, "waived")
-                self.tree.insert("", "end", iid=iid, values=row_values(iss),
-                                 tags=tags, open=True)
-            return
+            return cat
 
         # Coalesce by entry signature, preserving first-seen display order;
         # standalone rows keep their own positions in the sequence.
@@ -2404,7 +2934,12 @@ class AuditPanel(ttk.Frame):
                     self._row_issues[iid] = iss
                     tags = (iss.severity, "waived") if self._waived(iss) \
                         else (iss.severity,)
-                    self.tree.insert("", "end", iid=iid, values=row_values(iss),
+                    label = iss.entry_id \
+                        if iss.entry_id not in ("(none)", "(summary)") \
+                        else iss.category
+                    self.tree.insert("", "end", iid=iid, text=label,
+                                     values=(iss.message,
+                                             "Yes" if iss.fix else "No"),
                                      tags=tags, open=True)
                 continue
             worst = min(items, key=lambda i: self._SEV_RANK.get(i.severity, 9))
@@ -2417,18 +2952,21 @@ class AuditPanel(ttk.Frame):
             gcat = "{} issue(s)".format(len(items))
             if n_ign:
                 gcat += "  [{} ignored]".format(n_ign)
-            parent = self.tree.insert("", "end", iid=gid, values=(
-                gcat, worst.entry_id,
-                msg + ("   [+]" if len(items) > 1 else ""),
-                "{}/{} auto".format(nfix, len(items))),
-                tags=(worst.severity,), open=False)
+            parent = self.tree.insert("", "end", iid=gid,
+                                      text=worst.entry_id,
+                                      values=(gcat + "  \u2014  " + msg,
+                                              "{}/{} auto".format(nfix,
+                                                                  len(items))),
+                                      tags=(worst.severity,), open=False)
             self._group_items[parent] = items
             for iss in items:
                 iid = "i{}".format(seq); seq += 1
                 self._row_issues[iid] = iss
                 tags = (iss.severity, "waived") if self._waived(iss) \
                     else (iss.severity,)
-                self.tree.insert(parent, "end", iid=iid, values=row_values(iss),
+                self.tree.insert(parent, "end", iid=iid, text=leaf_label(iss),
+                                 values=(iss.message,
+                                         "Yes" if iss.fix else "No"),
                                  tags=tags)
 
     # ------------------------------------------------------------------
@@ -2437,9 +2975,6 @@ class AuditPanel(ttk.Frame):
     def _ignore_selected(self):
         chosen = self._issues_for_selection()
         if not chosen:
-            messagebox.showinfo(APP_TITLE,
-                                "Select one or more issue rows first, then "
-                                "click 'Ignore Selected'.")
             return
         waived = getattr(self.app, "waivers", None)
         if waived is None:
@@ -2483,8 +3018,77 @@ class AuditPanel(ttk.Frame):
                 "Restored {} issue(s) to the active audit list.".format(removed))
 
     # ------------------------------------------------------------------
+    # right-click context menu (row-specific actions)
+    # ------------------------------------------------------------------
+    def _build_context_menu(self):
+        """Build the context menu for the CURRENT selection. Items enable/
+        disable based on what the selection actually contains, so the menu
+        only ever offers valid actions. Returns the tk.Menu (not posted)."""
+        issues = self._issues_for_selection()
+
+        has_entry = any(isinstance(iss.entry_index, int)
+                        and iss.entry_index >= 0
+                        and not iss.entry_id.startswith("(")
+                        for iss in issues)
+        has_pair = any(getattr(iss, "pair_ids", None) for iss in issues)
+        has_ignorable = any(not self._waived(iss) and iss.severity != "error"
+                            for iss in issues)
+        has_waived = any(self._waived(iss) for iss in issues)
+
+        menu = tk.Menu(self, tearoff=0,
+                       background=theme.BG_CARD, foreground=theme.TEXT_MAIN,
+                       activebackground=theme.ACCENT_BLUE,
+                       activeforeground=theme.contrast_text(theme.ACCENT_BLUE),
+                       font=theme.font(13))
+        menu.add_command(label="Go to Entry",
+                         state="normal" if has_entry else "disabled",
+                         command=self._goto_selected)
+        menu.add_command(label="Merge Duplicate...",
+                         state="normal" if has_pair else "disabled",
+                         command=self._merge_selected)
+        menu.add_separator()
+        menu.add_command(label="Ignore Selected",
+                         state="normal" if has_ignorable else "disabled",
+                         command=self._ignore_selected)
+        menu.add_command(label="Un-ignore Selected",
+                         state="normal" if has_waived else "disabled",
+                         command=self._unignore_selected)
+        return menu
+
+    def _show_context_menu(self, event):
+        row = self.tree.identify_row(event.y)
+        if not row:
+            return                      # only offer actions ON an issue row
+        # right-clicking a selected row keeps the whole multi-selection
+        # (so batch actions act on it); clicking an unselected row makes
+        # it the only selection
+        if row not in self.tree.selection():
+            self.tree.selection_set(row)
+        if not self._issues_for_selection():
+            return
+        menu = self._build_context_menu()
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+        return "break"
+
+    # ------------------------------------------------------------------
     # selection helpers
     # ------------------------------------------------------------------
+    def _select_all_issues(self, _event=None):
+        """Ctrl+A: select every visible row, including issue rows nested
+        inside group headers (Tk has no built-in Ctrl+A for trees)."""
+        stack = list(self.tree.get_children(""))
+        all_items = []
+        while stack:
+            iid = stack.pop()
+            all_items.append(iid)
+            stack.extend(self.tree.get_children(iid))
+        if all_items:
+            self.tree.selection_set(all_items)
+        return "break"
+
     def _issues_for_selection(self):
         out = []
         for iid in self.tree.selection():
@@ -2502,14 +3106,33 @@ class AuditPanel(ttk.Frame):
     def _goto_selected(self):
         sel = self.tree.selection()
         if not sel:
-            messagebox.showinfo(APP_TITLE,
-                                "Select an issue row first, then click "
-                                "'Go to Entry' (or just double-click a row).")
             return
         iss = self._row_issues.get(sel[0]) or next(
             iter(self._group_items.get(sel[0], [])), None)
         if iss is not None:
             self.app.reveal_entry(iss)
+
+    # ------------------------------------------------------------------
+    # duplicate-pair merging
+    # ------------------------------------------------------------------
+    def _merge_selected(self):
+        pair = None
+        for iss in self._issues_for_selection():
+            if getattr(iss, "pair_ids", None):
+                pair = iss.pair_ids
+                break
+        if not pair:
+            return
+        pos_a = self.app._find_slot(None, {"id": pair[0]})
+        pos_b = self.app._find_slot(None, {"id": pair[1]})
+        missing = [pid for pid, pos in zip(pair, (pos_a, pos_b)) if pos < 0]
+        if missing:
+            messagebox.showwarning(
+                APP_TITLE,
+                "No longer in the database: {}.\n\nRe-run the audit to "
+                "refresh duplicate findings.".format(", ".join(missing)))
+            return
+        MergeDialog(self.winfo_toplevel(), self.app, pos_a, pos_b)
 
     def _on_issue_activate(self, _event=None):
         """Double-click / Enter on an issue leaf jumps to that entry in the
@@ -2576,7 +3199,7 @@ class HistoryPanel(ttk.Frame):
                    command=self._redo_selected).pack(side="left", padx=4)
         ttk.Button(top, text="Clear History",
                    command=self._clear).pack(side="left", padx=4)
-        self.summary_label = ttk.Label(top, text="", style="TLabel", foreground=TEXT_DIM)
+        self.summary_label = ttk.Label(top, text="", style="TLabel", foreground=theme.TEXT_DIM)
         self.summary_label.pack(side="left", padx=16)
 
         columns = ("time", "action", "details")
@@ -2598,16 +3221,20 @@ class HistoryPanel(ttk.Frame):
         vsb.grid(row=0, column=1, sticky="ns")
         frame.rowconfigure(0, weight=1)
         frame.columnconfigure(0, weight=1)
-        attach_touch_scroll(self.tree)
+        # NO touch-style drag panning: multi-select list (drag must select,
+        # not pan). Scrollbar + mouse wheel cover scrolling; Ctrl+A selects
+        # every undoable/redoable row at once.
+        self.tree.bind("<Control-a>", self._select_all_rows)
+        self.tree.bind("<Control-A>", self._select_all_rows)
         self.tree.bind("<MouseWheel>", self._on_mousewheel)
         self.tree.bind("<Button-4>", self._on_mousewheel)
         self.tree.bind("<Button-5>", self._on_mousewheel)
 
-        self.tree.tag_configure("section", background=BG_CARD,
-                                 foreground=ACCENT_ORANGE,
-                                 font=(pick_font_family(), 9, "bold"))
-        self.tree.tag_configure("op", foreground=TEXT_MAIN)
-        self.tree.tag_configure("redoable", foreground=ACCENT_BLUE)
+        self.tree.tag_configure("section", background=theme.BG_CARD,
+                                 foreground=theme.ACCENT_ORANGE,
+                                 font=theme.font(12, "bold"))
+        self.tree.tag_configure("op", foreground=theme.TEXT_MAIN)
+        self.tree.tag_configure("redoable", foreground=theme.ACCENT_BLUE)
 
     def _on_mousewheel(self, event):
         if getattr(event, "num", None) == 4:
@@ -2620,7 +3247,21 @@ class HistoryPanel(ttk.Frame):
         return "break"
 
     KIND_VERB = {"edit": "Edited entry", "add": "Added entry",
-                 "delete": "Deleted entry", "fixes": "Audit fixes"}
+                 "delete": "Deleted entry", "fixes": "Audit fixes",
+                 "merge": "Merged duplicates", "import": "Imported entries"}
+
+    def _select_all_rows(self, _event=None):
+        """Ctrl+A: select every row (Tk has no built-in tree Ctrl+A).
+        Section header rows are included but _selected_ops ignores them."""
+        stack = list(self.tree.get_children(""))
+        all_items = []
+        while stack:
+            iid = stack.pop()
+            all_items.append(iid)
+            stack.extend(self.tree.get_children(iid))
+        if all_items:
+            self.tree.selection_set(all_items)
+        return "break"
 
     def refresh(self):
         self.tree.delete(*self.tree.get_children())
@@ -2716,17 +3357,78 @@ class HistoryPanel(ttk.Frame):
             self.refresh()
 
 
+class StatusMarquee(tk.Canvas):
+    """Bottom status bar: shows the status message, and if it is too long
+    for the window it auto-scrolls (marquee) instead of clipping or needing
+    a horizontal scrollbar."""
+
+    TICK_MS = 50
+    STEP_PX = 2
+    PAUSE_TICKS = 24          # brief hold each time the text loops
+
+    def __init__(self, master, textvariable, **kw):
+        kw.setdefault("height", 26)
+        kw.setdefault("highlightthickness", 0)
+        kw.setdefault("bd", 0)
+        super().__init__(master, background=theme.BG_PANEL, **kw)
+        self.var = textvariable
+        self._font = theme.font(12)
+        self._item = self.create_text(8, 13, anchor="w", text="",
+                                      fill=theme.TEXT_DIM, font=self._font,
+                                      tags="t")
+        self._offset = 0
+        self._pause = 0
+        self.var.trace_add("write", lambda *a: self.reset())
+        self.bind("<Configure>", lambda _e: self.reset())
+        self._loop()
+
+    def reset(self):
+        self._offset = 0
+        self._pause = 0
+        self._render()
+
+    def _render(self):
+        self._font = theme.font(12)
+        self.itemconfigure(self._item, text=self.var.get(),
+                           fill=theme.TEXT_DIM, font=self._font)
+
+    def _loop(self):
+        try:
+            if self.winfo_ismapped():
+                self._render()
+                text = self.var.get()
+                avail = max(1, self.winfo_width() - 16)
+                import tkinter.font as tkfont
+                tw = tkfont.Font(font=self._font).measure(text)
+                if tw > avail:
+                    if self._pause > 0:
+                        self._pause -= 1
+                    else:
+                        self._offset -= self.STEP_PX
+                        # scroll fully out, then loop from the right edge
+                        limit = -(tw + 40)
+                        if self._offset < limit:
+                            self._offset = avail
+                            self._pause = self.PAUSE_TICKS
+                else:
+                    self._offset = 0
+                self.coords(self._item, 8 + self._offset, 13)
+        except Exception:
+            pass
+        self.after(self.TICK_MS, self._loop)
+
+
 # ---------------------------------------------------------------------------
 # MAIN APPLICATION
 # ---------------------------------------------------------------------------
 class MainApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("{}  v{}".format(APP_TITLE, APP_VERSION))
+        self.title(APP_TITLE)
         self._set_window_icon()
         self.geometry("1400x860")
         self.minsize(860, 540)   # half-screen snap stays fully usable
-        self.configure(background=BG_MAIN)
+        self.configure(background=theme.BG_MAIN)
         setup_styles(self)
 
         self.entries = []
@@ -2799,6 +3501,10 @@ class MainApp(tk.Tk):
         self.status_var.set(
             "Drop .txt/.csv measurement files (Import Curves tab) or a "
             "database.json.")
+
+    def _import_entries(self):
+        """Open the Import Entries dialog (review & apply AI output)."""
+        ai_import.ImportDialog(self)
 
     def _mark_audit_dirty(self):
         """Flag audit results as stale; if the user is literally looking at
@@ -3013,6 +3719,8 @@ class MainApp(tk.Tk):
     # ------------------------------------------------------------------
     def _build_menu(self):
         menubar = tk.Menu(self)
+        self._menus = [menubar]
+
         filemenu = tk.Menu(menubar, tearoff=0)
         filemenu.add_command(label="Open Database...", command=self.open_database)
         filemenu.add_command(label="Set Data Folder...", command=self.set_data_folder)
@@ -3021,6 +3729,7 @@ class MainApp(tk.Tk):
         filemenu.add_separator()
         filemenu.add_command(label="Exit", command=self._on_close)
         menubar.add_cascade(label="File", menu=filemenu)
+        self._menus.append(filemenu)
 
         editmenu = tk.Menu(menubar, tearoff=0)
         editmenu.add_command(label="Add New Entry", command=self.add_entry)
@@ -3029,10 +3738,12 @@ class MainApp(tk.Tk):
         editmenu.add_command(label="Undo Last Action", command=self.undo_last)
         editmenu.add_command(label="Redo Last Undone Action", command=self.redo_last)
         menubar.add_cascade(label="Edit", menu=editmenu)
+        self._menus.append(editmenu)
 
         auditmenu = tk.Menu(menubar, tearoff=0)
         auditmenu.add_command(label="Run Full Audit", command=self.run_audit)
         menubar.add_cascade(label="Audit", menu=auditmenu)
+        self._menus.append(auditmenu)
 
         toolmenu = tk.Menu(menubar, tearoff=0)
         toolmenu.add_command(
@@ -3045,28 +3756,63 @@ class MainApp(tk.Tk):
             label="Split into AI Chunks",
             command=self._open_export_tab)
         menubar.add_cascade(label="Tools", menu=toolmenu)
+        self._menus.append(toolmenu)
+
+        # View menu -- the home of appearance controls: theme only. The app
+        # always renders in the OS's own default UI font (no bundled font
+        # files to pick between, no per-platform registration -- see
+        # theme.py's font section).
+        viewmenu = tk.Menu(menubar, tearoff=0)
+        self._theme_var = tk.StringVar(value=theme.current_theme_id)
+        thememenu = tk.Menu(viewmenu, tearoff=0)
+        for t in theme.THEMES:
+            kwargs = dict(label=" {}".format(t["name"]),
+                          value=t["id"], variable=self._theme_var,
+                          command=lambda tid=t["id"]: self._set_theme(tid))
+            img = theme.emoji_photo(t["emoji"], 14, root=self)
+            if img is not None:
+                kwargs.update(image=img, compound="left")
+            thememenu.add_radiobutton(**kwargs)
+        viewmenu.add_cascade(label="Theme", menu=thememenu)
+        menubar.add_cascade(label="View", menu=viewmenu)
+        self._menus.extend([viewmenu, thememenu])
 
         helpmenu = tk.Menu(menubar, tearoff=0)
         helpmenu.add_command(label="About", command=self._show_about)
         menubar.add_cascade(label="Help", menu=helpmenu)
+        self._menus.append(helpmenu)
         self.config(menu=menubar)
+        self._sync_menu_colors()
+
+    def _sync_menu_colors(self):
+        """Re-palette every tk.Menu (ttk can't style native menus)."""
+        for m in getattr(self, "_menus", []):
+            try:
+                theme.style_menu(m)
+            except Exception:
+                pass
 
     def _open_export_tab(self):
         self.notebook.select(self.tools_panel)
 
     def _build_layout(self):
+        self._build_header()
+
         toolbar = ttk.Frame(self, style="Panel.TFrame")
         toolbar.pack(fill="x", side="top")
         ttk.Button(toolbar, text="Open Database", command=self.open_database).pack(side="left", padx=4, pady=6)
-        ttk.Button(toolbar, text="Save As...", style="Accent.TButton", command=self.save_as).pack(side="left", padx=4, pady=6)
+        ttk.Button(toolbar, text="Save", style="Accent.TButton", command=self.save_as).pack(side="left", padx=4, pady=6)
         ttk.Button(toolbar, text="Add Entry", command=self.add_entry).pack(side="left", padx=4, pady=6)
+        ttk.Button(toolbar, text="Import Entries",
+                   command=self._import_entries).pack(side="left", padx=4, pady=6)
         ttk.Button(toolbar, text="Delete Entry", style="Danger.TButton", command=self.delete_entry).pack(side="left", padx=4, pady=6)
-        ttk.Button(toolbar, text="Run Audit", style="Blue.TButton", command=self.run_audit).pack(side="left", padx=4, pady=6)
 
         ttk.Label(toolbar, text="Search:", style="Panel.TLabel").pack(side="left", padx=(20, 4))
         self.search_var = tk.StringVar()
-        search_entry = ttk.Entry(toolbar, textvariable=self.search_var, width=30)
-        search_entry.pack(side="left", padx=4)
+        # fills all remaining toolbar space instead of a fixed char width,
+        # so it stays usable at half-screen snap
+        search_entry = ttk.Entry(toolbar, textvariable=self.search_var)
+        search_entry.pack(side="left", padx=4, fill="x", expand=True)
         attach_entry_context_menu(search_entry)
         self._search_debounce_id = None
         def _on_search_change(*a):
@@ -3085,26 +3831,41 @@ class MainApp(tk.Tk):
         paned.pack(fill="both", expand=True)
         self.paned = paned
 
-        left = ttk.Frame(paned, style="Panel.TFrame")
-        paned.add(left, weight=1)
+        # ---- LEFT column: database entries (offset-shadow card) ----
+        tree_outer, left = make_card(paned)
+        paned.add(tree_outer, weight=1)
+        try:
+            paned.paneconfigure(tree_outer, minsize=190)
+        except Exception:
+            pass    # minsize is not supported on every Tk build
 
         # live entry counter in the tree header (kept current by
         # populate_tree, which runs after every add/delete/undo/fix/load)
-        self.entries_header_var = tk.StringVar(value="DATABASE ENTRIES  (0)")
-        ttk.Label(left, textvariable=self.entries_header_var,
-                  style="Header.TLabel").pack(anchor="w", padx=8, pady=(8, 4))
-        tree_frame = ttk.Frame(left, style="Panel.TFrame")
-        tree_frame.pack(fill="both", expand=True, padx=8, pady=4)
+        # "ENTRIES" rather than "DATABASE ENTRIES": the title bar already
+        # says DATABASE TOOL immediately above, and the shorter label
+        # leaves the live count room to stay on-screen at the narrowest
+        # supported column width instead of being clipped to "(5,0...".
+        self.entries_header_var = tk.StringVar(value="ENTRIES  (0)")
+        entries_header = ttk.Label(left, textvariable=self.entries_header_var,
+                                    style="CardHeader.TLabel")
+        entries_header.pack(anchor="w", fill="x", padx=8, pady=(8, 4))
+        # safety net if a very wide font or very narrow column still can't
+        # fit it on one line: wrap onto a second line instead of clipping.
+        entries_header.bind(
+            "<Configure>",
+            lambda e: entries_header.configure(wraplength=max(80, e.width)))
+        tree_frame = ttk.Frame(left, style="CardFlat.TFrame")
+        tree_frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
         tree_frame.rowconfigure(0, weight=1)
         tree_frame.columnconfigure(0, weight=1)
         self.tree = ttk.Treeview(tree_frame, show="tree", selectmode="browse")
+        # vertical only: long names ellipsize + show in full on hover /
+        # via the tooltip instead of a horizontal scrollbar
         vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
-        hsb = ttk.Scrollbar(tree_frame, orient="horizontal", command=self.tree.xview)
-        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        self.tree.configure(yscrollcommand=vsb.set)
         self.tree.column("#0", stretch=True)
         self.tree.grid(row=0, column=0, sticky="nsew")
         vsb.grid(row=0, column=1, sticky="ns")
-        hsb.grid(row=1, column=0, sticky="ew")
         attach_touch_scroll(self.tree)
         self._full_labels = {}
         self._ellipsis_after = None
@@ -3112,19 +3873,22 @@ class MainApp(tk.Tk):
         HoverTooltip(self.tree, self._tree_full_text_at)
         self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
 
-        right = ttk.Frame(paned, style="TFrame")
-        paned.add(right, weight=3)
+        # ---- RIGHT column: the tabbed workbench (offset-shadow card) ----
+        nb_outer, nb_inner = make_card(paned)
+        paned.add(nb_outer, weight=3)
 
-        self.notebook = ttk.Notebook(right)
-        self.notebook.pack(fill="both", expand=True)
+        self.notebook = ttk.Notebook(nb_inner, style="Card.TNotebook")
+        self.notebook.pack(fill="both", expand=True, padx=6, pady=(2, 6))
         self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+        # responsive tabs: shrink padding as the pane narrows so all five
+        # tabs stay fully visible (no clipped labels) at any window size
+        self._tab_pad_cur = None
+        self._tab_pad_after = None
+        self.notebook.bind("<Configure>", self._schedule_fit_tabs, add="+")
 
         self.editor = EntryEditor(self.notebook, self)
         self._editor_tab_text = "  Editor  "
         self.notebook.add(self.editor, text=self._editor_tab_text)
-        # live "N linked" badge on the Editor tab so auto-link feedback from
-        # the Import Curves tab (or any other tab) is always visible
-        self.editor.file_panel.on_files_changed = self._update_editor_tab_badge
 
         self.audit_panel = AuditPanel(self.notebook, self)
         self.notebook.add(self.audit_panel, text="  Audit  ")
@@ -3135,7 +3899,7 @@ class MainApp(tk.Tk):
 
         # companion tools (secondary to the editor by design)
         self.curve_panel = curve_import.CurveImportPanel(self.notebook, self)
-        self.notebook.add(self.curve_panel, text="  Import Curves  ")
+        self.notebook.add(self.curve_panel, text="  Import  ")
         # drag-panning for the Import tab's scrollable body (wired here, not
         # inside curve_import, to keep the module import graph acyclic)
         attach_touch_scroll_canvas(self.curve_panel.scroll_canvas,
@@ -3144,23 +3908,97 @@ class MainApp(tk.Tk):
         self.tools_panel = tools_panel.ToolsPanel(self.notebook, self)
         self.notebook.add(self.tools_panel, text="  Export  ")
 
+        # ttk panes start at their requested sizes, which can squeeze the
+        # tree pane to near-zero; set the initial sash position once the
+        # window is realized (only once -- user drags are never overwritten).
+        # The width scales with the window (20%, clamped) so half-screen
+        # snaps keep the workbench usable.
+        self._sashes_set = False
+
+        def _initial_sashes(_e=None):
+            if self._sashes_set:
+                return
+            w = paned.winfo_width()
+            if w < 700:
+                return
+            self._sashes_set = True
+            try:
+                paned.sashpos(0, max(210, min(300, int(w * 0.20))))
+            except Exception:
+                pass
+        paned.bind("<Configure>", _initial_sashes, add="+")
+
         status = ttk.Frame(self, style="Panel.TFrame")
         status.pack(fill="x", side="bottom")
         self.status_var = tk.StringVar(value="No database loaded.")
-        ttk.Label(status, textvariable=self.status_var, style="Status.TLabel").pack(side="left", padx=8, pady=4)
+        self.status_marquee = StatusMarquee(status,
+                                            textvariable=self.status_var)
+        self.status_marquee.pack(side="left", padx=8, pady=2,
+                                 fill="x", expand=True)
 
-    def _update_editor_tab_badge(self, n_linked):
-        """Show the number of measurement files linked to the open entry
-        form directly on the Editor tab (empty badge when zero)."""
+        # live-retheme hooks: canvas art + placed widgets the style engine
+        # and retint walker cannot reach on their own
+        theme.add_retheme_hook(self._on_retheme_hook)
+        theme.add_retheme_hook(self.audit_panel.rerender)
+
+    # ------------------------------------------------------------------
+    # HEADER STRIP (solid pixel title; appearance controls live in the
+    # View menu)
+    # ------------------------------------------------------------------
+    def _build_header(self):
+        header = tk.Frame(self, background=theme.BG_PANEL, height=44)
+        header.pack(fill="x", side="top")
+        header.pack_propagate(False)
+        self.header = header
+
+        self.header_title = tk.Label(
+            header, text="\U0001F4BE  DATABASE TOOL",
+            font=theme.title_font(), bg=theme.BG_PANEL, fg=theme.TEXT_MAIN)
+        self.header_title.pack(side="left", padx=14, pady=6)
+
+    def _on_retheme_hook(self):
+        """Registered as a live-retheme hook: refreshes the placed header
+        widgets (fonts can't be retinted by the walker) and menus."""
         try:
-            text = self._editor_tab_text
-            if n_linked:
-                text = "  Editor \u2022 {} linked  ".format(n_linked)
-            idx = self.notebook.index(self.editor)
-            if str(self.notebook.tab(idx, option="text")) != text:
-                self.notebook.tab(idx, text=text)
+            self.header_title.configure(font=theme.title_font(),
+                                        bg=theme.BG_PANEL, fg=theme.TEXT_MAIN)
+            self.header.configure(background=theme.BG_PANEL)
+            if getattr(self, "status_marquee", None) is not None:
+                self.status_marquee.configure(background=theme.BG_PANEL)
+                self.status_marquee.reset()
+            self._sync_menu_colors()
         except Exception:
             pass
+
+    # ------------------------------------------------------------------
+    # RESPONSIVE TAB SIZING
+    # ------------------------------------------------------------------
+    def _schedule_fit_tabs(self, _event=None):
+        if self._tab_pad_after is not None:
+            try:
+                self.after_cancel(self._tab_pad_after)
+            except Exception:
+                pass
+        self._tab_pad_after = self.after(80, self._fit_tabs)
+
+    def _fit_tabs(self):
+        """Shrink tab padding as the notebook narrows so all five tabs stay
+        fully visible (no clipped labels) at half-screen snap."""
+        self._tab_pad_after = None
+        w = self.notebook.winfo_width()
+        px = 14 if w > 1150 else (9 if w > 920 else 4)
+        if px != self._tab_pad_cur:
+            self._tab_pad_cur = px
+            theme.set_tab_pad(px)
+
+    # ------------------------------------------------------------------
+    # THEME SWITCHING (View menu)
+    # ------------------------------------------------------------------
+    def _set_theme(self, theme_id):
+        if theme.set_theme(theme_id):
+            if hasattr(self, "_theme_var"):
+                self._theme_var.set(theme_id)
+            restyle_app(self)
 
     def _show_about(self):
         messagebox.showinfo(
@@ -3474,6 +4312,8 @@ class MainApp(tk.Tk):
     # TREE / SELECTION
     # ------------------------------------------------------------------
     def populate_tree(self, restore_selection=True):
+        # a rebuild invalidates the marquee row
+        self._stop_tree_marquee()
         # Cancel any pending search-debounce rebuild: every mutation
         # funnels through here, so the state we are rendering right now is
         # the freshest. Without this, a queued debounce could fire AFTER a
@@ -3486,7 +4326,7 @@ class MainApp(tk.Tk):
                 pass
             self._search_debounce_id = None
         # header always shows the TOTAL database size, never the filtered view
-        self.entries_header_var.set("DATABASE ENTRIES  ({:,})".format(len(self.entries)))
+        self.entries_header_var.set("ENTRIES  ({:,})".format(len(self.entries)))
         # preserve the user's place across rebuilds: expanded brands, scroll
         # position, and (when the row didn't move) the selected entry
         prev_open = {iid for iid in self.tree.get_children("")
@@ -3520,10 +4360,12 @@ class MainApp(tk.Tk):
             self._full_labels[node] = brand_text
             for idx in sorted(idxs, key=lambda i: L.sort_key(self.entries[i])):
                 e = self.entries[idx]
+                # Model [Variant] only -- the internal id stays out of the
+                # row text (cleaner tree); it is still one lookup away and
+                # is shown in the hover tooltip instead.
                 label = e.get("model", "")
                 if e.get("variant"):
                     label += "  [{}]".format(e["variant"])
-                label += "   -- {}".format(e.get("id", ""))
                 iid = "entry:{}".format(idx)
                 self._full_labels[iid] = label
                 self.tree.insert(node, "end", iid=iid, text=label)
@@ -3572,11 +4414,13 @@ class MainApp(tk.Tk):
             return
         try:
             import tkinter.font as tkfont
-            fnt = tkfont.Font(font=(pick_font_family(), 10))
+            fnt = tkfont.Font(font=theme.font(13))
             cw = max(4, fnt.measure("n"))
         except Exception:
             cw = 8
-        budget_base = int((wpx - 52) // cw)      # padding + scrollbar margin
+        # small reserved margin: rows use the full column width (minus the
+        # scrollbar and a little padding); clipped names marquee when selected
+        budget_base = int((wpx - 36) // cw)
         if budget_base < 8:
             return
         for iid, full in list(self._full_labels.items()):
@@ -3587,10 +4431,92 @@ class MainApp(tk.Tk):
                     self.tree.item(iid, text=disp)
             except Exception:
                 pass
+        self._start_tree_marquee()
+
+    # -- marquee: the selected row's name auto-scrolls when too long -------
+    MARQUEE_TICK_MS = 160
+
+    def _start_tree_marquee(self):
+        self._stop_tree_marquee()
+        sel = self.tree.selection()
+        if not sel:
+            return
+        iid = sel[0]
+        full = self._full_labels.get(iid, "")
+        try:
+            disp = self.tree.item(iid, "text")
+        except Exception:
+            return
+        if not full or disp == full:
+            return                      # fits: nothing to scroll
+        self._marquee = {"iid": iid, "pos": 0}
+        self._marquee_tick()
+
+    def _marquee_tick(self):
+        m = getattr(self, "_marquee", None)
+        if not m:
+            return
+        iid = m["iid"]
+        if not self.tree.exists(iid) or iid not in self.tree.selection():
+            self._stop_tree_marquee()
+            return
+        full = self._full_labels.get(iid, "")
+        try:
+            disp = self.tree.item(iid, "text")
+        except Exception:
+            self._stop_tree_marquee()
+            return
+        budget = len(disp)
+        if not budget or disp == full:
+            self._stop_tree_marquee()
+            return
+        m["pos"] = (m["pos"] + 1) % max(1, len(full) + 4)
+        window = full[m["pos"]:]
+        if len(window) < budget:        # loop gap before wrapping around
+            window = window + "     " + full
+        try:
+            self.tree.item(iid, text=window[:budget])
+        except Exception:
+            self._stop_tree_marquee()
+            return
+        self._marquee_after = self.after(self.MARQUEE_TICK_MS, self._marquee_tick)
+
+    def _stop_tree_marquee(self):
+        if getattr(self, "_marquee_after", None):
+            try:
+                self.after_cancel(self._marquee_after)
+            except Exception:
+                pass
+        self._marquee_after = None
+        m = getattr(self, "_marquee", None)
+        self._marquee = None
+        if m and self.tree.exists(m["iid"]):
+            # restore the ellipsized (non-scrolling) form of the row
+            full = self._full_labels.get(m["iid"], "")
+            wpx = self.tree.winfo_width()
+            try:
+                import tkinter.font as tkfont
+                cw = max(4, tkfont.Font(font=theme.font(13)).measure("n"))
+            except Exception:
+                cw = 8
+            budget = max(8, int((wpx - 36) // cw)
+                         - (1 if m["iid"].startswith("brand:") else 2))
+            try:
+                self.tree.item(m["iid"], text=ellipsize(full, budget))
+            except Exception:
+                pass
 
     def _tree_full_text_at(self, x, y):
         iid = self.tree.identify_row(y)
         if iid and iid in self._full_labels:
+            # entry rows: full name + the internal id (kept out of the row
+            # text itself, but still discoverable on hover)
+            if iid.startswith("entry:"):
+                try:
+                    eid = self.entries[int(iid.split(":", 1)[1])].get("id", "")
+                    return "{}\n{}".format(self._full_labels[iid], eid)
+                except Exception:
+                    pass
             return self._full_labels[iid]
         return ""
 
@@ -3625,6 +4551,8 @@ class MainApp(tk.Tk):
         idx = int(iid.split(":", 1)[1])
         self.editing_index = idx
         self.editor.load_entry(self.entries[idx])
+        # long names auto-scroll (marquee) while the row stays selected
+        self._start_tree_marquee()
         # Internal re-selections (e.g. post-commit re-highlight) must NOT
         # yank the user out of whichever tab they're reading.
         if not getattr(self, "_quiet_select", False):
@@ -3750,6 +4678,30 @@ class MainApp(tk.Tk):
         errors = L.validate_entry(entry, existing_ids=existing_ids, exclude_id=None)
         if errors:
             return errors
+
+        # AUDIT PROMPT zero-rule: impedance/sensitivity = 0 is "STRICTLY
+        # FORBIDDEN" on wired entries (only TWS may be 0). validate_entry
+        # deliberately does not block it (specs can legitimately be unknown
+        # mid-research), but saving 0/0 silently used to ship unverified
+        # data -- so confirm explicitly before committing.
+        ff = (entry.get("form_factor") or "").strip()
+        if ff and ff != L.TWS_FORM_FACTOR:
+            missing = [label for field, label in
+                       (("impedance", "Impedance"), ("sensitivity", "Sensitivity"))
+                       if L.coerce_int(entry.get(field, 0), -1) == 0]
+            if missing:
+                ok = messagebox.askyesno(
+                    APP_TITLE,
+                    "{} is 0 on a wired entry ({}).\n\n"
+                    "Per the audit rules this is STRICTLY FORBIDDEN and "
+                    "indicates missing/unverified data -- research and "
+                    "populate the real spec before saving.\n\n"
+                    "Save anyway with unverified specs?".format(
+                        " and ".join(missing), ff))
+                if not ok:
+                    return ["Cancelled -- fill in {} before saving.".format(
+                        " and ".join(missing))]
+
         clean = L.build_clean_entry(entry)
 
         if editing:

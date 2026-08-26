@@ -1,4 +1,4 @@
-"""
+﻿"""
 tools_panel.py -- the "Export" notebook tab.
 
 Two dead-simple cards that replace the standalone Database Compressor
@@ -21,39 +21,45 @@ from tkinter import ttk, filedialog, messagebox
 
 import db_logic as L
 import export_tools as EX
-from theme import (BG_INPUT, TEXT_MAIN, ACCENT_GREEN, ACCENT_BLUE,
-                   ACCENT_RED, pick_font_family)
+import ai_prompts
+import theme
 
 
 class ToolsPanel(ttk.Frame):
     def __init__(self, parent, app):
         super().__init__(parent, style="TFrame")
         self.app = app
-        self._font = (pick_font_family(), 10)
+        self._font = theme.font(13)
         self._source_label = None
 
         cards = ttk.Frame(self, style="TFrame")
         cards.pack(fill="x", padx=10, pady=(10, 4))
-        self._build_compress_card(cards)
-        self._build_split_card(cards)
-        cards.columnconfigure(0, weight=1, uniform="toolcard")
-        cards.columnconfigure(1, weight=1, uniform="toolcard")
+        self._cards_host = cards
+        self._compress_outer = self._build_compress_card(cards)
+        self._split_outer = self._build_split_card(cards)
+        self._cards_stacked = None
+        self._cards_resp_after = None
+        cards.bind("<Configure>", self._schedule_cards_layout, add="+")
 
         self._build_source_row()
 
+        # AI working prompts (Add Entry / Audit Database), generated live
+        # from the app's own rules so they can never drift out of sync
+        self._build_prompts_card()
+
         # shared result/log console
-        log_wrap = ttk.Frame(self, style="Card.TFrame")
-        log_wrap.pack(fill="both", expand=True, padx=10, pady=(4, 10))
+        log_outer, log_wrap = theme.make_card(self)
+        log_outer.pack(fill="both", expand=True, padx=10, pady=(4, 10))
         ttk.Label(log_wrap, text="OUTPUT", style="CardHeader.TLabel").pack(
             anchor="w", padx=8, pady=(6, 2))
         self.log = tk.Text(
-            log_wrap, height=9, bg=BG_INPUT, fg=TEXT_MAIN,
-            insertbackground=TEXT_MAIN, font=self._font, relief="flat",
+            log_wrap, height=9, bg=theme.BG_INPUT, fg=theme.TEXT_MAIN,
+            insertbackground=theme.TEXT_MAIN, font=self._font, relief="flat",
             wrap="word", padx=10, pady=8,
         )
         self.log.pack(fill="both", expand=True, padx=8, pady=(0, 8))
-        self.log.tag_configure("ok", foreground=ACCENT_GREEN)
-        self.log.tag_configure("fail", foreground=ACCENT_RED)
+        self.log.tag_configure("ok", foreground=theme.ACCENT_GREEN)
+        self.log.tag_configure("fail", foreground=theme.ACCENT_RED)
         self.log.configure(state="disabled")
 
         self.refresh_state()
@@ -62,17 +68,16 @@ class ToolsPanel(ttk.Frame):
     # UI construction
     # ------------------------------------------------------------------
     def _build_compress_card(self, parent):
-        card = ttk.Frame(parent, style="Card.TFrame")
-        card.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
+        card_outer, card = theme.make_card(parent)
+        card_outer.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
 
         ttk.Label(card, text="\U0001F5DC  COMPRESS", style="CardHeader.TLabel").grid(
             row=0, column=0, columnspan=3, sticky="w", padx=8, pady=(8, 0))
-        desc = ("Gzip (level 9) the database for faster website loading.\n"
-                "Output is ALWAYS named database.json.gz - the name the "
-                "main app looks for.")
-        ttk.Label(card, text=desc, style="Card.TLabel", foreground="#8892a8",
-                  wraplength=380, justify="left").grid(
-            row=1, column=0, columnspan=3, sticky="w", padx=8, pady=(2, 6))
+        desc = "Compress database into GZIP for faster loading."
+        desc_lbl = ttk.Label(card, text=desc, style="Card.TLabel", foreground=theme.TEXT_DIM,
+                  justify="left")
+        desc_lbl.grid(row=1, column=0, columnspan=3, sticky="w", padx=8, pady=(2, 6))
+        theme.bind_dynamic_wrap(desc_lbl, source=card)
 
         ttk.Label(card, text="Destination folder", style="Card.TLabel").grid(
             row=2, column=0, columnspan=3, sticky="w", padx=8, pady=2)
@@ -82,31 +87,46 @@ class ToolsPanel(ttk.Frame):
         ttk.Button(card, text="Browse...", command=self._browse_gz_dir).grid(
             row=3, column=2, sticky="ew", padx=(4, 8))
 
-        self.compress_btn = ttk.Button(card, text="Compress to database.json.gz",
-                                       style="Accent.TButton",
+        # flexible filler: absorbs the height difference vs the Split card
+        # (which has an extra "Max tokens / chunk" field) so both action
+        # buttons pin to the bottom and always line up side-by-side.
+        # padx=1 keeps it inside the card's 1px border: ttk frames draw
+        # their border UNDER their children, so a zero-padding child
+        # gridded sticky="nsew" would paint right over the outline and it
+        # would visibly vanish along this band.
+        filler = ttk.Frame(card, style="CardFlat.TFrame", height=1)
+        filler.grid(row=4, column=0, columnspan=3, sticky="nsew", padx=1)
+        card.rowconfigure(4, weight=1)
+
+        self.compress_btn = ttk.Button(card, text="Compress Database",
+                                       style="Accent.TButton", width=22,
                                        command=self._run_compress)
-        self.compress_btn.grid(row=4, column=0, columnspan=3, sticky="ew",
+        # no sticky: grid centers the button in the card instead of
+        # stretching it edge-to-edge; width=22 makes both action buttons
+        # (this and "Split Database") pixel-identical for a symmetrical row
+        self.compress_btn.grid(row=5, column=0, columnspan=3,
                                padx=8, pady=(8, 2))
 
         self.gz_result_var = tk.StringVar(value="")
-        ttk.Label(card, textvariable=self.gz_result_var, style="Card.TLabel",
-                  foreground=ACCENT_GREEN, wraplength=380).grid(
-            row=5, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 8))
+        gz_result_lbl = ttk.Label(card, textvariable=self.gz_result_var, style="Card.TLabel",
+                  foreground=theme.ACCENT_GREEN)
+        gz_result_lbl.grid(row=6, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 8))
+        theme.bind_dynamic_wrap(gz_result_lbl, source=card)
 
         card.columnconfigure(1, weight=1)
+        return card_outer
 
     def _build_split_card(self, parent):
-        card = ttk.Frame(parent, style="Card.TFrame")
-        card.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
+        card_outer, card = theme.make_card(parent)
+        card_outer.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
 
         ttk.Label(card, text="\u2702  SPLIT INTO CHUNKS", style="CardHeader.TLabel").grid(
             row=0, column=0, columnspan=3, sticky="w", padx=8, pady=(8, 0))
-        desc = ("Split the database into AI-context-sized *_chunk_N.json "
-                "files for LLM-assisted auditing. Old chunks with the "
-                "same name are cleaned up automatically.")
-        ttk.Label(card, text=desc, style="Card.TLabel", foreground="#8892a8",
-                  wraplength=380, justify="left").grid(
-            row=1, column=0, columnspan=3, sticky="w", padx=8, pady=(2, 6))
+        desc = "Split database into chunks for AI auditing."
+        desc_lbl = ttk.Label(card, text=desc, style="Card.TLabel", foreground=theme.TEXT_DIM,
+                  justify="left")
+        desc_lbl.grid(row=1, column=0, columnspan=3, sticky="w", padx=8, pady=(2, 6))
+        theme.bind_dynamic_wrap(desc_lbl, source=card)
 
         ttk.Label(card, text="Output folder", style="Card.TLabel").grid(
             row=2, column=0, columnspan=3, sticky="w", padx=8, pady=2)
@@ -124,26 +144,149 @@ class ToolsPanel(ttk.Frame):
                            textvariable=self.max_tokens_var, width=10)
         spin.grid(row=5, column=0, sticky="w", padx=8, pady=(0, 2))
 
-        self.split_btn = ttk.Button(card, text="Split into chunks",
-                                    style="Accent.TButton",
+        # flexible filler (see the Compress card): keeps the two action
+        # buttons aligned on the same visual row. padx=1 keeps it inside
+        # the card's 1px border (ttk draws borders UNDER children).
+        filler = ttk.Frame(card, style="CardFlat.TFrame", height=1)
+        filler.grid(row=6, column=0, columnspan=3, sticky="nsew", padx=1)
+        card.rowconfigure(6, weight=1)
+
+        self.split_btn = ttk.Button(card, text="Split Database",
+                                    style="Accent.TButton", width=22,
                                     command=self._run_split)
-        self.split_btn.grid(row=6, column=0, columnspan=3, sticky="ew",
+        # centered, same fixed width as "Compress Database" (see above)
+        self.split_btn.grid(row=7, column=0, columnspan=3,
                             padx=8, pady=(8, 2))
 
         self.split_result_var = tk.StringVar(value="")
-        ttk.Label(card, textvariable=self.split_result_var, style="Card.TLabel",
-                  foreground=ACCENT_GREEN, wraplength=380).grid(
-            row=7, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 8))
+        split_result_lbl = ttk.Label(card, textvariable=self.split_result_var, style="Card.TLabel",
+                  foreground=theme.ACCENT_GREEN)
+        split_result_lbl.grid(row=8, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 8))
+        theme.bind_dynamic_wrap(split_result_lbl, source=card)
 
         card.columnconfigure(1, weight=1)
+        return card_outer
+
+    # ------------------------------------------------------------------
+    # Responsive layout: side-by-side when there's room for both cards to
+    # show their contents without squeezing, stacked full-width otherwise.
+    # A fixed 50/50 split used to force "Browse..." and the folder entry
+    # into a card half as wide as the tab at any window size, which is
+    # what pushed them past the pane's right edge on a half-screen snap.
+    # ------------------------------------------------------------------
+    _CARD_MIN_WIDTH = 360   # each card needs roughly this much to lay out cleanly
+
+    def _schedule_cards_layout(self, _event=None):
+        if self._cards_resp_after is not None:
+            try:
+                self.after_cancel(self._cards_resp_after)
+            except Exception:
+                pass
+        self._cards_resp_after = self.after(120, self._layout_cards)
+
+    def _layout_cards(self):
+        self._cards_resp_after = None
+        w = self._cards_host.winfo_width()
+        stacked = w < (self._CARD_MIN_WIDTH * 2 + 20)
+        if stacked == self._cards_stacked:
+            return
+        self._cards_stacked = stacked
+        host = self._cards_host
+        for c in range(2):
+            host.columnconfigure(c, weight=0, uniform="")
+        if stacked:
+            host.columnconfigure(0, weight=1)
+            self._compress_outer.grid(row=0, column=0, sticky="nsew", padx=0, pady=(0, 8))
+            self._split_outer.grid(row=1, column=0, sticky="nsew", padx=0, pady=0)
+        else:
+            host.columnconfigure(0, weight=1, uniform="toolcard")
+            host.columnconfigure(1, weight=1, uniform="toolcard")
+            self._compress_outer.grid(row=0, column=0, sticky="nsew", padx=(0, 5), pady=0)
+            self._split_outer.grid(row=0, column=1, sticky="nsew", padx=(5, 0), pady=0)
 
     def _build_source_row(self):
         src = ttk.Frame(self, style="TFrame")
         src.pack(fill="x", padx=12, pady=(0, 0))
         ttk.Label(src, text="Source:", style="Dim.TLabel").pack(side="left")
         self._source_label = ttk.Label(src, text="", style="TLabel",
-                                       foreground=ACCENT_BLUE)
+                                       foreground=theme.ACCENT_BLUE)
         self._source_label.pack(side="left", padx=6)
+
+    # ------------------------------------------------------------------
+    # AI prompts card (Add Entry / Audit Database)
+    # ------------------------------------------------------------------
+    def _build_prompts_card(self):
+        outer, card = theme.make_card(self)
+        outer.pack(fill="x", padx=10, pady=(6, 4))
+
+        ttk.Label(card, text="\U0001F4DD  AI PROMPTS",
+                  style="CardHeader.TLabel").pack(anchor="w", padx=8,
+                                                  pady=(8, 2))
+        hint = ttk.Label(
+            card,
+            text="Save a prompt as a file, or copy it to your clipboard.",
+            style="Card.TLabel", foreground=theme.TEXT_DIM,
+            justify="left")
+        hint.pack(anchor="w", padx=8, pady=(0, 6))
+        theme.bind_dynamic_wrap(hint, source=card)
+
+        # both prompt buttons share one centered row, styled exactly like
+        # the Compress/Split action buttons (Accent orange)
+        row = ttk.Frame(card, style="CardFlat.TFrame")
+        row.pack(fill="x", padx=8, pady=(2, 8))
+        # edge columns absorb the spare width so the button group sits
+        # centered in the card no matter how wide the tab gets
+        row.columnconfigure(0, weight=1)
+        row.columnconfigure(5, weight=1)
+
+        for i, (name, filename, builder) in enumerate(ai_prompts.PROMPTS):
+            btn = ttk.Button(row, text=name, style="Accent.TButton", width=16,
+                             command=lambda fn=filename, b=builder:
+                             self._save_prompt(fn, b))
+            btn.grid(row=0, column=1 + i * 2,
+                     sticky="e", padx=(24 if i else 0, 6), pady=4)
+            # square clipboard button with a visual toast: the block flips
+            # to green with a checkmark for a second after a successful
+            # copy (the color swap is a dedicated style: ttk has no
+            # widget-level foreground)
+            clip = ttk.Button(row, text="\U0001F4CB", width=3,
+                              style="Accent.TButton")
+            clip.configure(command=lambda n=name, b=builder, w=clip:
+                           self._copy_prompt(n, b, w))
+            clip.grid(row=0, column=2 + i * 2, sticky="w", pady=4)
+
+    def _copy_prompt(self, name, builder, btn):
+        text = builder()
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        self.app.status_var.set(
+            "Copied the {} prompt to the clipboard ({} characters).".format(
+                name, len(text)))
+        # visual toast: orange -> green checkmark -> back (the color
+        # swap is a dedicated style: ttk has no widget-level foreground)
+        try:
+            btn.configure(style="Accent.Toast.TButton", text="\u2714")
+            btn.after(1000, lambda: btn.configure(
+                style="Accent.TButton", text="\U0001F4CB"))
+        except Exception:  # noqa: BLE001 - button may be gone at shutdown
+            pass
+
+    def _save_prompt(self, filename, builder):
+        name = filename.replace("_PROMPT.md", "").replace("_", " ").title()
+        path = filedialog.asksaveasfilename(
+            title="Save the {} prompt".format(name),
+            defaultextension=".md", initialfile=filename,
+            filetypes=[("Markdown", "*.md"), ("Text file", "*.txt")])
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(builder())
+        except OSError as e:
+            messagebox.showerror(APP_TITLE_REF,
+                                 "Could not write the prompt:\n{}".format(e))
+            return
+        self.app.status_var.set("Saved the {} prompt to {}".format(name, path))
 
     # ------------------------------------------------------------------
     # State refresh (MainApp calls this when the tab becomes visible and
@@ -243,8 +386,32 @@ class ToolsPanel(ttk.Frame):
 
         poll()
 
+    def _confirm_audit_unresolved(self):
+        """Verify-before-export: the exporters serialize whatever is loaded,
+        so warn when the Audit tab still shows unresolved findings instead
+        of silently compressing/splitting a database mid-edit."""
+        panel = getattr(self.app, "audit_panel", None)
+        issues = getattr(panel, "issues", []) if panel is not None else []
+        if not issues:
+            return True
+        try:
+            live = [i for i in issues if not panel._waived(i)]
+        except Exception:
+            live = list(issues)
+        if not live:
+            return True
+        errors = sum(1 for i in live if i.severity == "error")
+        warnings = sum(1 for i in live if i.severity == "warning")
+        return messagebox.askyesno(
+            APP_TITLE_REF,
+            "The audit still reports {} unresolved issue(s) "
+            "({} error(s), {} warning(s)).\n\nExport the database anyway?".format(
+                len(live), errors, warnings))
+
     def _run_compress(self):
         if self._require_source():
+            return
+        if not self._confirm_audit_unresolved():
             return
         dest = self.gz_dir_var.get().strip()
         if not dest:
@@ -283,6 +450,8 @@ class ToolsPanel(ttk.Frame):
 
     def _run_split(self):
         if self._require_source():
+            return
+        if not self._confirm_audit_unresolved():
             return
         out_dir = self.split_dir_var.get().strip()
         if not out_dir:

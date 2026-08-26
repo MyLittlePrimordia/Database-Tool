@@ -32,6 +32,7 @@ import math
 import gzip
 import zlib
 import shutil
+import difflib
 import datetime
 import unicodedata
 
@@ -45,14 +46,18 @@ MAX_DECOMPRESSED_BYTES = 256 * 1024 * 1024
 # BEHAVIOR SWITCHES (defaults match ADD ENTRY PROMPT.txt / AUDIT PROMPT.txt)
 # ==========================================================================
 ENFORCE_TWS_ZERO_SPECS = False       # prompts do NOT require TWS specs = 0
-CANONICALIZE_DRIVER_ORDER = False    # opt-in: DRIVER_TECH_ORDER now matches
-                                     # the prompt's canonical sequence, so
-                                     # newly generated configs are already
-                                     # canonical; this flag only rewrites
-                                     # legacy data during audits
+CANONICALIZE_DRIVER_ORDER = True     # always-on audit rule: legacy configs
+                                     # that ignore the canonical sequence
+                                     # (DD -> BA -> Planar -> EST -> MEMS ->
+                                     # PZT -> BC) get flagged with an
+                                     # auto-fix that reorders them
 
 # sanity caps (defensive; prompts say whole integers, 0 if unverifiable)
-IMPEDANCE_MAX = 200000     # ohms (electrostatics reach ~145k)
+IMPEDANCE_MAX = 200000     # ohms
+# AUDIT PROMPT: electrostatic earspeakers are rated by 10 kHz capacitive
+# reactance, "typically 100,000 ohms to 360,000 ohms" -- so the usual cap
+# only applies to non-electrostatic entries (connector == "Electrostatic").
+IMPEDANCE_MAX_ELECTROSTATIC = 360000
 SENSITIVITY_MAX = 200      # dB/mW
 PRICE_MAX = 10000000       # USD
 
@@ -954,6 +959,227 @@ def save_waivers(db_path, waivers):
     os.replace(tmp, path)
 
 
+# --------------------------------------------------------------------------
+# FUZZY DUPLICATE DETECTION (soft audit)
+# --------------------------------------------------------------------------
+# Flags SUSPICIOUS near-duplicate pairs as warning-level findings; the user
+# always decides (Merge... in the Audit tab combines them, Ignore/waiver
+# dismisses the pair for good). Never auto-fixed.
+
+# Generation/edition tokens that legitimately separate product generations
+# ("Chu" vs "Chu II" are DIFFERENT products by design). When all that
+# differs between two names is tokens from this set, the pair is NOT
+# flagged. Edition words that are NOT here (e.g. "Pro", "Red", "MK2" is,
+# "Studio" is not) still get flagged for manual review.
+_GEN_TOKENS = {
+    "2": "2", "3": "3", "4": "4", "5": "5", "6": "6", "7": "7", "8": "8",
+    "ii": "2", "iii": "3", "iv": "4", "vi": "6",
+    "mk2": "mk2", "mk3": "mk3", "mk4": "mk4",
+    "dsp": "dsp",
+}
+
+# SequenceMatcher ratio above which two same-brand names are considered
+# "very similar" (typos, restyled spellings).
+_DUP_MIN_RATIO = 0.84
+
+
+def _dup_norm_name(entry):
+    """Normalized 'model variant' string used for duplicate comparison.
+    Roman-numeral generations are folded to digits so 'Chu II' and
+    'Chu 2' compare equal (flagging them is correct: same product,
+    inconsistent styling -- exactly what the ID rules forbid)."""
+    parts = [str(entry.get("model") or ""), str(entry.get("variant") or "")]
+    text = " ".join(p for p in parts if p).lower()
+    text = re.sub(r"[^a-z0-9]+", " ", text).strip()
+    tokens = [_GEN_TOKENS.get(t, t) for t in text.split()]
+    return " ".join(tokens)
+
+
+def _dup_specs_match(a, b):
+    """How many of (year, price_usd, driver_config) agree between the two
+    entries (0..3). Identical specs on 'different' products raise the
+    suspicion; differing specs hint at legit generations/variants."""
+    same = 0
+    for f in ("year", "price_usd", "driver_config"):
+        va, vb = a.get(f, 0), b.get(f, 0)
+        try:
+            if int(str(va) or 0) == int(str(vb) or 0):
+                same += 1
+        except (TypeError, ValueError):
+            if str(va) == str(vb) and str(va):
+                same += 1
+    return same
+
+
+def _dup_prefix_pair(na, nb):
+    """(shorter, longer, remainder-tokens) when one normalized name is a
+    whole-word prefix of the other, else None."""
+    if na == nb:
+        return None
+    if nb.startswith(na + " "):
+        return na, nb, nb[len(na):].strip()
+    if na.startswith(nb + " "):
+        return nb, na, na[len(nb):].strip()
+    return None
+
+
+def find_duplicate_pairs(entries, referenced_map=None):
+    """Scan for likely duplicate entries. Returns warning AuditIssues with
+    a .pair_ids attribute (id_a, id_b) consumed by the Audit tab's
+    Merge... action. Waiver subject is the sorted id pair, so dismissing
+    one pair never hides another."""
+    referenced_map = referenced_map or {}
+    issues = []
+    if len(entries) < 2:
+        return issues
+
+    seen_pairs = set()
+    pending = []           # (rank, idx_a, idx_b, confidence, reasons)
+    _RANK = {"high": 0, "medium": 1, "low": 2}
+
+    def emit(idx_a, idx_b, confidence, reasons):
+        key = (min(idx_a, idx_b), max(idx_a, idx_b))
+        if key in seen_pairs:
+            return
+        seen_pairs.add(key)
+        pending.append((_RANK.get(confidence, 3), idx_a, idx_b,
+                        confidence, list(reasons)))
+
+    # -- signal 1: shared measurement files (strongest, any brand) --------
+    # (Duplicate File Link already reports the overlap per entry; here it
+    # upgrades the pair to a high-confidence duplicate candidate.)
+    shared_boost = set()
+    for rel, idxs in referenced_map.items():
+        uniq = sorted(set(idxs))
+        if len(uniq) < 2:
+            continue
+        for i in range(len(uniq)):
+            for j in range(i + 1, len(uniq)):
+                key = (uniq[i], uniq[j])
+                shared_boost.add(key)
+                emit(uniq[i], uniq[j], "high",
+                     ["both entries link measurement file '{}'".format(rel)])
+
+    # -- signal 2: same-brand name similarity -----------------------------
+    by_brand = {}
+    for idx, e in enumerate(entries):
+        brand = str(e.get("brand") or "").strip().lower()
+        by_brand.setdefault(brand, []).append(idx)
+
+    matcher = difflib.SequenceMatcher
+    for brand, idxs in by_brand.items():
+        if not brand or len(idxs) < 2:
+            continue
+        names = {}
+        for i in idxs:
+            try:
+                names[i] = _dup_norm_name(entries[i])
+            except Exception:                      # noqa: BLE001 - never abort audit
+                names[i] = ""
+        # cheap pairwise pre-filters keep the expensive SequenceMatcher
+        # calls rare: at 5k entries a brand can hold hundreds of names and
+        # a naive O(n^2) ratio() pass costs seconds.
+        info = {}
+        for i, na in names.items():
+            toks = frozenset(na.split())
+            info[i] = (na, len(na), toks)
+        for ii in range(len(idxs)):
+            for jj in range(ii + 1, len(idxs)):
+                ia, ib = idxs[ii], idxs[jj]
+                key = (min(ia, ib), max(ia, ib))
+                if key in seen_pairs:
+                    continue
+                na, nb = info[ia][0], info[ib][0]
+                if not na or not nb:
+                    continue
+                a, b = entries[ia], entries[ib]
+                reasons = []
+                confidence = None
+
+                # generation guard: "Chu" vs "Chu II" is by design; a
+                # pure-digit remainder ("Model 1" vs "Model 100") is a
+                # different model number, also by design
+                prefix = _dup_prefix_pair(na, nb)
+                if prefix is not None:
+                    _short, _long, rest = prefix
+                    rest_tokens = set(rest.split())
+                    if rest_tokens and (
+                            rest_tokens.issubset(_GEN_TOKENS)
+                            or all(t.isdigit() for t in rest_tokens)):
+                        continue
+
+                # --- cheap rejection filters (no difflib yet) ----------
+                la, lb = info[ia][1], info[ib][1]
+                # length upper bound: ratio can never exceed 2*min/sum
+                if 2.0 * min(la, lb) / (la + lb) < _DUP_MIN_RATIO \
+                        and prefix is None:
+                    continue
+                # common prefix + digit-suffix rule: "model123" vs
+                # "model456" (or "model1" vs "model11") share a prefix but
+                # are different model numbers, not duplicates
+                p = 0
+                for ca, cb in zip(na, nb):
+                    if ca != cb:
+                        break
+                    p += 1
+                if p >= 3:
+                    sa_, sb_ = na[p:], nb[p:]
+                    if ((sa_.isdigit() or not sa_)
+                            and (sb_.isdigit() or not sb_)
+                            and (sa_ or sb_) and sa_ != sb_):
+                        continue
+                elif not (info[ia][2] & info[ib][2]):
+                    # no shared token and little shared prefix: only a
+                    # tiny edit (typo) can still matter
+                    if abs(la - lb) > 2 or p < 2:
+                        continue
+
+                ratio = matcher(None, na, nb).ratio()
+                if ratio >= _DUP_MIN_RATIO:
+                    confidence = "high" if ratio >= 0.93 else "medium"
+                    reasons.append(
+                        "very similar names ({:.0f}% alike)".format(ratio * 100))
+                elif prefix is not None:
+                    # extends the name with a NON-generation word
+                    # ("Chu" vs "Chu Pro"): worth a manual look
+                    confidence = "low"
+                    reasons.append(
+                        "one name extends the other ('{}' vs '{}')".format(
+                            prefix[0], prefix[1]))
+                if confidence is None:
+                    continue
+
+                spec_n = _dup_specs_match(a, b)
+                if spec_n == 3:
+                    confidence = "high"
+                    reasons.append("year, price and driver config all match")
+                elif spec_n >= 2 and confidence == "low":
+                    confidence = "medium"
+                    reasons.append("{} of 3 key specs match".format(spec_n))
+                if (ia, ib) in shared_boost or (ib, ia) in shared_boost:
+                    confidence = "high"
+                    reasons.append("entries also share linked measurement files")
+                emit(ia, ib, confidence, reasons)
+
+    # materialize findings best-first (high confidence at the top)
+    pending.sort(key=lambda t: (t[0], t[1], t[2]))
+    for rank, idx_a, idx_b, confidence, reasons in pending:
+        a, b = entries[idx_a], entries[idx_b]
+        id_a = a.get("id") or "entry #{}".format(idx_a)
+        id_b = b.get("id") or "entry #{}".format(idx_b)
+        msg = ("Possible duplicate ({} confidence): '{}' and '{}' -- {}. "
+               "Review both: 'Merge...' combines them, 'Ignore' dismisses "
+               "this pair for good.".format(
+                   confidence, id_a, id_b, "; ".join(reasons)))
+        iss = AuditIssue(
+            "Possible Duplicate", idx_a, id_a, msg,
+            severity="warning", code="dup-pair",
+            subject="dup|{}|{}".format(*sorted([id_a, id_b])))
+        iss.pair_ids = (id_a, id_b)
+        issues.append(iss)
+    return issues
+
+
 def run_full_audit(entries, data_root=None):
     """
     Returns list of AuditIssue. Fix closures capture the audited ENTRY
@@ -1198,7 +1424,22 @@ def run_full_audit(entries, data_root=None):
                                  lambda en, f=field, val=rounded: en.__setitem__(f, val)),
                     severity="warning", code="spec-float",
                 ))
-            elif fv > (IMPEDANCE_MAX if field == "impedance" else SENSITIVITY_MAX):
+            elif field == "impedance":
+                # Electrostatics are rated by 10 kHz capacitive reactance
+                # (100k-360k per the AUDIT PROMPT) -- applies both to
+                # full-size estat earspeakers (connector "Electrostatic")
+                # and to electrostatic IEMs (driver_type "EST" on a wired
+                # connector, e.g. STAX SR-001 with "Fixed Cable").
+                is_est = ((entry.get("connector") or "").strip() == "Electrostatic"
+                          or (entry.get("driver_type") or "").strip() == "EST")
+                cap = IMPEDANCE_MAX_ELECTROSTATIC if is_est else IMPEDANCE_MAX
+                if fv > cap:
+                    issues.append(AuditIssue(
+                        "Spec Sanity", idx, eid,
+                        "{} {} is above the usual range (advisory).".format(label, int(fv)),
+                        severity="warning", code="spec-range",
+                    ))
+            elif fv > SENSITIVITY_MAX:
                 issues.append(AuditIssue(
                     "Spec Sanity", idx, eid,
                     "{} {} is above the usual range (advisory).".format(label, int(fv)),
@@ -1243,9 +1484,22 @@ def run_full_audit(entries, data_root=None):
         present_tiers = [t for t in tags if t in PRICE_TIER_TAGS]
 
         def tier_mut(en, expected=expected_tier):
-            cur_tags = [t for t in en.get("tags", []) if t not in PRICE_TIER_TAGS]
-            cur_tags.append(expected)
-            en["tags"] = cur_tags
+            # Replace the existing tier tag IN ITS ORIGINAL POSITION (and
+            # drop any extra tier tags) instead of stripping all tiers and
+            # appending at the end, so fixes produce minimal, readable diffs.
+            out = []
+            placed = False
+            for t in en.get("tags", []):
+                if t in PRICE_TIER_TAGS:
+                    if not placed:
+                        out.append(expected)
+                        placed = True
+                    # additional tier tags are dropped silently
+                else:
+                    out.append(t)
+            if not placed:
+                out.append(expected)
+            en["tags"] = out
 
         if present_tiers != [expected_tier]:
             issues.append(AuditIssue(
@@ -1472,5 +1726,8 @@ def run_full_audit(entries, data_root=None):
                     "Unlinked File", -1, "(none)",
                     "File on disk is not linked to any entry: {}".format(rel),
                     severity="info", subject=rel))
+
+    # ---- fuzzy duplicate scan (soft; pairs are user-judged) --------------
+    issues.extend(find_duplicate_pairs(entries, referenced_map))
 
     return issues
