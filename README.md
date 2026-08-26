@@ -95,3 +95,10 @@ Build scripts are included in the repository:
 chmod +x build_macos.sh build_linux_appimage.sh
 ./build_macos.sh
 ./build_linux_appimage.sh
+
+---
+
+## 🔗 Related Projects
+
+* **[🎧 IEM Tool](https://github.com/MyLittlePrimordia/IEM-Tool):** The offline desktop app that uses this database for EQ, target matching, and discovery.
+* **[📦 Database](https://github.com/MyLittlePrimordia/Database):** The official dataset repository where new measurements are merged, audited & maintained.
