@@ -204,6 +204,24 @@ class ToolsPanel(ttk.Frame):
             self._compress_outer.grid(row=0, column=0, sticky="nsew", padx=(0, 5), pady=0)
             self._split_outer.grid(row=0, column=1, sticky="nsew", padx=(5, 0), pady=0)
 
+        # Force an immediate, full repaint of the host + both shadow-card
+        # frames. Without this, jumping straight to full-screen (rather
+        # than dragging the border) can leave a stray black square behind:
+        # this callback runs 120ms after the window already reached its
+        # new size, so the *previous* stacked/side-by-side geometry's 4px
+        # offset-shadow (theme.CARD_SHADOW, drawn as a plain background
+        # color, not a real widget with its own redraw guarantees) can be
+        # left un-erased in a corner until something else repaints it.
+        # update_idletasks() alone isn't reliably enough to invalidate the
+        # old region on Windows here, so briefly forget/re-show each outer
+        # frame to force Tk to redraw the area from scratch.
+        for outer in (self._compress_outer, self._split_outer):
+            info = outer.grid_info()
+            outer.grid_remove()
+            outer.update_idletasks()
+            outer.grid(**info)
+        host.update_idletasks()
+
     def _build_source_row(self):
         src = ttk.Frame(self, style="TFrame")
         src.pack(fill="x", padx=12, pady=(0, 0))

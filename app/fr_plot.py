@@ -25,6 +25,24 @@ import tkinter as tk
 
 import theme
 
+# Anti-aliased curve rendering: Tk's Canvas has no anti-aliasing primitive
+# at all (create_line's smooth=True only rounds corners with more spline
+# segments -- every line is still drawn one aliased/jagged pixel at a
+# time), which is why curves looked thin and pixelated next to a browser
+# tool like squig.link. Pillow (already a dependency -- see theme.py's
+# emoji rendering) fixes this properly: draw each curve onto a
+# transparent image at _SS times the target resolution, then downsample
+# with LANCZOS, which anti-aliases every edge as a side effect. If Pillow
+# isn't importable for some reason, we fall back to the old pure-Tk path
+# below (_draw_curves_tk) so the app still works, just less smoothly.
+try:
+    from PIL import Image, ImageDraw, ImageTk
+    _PIL_OK = True
+except Exception:                              # noqa: BLE001
+    _PIL_OK = False
+
+_SS = 3   # supersample factor for the Pillow-rendered curve path
+
 FMIN = 20.0
 FMAX = 20000.0
 # Default Y window -- used only when there is no data to autoscale from
@@ -285,6 +303,7 @@ class CurvePlot(tk.Canvas):
         # so the <Motion> handler never re-zips full point lists per event.
         self._hover_data = []
         self._font_small = theme.font(12)
+        self._curve_photo = None    # keep a ref -- PhotoImage has no owner
         self.bind("<Configure>", lambda e: self.redraw(), add="+")
         # live retheme: redraw with the new palette (unhooked on destroy)
         theme.add_retheme_hook(self.redraw)
@@ -353,13 +372,38 @@ class CurvePlot(tk.Canvas):
                 width=max(120, (x1 - x0) - 20))
             return
 
-        for s in self._series:
+        # self._avg (a separately-passed average curve -- curve_import.py's
+        # preview uses this) is folded into one combined list alongside
+        # self._series so both renderers below only need one code path.
+        all_series = list(self._series)
+        if self._avg:
+            all_series.append({"name": "Average", "pts": self._avg,
+                                "color": theme.TEXT_MAIN, "width": 3,
+                                "dash": (7, 4)})
+
+        if _PIL_OK:
+            self._draw_curves_aa(all_series, x0, y0, x1, y1, x_of, y_of)
+        else:
+            self._draw_curves_tk(all_series, x_of, y_of, w)
+
+        # hover readout data: solid (non-dashed) series only
+        self._hover_data = []
+        for s in all_series:
+            if s.get("dash") or not s["pts"]:
+                continue
+            fs, ds = zip(*s["pts"])
+            self._hover_data.append((fs, ds, s["color"]))
+
+        # hover readout lives with the cursor position, cheap and useful
+        self._bind_hover()
+
+    def _draw_curves_tk(self, all_series, x_of, y_of, w):
+        """Fallback path when Pillow isn't importable: the original
+        pure-Tk renderer (no true anti-aliasing, just spline-rounded
+        aliased segments)."""
+        for s in all_series:
             coords = self._polyline(s["pts"], x_of, y_of, w)
             if len(coords) >= 4:
-                # smooth=True + high splinesteps rounds the per-pixel
-                # column transitions; combined with thick lines and
-                # 1/12-oct data smoothing this is what gives the curves
-                # their squig-like look (Tk has no true anti-aliasing).
                 kw = {"fill": s["color"], "width": s.get("width", 4),
                       "smooth": True, "splinesteps": 14, "tags": ("curve",),
                       "capstyle": "round", "joinstyle": "round"}
@@ -367,24 +411,100 @@ class CurvePlot(tk.Canvas):
                     kw["dash"] = s["dash"]
                 self.create_line(*coords, **kw)
 
-        # hover readout data: solid (non-dashed) series only
-        self._hover_data = []
-        for s in self._series:
-            if s.get("dash") or not s["pts"]:
+    def _draw_curves_aa(self, all_series, x0, y0, x1, y1, x_of, y_of):
+        """Anti-aliased path: every curve is drawn onto one transparent
+        Pillow image at _SS x the plot's pixel size, then downsampled
+        with LANCZOS (this is what actually smooths the diagonal edges --
+        see the _SS comment up top), and the result is blitted as a
+        single image on top of the grid already drawn on the canvas."""
+        pw, ph = max(1, x1 - x0), max(1, y1 - y0)
+        img = Image.new("RGBA", (pw * _SS, ph * _SS), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        for s in all_series:
+            pts = self._envelope_points(s["pts"], x_of, y_of, x0, y0, _SS)
+            if len(pts) < 2:
                 continue
-            fs, ds = zip(*s["pts"])
-            self._hover_data.append((fs, ds, s["color"]))
+            width = max(1, int(round(s.get("width", 4) * _SS * 0.85)))
+            color = _rgb(s["color"]) + (255,)
+            dash = s.get("dash")
+            if dash:
+                self._draw_dashed(draw, pts, dash, color, width, _SS)
+                continue
+            try:
+                draw.line(pts, fill=color, width=width, joint="curve")
+            except TypeError:                  # older Pillow: no joint=
+                draw.line(pts, fill=color, width=width)
+            r = width / 2.0
+            for px, py in (pts[0], pts[-1]):    # rounded end caps
+                draw.ellipse((px - r, py - r, px + r, py + r), fill=color)
+        small = img.resize((pw, ph), Image.LANCZOS)
+        self._curve_photo = ImageTk.PhotoImage(small)
+        self.create_image(x0, y0, anchor="nw", image=self._curve_photo,
+                          tags=("curve",))
 
-        if self._avg:
-            coords = self._polyline(self._avg, x_of, y_of, w)
-            if len(coords) >= 4:
-                self.create_line(*coords, fill=theme.TEXT_MAIN, width=3,
-                                 smooth=True, splinesteps=14,
-                                 capstyle="round", joinstyle="round",
-                                 dash=(7, 4), tags=("avg",))
+    def _envelope_points(self, pts, x_of, y_of, x0, y0, ss):
+        """Same per-column min/max envelope idea as _polyline (preserves
+        treble spikes while capping point count), but bucketed in the
+        supersampled image's own coordinate space (image-local, i.e.
+        shifted by the plot's x0/y0 origin) instead of native canvas
+        pixels, so the extra resolution actually reaches the curve
+        itself and not just the final downsample blur."""
+        if not pts:
+            return []
+        buckets = {}
+        for f, d in pts:
+            bx = int((x_of(f) - x0) * ss)
+            py = (y_of(d) - y0) * ss
+            cur = buckets.get(bx)
+            if cur is None:
+                buckets[bx] = [py, py]
+            elif py < cur[0]:
+                cur[0] = py
+            elif py > cur[1]:
+                cur[1] = py
+        out = []
+        prev_bx = None
+        for bx in sorted(buckets):
+            lo, hi = buckets[bx]
+            if prev_bx is not None and bx - prev_bx > ss and out:
+                out.append((bx, out[-1][1]))     # bridge a sparse-data gap
+            out.append((bx, lo))
+            if hi != lo:
+                out.append((bx, hi))
+            prev_bx = bx
+        return out
 
-        # hover readout lives with the cursor position, cheap and useful
-        self._bind_hover()
+    def _draw_dashed(self, draw, pts, dash, color, width, ss):
+        """Manually chop a polyline into dash/gap segments -- Pillow's
+        ImageDraw.line has no dash= option -- scaled by the same ss
+        factor as the points themselves so the dash pitch looks the same
+        size regardless of the supersample factor."""
+        on_len = dash[0] * ss
+        off_len = dash[1] * ss if len(dash) > 1 else on_len
+        on = True
+        remaining = on_len
+        seg = [pts[0]]
+        for i in range(len(pts) - 1):
+            x0_, y0_ = pts[i]
+            x1_, y1_ = pts[i + 1]
+            seg_len = math.hypot(x1_ - x0_, y1_ - y0_)
+            t = 0.0
+            while seg_len - t > 1e-6:
+                step = min(remaining, seg_len - t)
+                t += step
+                remaining -= step
+                frac = t / seg_len if seg_len else 1.0
+                px = x0_ + (x1_ - x0_) * frac
+                py = y0_ + (y1_ - y0_) * frac
+                seg.append((px, py))
+                if remaining <= 1e-6:
+                    if on and len(seg) >= 2:
+                        draw.line(seg, fill=color, width=width)
+                    seg = [(px, py)]
+                    on = not on
+                    remaining = on_len if on else off_len
+        if on and len(seg) >= 2:
+            draw.line(seg, fill=color, width=width)
 
     # internals -------------------------------------------------------------
     def _draw_grid(self, w, h, x_of, y_of):

@@ -1954,6 +1954,7 @@ class EntryEditor(ttk.Frame):
         super().__init__(parent, style="TFrame")
         self.app = app
         self.original_id = None  # id of the entry currently loaded, for update-in-place
+        self._fr_hidden = set()  # rel-paths soloed/hidden via a legend-chip click
         self._build()
 
     def _build(self):
@@ -2112,14 +2113,15 @@ class EntryEditor(ttk.Frame):
         fr_head.pack(fill="x", padx=8, pady=(8, 2))
         ttk.Label(fr_head, text="\U0001F4C8  FR PREVIEW",
                   style="CardHeader.TLabel").pack(side="left")
-        # color-chip legend (rebuilt on every refresh; duplicate basenames
-        # get their source folder prefixed so curves are tellable apart)
-        self.fr_legend = ttk.Frame(fr_head, style="CardFlat.TFrame")
-        self.fr_legend.pack(side="left", padx=(12, 0))
         # Toggle buttons (checkbox drawn as a flat accent button):
         #   Show All    - draw every linked curve, one color each
         #   Average All - draw the averaged curve of ALL linked files
-        # Both grey out while fewer than 2 files are linked.
+        # Both grey out while fewer than 2 files are linked. These live
+        # ALONE in fr_head now -- the legend used to share this row and
+        # would crowd/clip these buttons past ~4 linked curves (a single
+        # unwrapping pack() row has nowhere to put overflow but off the
+        # edge). The legend gets its own full-width, wrapping row below
+        # instead (see fr_legend_row / _set_fr_legend).
         self.fr_avg_var = tk.BooleanVar(value=False)
         self.fr_avg_btn = ttk.Checkbutton(
             fr_head, text="Average All", style="Toggle.TCheckbutton",
@@ -2130,7 +2132,25 @@ class EntryEditor(ttk.Frame):
             fr_head, text="Show All", style="Toggle.TCheckbutton",
             variable=self.fr_show_all_var, command=self._refresh_fr_plot)
         self.fr_show_all_btn.pack(side="right", padx=(0, 8))
-        self.fr_plot = fr_plot.CurvePlot(fr_card, height=230)
+        # Color-chip legend: its own full-width row so it never competes
+        # with the buttons above for space. Rebuilt on every refresh
+        # (duplicate basenames get their source folder prefixed so curves
+        # stay tellable apart); wraps to as many rows as needed and each
+        # chip is click-to-hide/show, so unlike the old header strip it
+        # is never truncated to a "+N" you can't get back.
+        self.fr_legend_row = ttk.Frame(fr_card, style="CardFlat.TFrame")
+        self.fr_legend_row.pack(fill="x", padx=8, pady=(0, 2))
+        self.fr_legend = ttk.Frame(self.fr_legend_row, style="CardFlat.TFrame")
+        self.fr_legend.pack(fill="x", anchor="w")
+        self._fr_legend_font = theme.font(12)
+        self._fr_legend_last_w = None
+        self._fr_legend_relayout_job = None
+        self.fr_legend_row.bind("<Configure>", self._on_fr_legend_configure, add="+")
+        # Bigger graph box: was a fixed 230px, which felt cramped once
+        # more than a couple of curves were on screen at once. Height
+        # grows further while Show All is on (that's when the extra
+        # vertical room actually helps separate overlapping curves).
+        self.fr_plot = fr_plot.CurvePlot(fr_card, height=340)
         self.fr_plot.pack(fill="both", expand=True, padx=8, pady=(2, 8))
 
         # ---- files ----
@@ -2450,6 +2470,7 @@ class EntryEditor(ttk.Frame):
         pal = fr_plot.palette()
         show_all = self.fr_show_all_var.get() and len(linked) >= 2
         avg_on = self.fr_avg_var.get() and len(linked) >= 2
+        hidden = self._fr_hidden
 
         # Duplicate basenames ("7HZ ETERNAL.txt" x4) get their source
         # folder prefixed so the legend actually tells curves apart.
@@ -2471,17 +2492,24 @@ class EntryEditor(ttk.Frame):
             return fr_plot.smooth_octaves(norm) if norm else []
 
         series = []
-        chips = []          # (color, label) for the legend
+        chips = []          # (color, label, rel, is_hidden) for the legend
         for i, rel in enumerate(linked):
-            if not show_all:
-                if sel and i not in sel:
-                    continue
-                if not sel and series:
-                    continue             # no selection -> first curve only
+            if not show_all and sel and i not in sel:
+                continue
+            color = pal[i % len(pal)]
+            name = disp_name(rel)
+            if rel in hidden:
+                # soloed out via a legend-chip click: keep its (dimmed)
+                # chip so it can be clicked again to bring it back, but
+                # never parse/draw it and never count it toward "first
+                # curve only" below or toward Average All.
+                chips.append((color, name, rel, True))
+                continue
+            if not show_all and not sel and series:
+                continue             # no selection -> first VISIBLE curve only
             norm = load_norm(rel)
             if not norm:
                 continue
-            color = pal[i % len(pal)]
             if sel and i in sel:
                 width = 5                # emphasized: thickest, full color
             elif sel:
@@ -2489,22 +2517,23 @@ class EntryEditor(ttk.Frame):
                 color = fr_plot.dim(color, 0.5)
             else:
                 width = 4
-            name = disp_name(rel)
             series.append({"name": name, "pts": norm,
                            "color": color, "width": width})
-            chips.append((color, name))
-        # Average All: mean of ALL linked curves, drawn last (on top) as a
-        # thick dashed near-white line -- the "consensus" curve.
+            chips.append((color, name, rel, False))
+        # Average All: mean of every linked curve that ISN'T hidden, drawn
+        # last (on top) as a thick dashed near-white line -- the
+        # "consensus" curve.
         avg = None
         if avg_on:
-            all_norms = [n for n in (load_norm(r) for r in linked) if n]
+            all_norms = [n for n in (load_norm(r) for r in linked
+                                      if r not in hidden) if n]
             if len(all_norms) >= 2:
                 avg = fr_plot.average(all_norms)
                 if avg:
                     series.append({"name": "Average", "pts": avg,
                                    "color": theme.TEXT_MAIN, "width": 3,
                                    "dash": (7, 4)})
-                    chips.append((theme.TEXT_MAIN, "Average"))
+                    chips.append((theme.TEXT_MAIN, "Average", None, False))
         # ghost: browsing the Available list previews an unlinked file dashed
         av = self.file_panel.available_list.curselection()
         if av and 0 <= av[0] < min(len(self.file_panel._available_full),
@@ -2517,14 +2546,27 @@ class EntryEditor(ttk.Frame):
                                   "pts": gnorm, "color": theme.TEXT_DIM,
                                   "width": 2, "dash": (5, 3)})
                 chips.insert(0, (theme.TEXT_DIM,
-                                 "~ " + os.path.basename(ghost_rel)))
+                                 "~ " + os.path.basename(ghost_rel),
+                                 None, False))
         self._set_fr_legend(chips)
         if not series:
-            self.fr_plot.set_data(
-                [], msg="Link a measurement file - or browse the Available "
-                        "list - to preview its curve")
+            msg = ("Every linked curve is hidden - click a legend chip to "
+                    "bring one back" if chips else
+                   "Link a measurement file - or browse the Available "
+                   "list - to preview its curve")
+            self.fr_plot.set_data([], msg=msg)
             return
         self.fr_plot.set_data(series, avg=None)   # avg already a series
+
+    def _toggle_fr_hidden(self, rel):
+        """Legend-chip click: solo a curve out of (or back into) the plot
+        without unlinking the file. Independent of Show All / selection --
+        a hidden curve stays hidden across either mode until clicked again."""
+        if rel in self._fr_hidden:
+            self._fr_hidden.discard(rel)
+        else:
+            self._fr_hidden.add(rel)
+        self._refresh_fr_plot()
 
     def _update_fr_buttons(self, n_linked):
         """Show All / Average All grey out while fewer than 2 files are
@@ -2540,25 +2582,73 @@ class EntryEditor(ttk.Frame):
                 pass
 
     def _set_fr_legend(self, chips):
-        """Rebuild the color-chip legend: [swatch label] per drawn curve."""
+        """Rebuild the color-chip legend as a wrapping strip of clickable
+        toggle-chips: [swatch label] per linked curve (drawn or hidden).
+
+        Lives in its own full-width row below fr_head so it never crowds
+        the Show All / Average All buttons, and wraps to as many rows as
+        the current width needs instead of hard-capping at N chips with a
+        "+N" you can't get back to -- every chip has to stay reachable
+        since clicking one is how a hidden curve gets un-hidden.
+        chips: list of (color, label, rel_or_None, is_hidden)."""
+        self._last_fr_chips = chips
         for w in self.fr_legend.winfo_children():
             w.destroy()
-        shown = chips[:6]
-        for color, label in shown:
-            chip = ttk.Frame(self.fr_legend, style="CardFlat.TFrame")
-            chip.pack(side="left", padx=(0, 10))
-            swatch = tk.Label(chip, text="  ", background=color,
+        font = self._fr_legend_font
+        max_w = self.fr_legend_row.winfo_width()
+        if max_w < 100:      # not realized/mapped yet -- fall back
+            max_w = max(240, self.winfo_width() - 40)
+        self._fr_legend_last_w = max_w
+        SWATCH_W, GAP, SLOP = 16, 4, 26   # chip-frame padding/border slop
+        row = ttk.Frame(self.fr_legend, style="CardFlat.TFrame")
+        row.pack(side="top", fill="x", anchor="w")
+        row_w = 0
+        for color, label, rel, is_hidden in chips:
+            short = label if len(label) <= 28 else label[:27] + "\u2026"
+            chip_w = SWATCH_W + GAP + font.measure(short) + SLOP
+            if row_w and row_w + chip_w > max_w:
+                row = ttk.Frame(self.fr_legend, style="CardFlat.TFrame")
+                row.pack(side="top", fill="x", anchor="w", pady=(2, 0))
+                row_w = 0
+            row_w += chip_w
+            chip = ttk.Frame(row, style="CardFlat.TFrame")
+            chip.pack(side="left", padx=(0, 10), pady=1)
+            swatch_bg = fr_plot.dim(color, 0.65) if is_hidden else color
+            swatch = tk.Label(chip, text="  ", background=swatch_bg,
                               highlightthickness=1,
                               highlightbackground=theme.BORDER)
             swatch.pack(side="left", padx=(0, 4))
-            short = label if len(label) <= 28 else label[:27] + "\u2026"
-            tk.Label(chip, text=short, background=theme.BG_CARD,
-                     foreground=theme.TEXT_DIM,
-                     font=theme.font(12)).pack(side="left")
-        if len(chips) > len(shown):
-            tk.Label(self.fr_legend, text="(+{})".format(len(chips) - 6),
-                     background=theme.BG_CARD, foreground=theme.TEXT_DIM,
-                     font=theme.font(12)).pack(side="left")
+            fg = (theme.blend(theme.TEXT_DIM, theme.BG_CARD, 0.45)
+                  if is_hidden else theme.TEXT_DIM)
+            txt = tk.Label(chip, text=short, background=theme.BG_CARD,
+                           foreground=fg, font=font)
+            txt.pack(side="left")
+            if rel is not None:
+                # click-to-hide/show: Average/ghost chips (rel is None)
+                # aren't toggleable, only real linked-file curves are.
+                for w2 in (chip, swatch, txt):
+                    w2.configure(cursor="hand2")
+                    w2.bind("<Button-1>",
+                            lambda _e, r=rel: self._toggle_fr_hidden(r))
+
+    def _on_fr_legend_configure(self, _evt=None):
+        """Debounced re-wrap on resize: the legend only rebuilds itself on
+        _refresh_fr_plot(), which a plain window resize never triggers, so
+        without this a legend built at one width could stay mis-wrapped
+        (too cramped, or wasting space) after the window changes size."""
+        if self._fr_legend_relayout_job:
+            self.after_cancel(self._fr_legend_relayout_job)
+        self._fr_legend_relayout_job = self.after(120, self._relayout_fr_legend)
+
+    def _relayout_fr_legend(self):
+        self._fr_legend_relayout_job = None
+        chips = getattr(self, "_last_fr_chips", None)
+        if chips is None:
+            return
+        new_w = self.fr_legend_row.winfo_width()
+        if new_w < 100 or new_w == self._fr_legend_last_w:
+            return               # unchanged/not mapped -- skip the rebuild
+        self._set_fr_legend(chips)
 
     def new_entry(self):
         self.original_id = None
@@ -2581,6 +2671,7 @@ class EntryEditor(ttk.Frame):
         self.validation_label.configure(text="")
         self.year_hint.configure(text="")
         self.price_hint.configure(text="")
+        self._fr_hidden.clear()
         self._capture_baseline()
         self._refresh_fr_plot()
 
@@ -2606,6 +2697,7 @@ class EntryEditor(ttk.Frame):
         self.tag_panel.set_tags(entry.get("tags", []))
         self.tag_panel.update_price(entry.get("price_usd", 0))
         self.file_panel.set_files(entry.get("files", []))
+        self._fr_hidden.clear()
         self._refresh_fr_plot()
         self.tag_panel.clear_suggestions()
         self.validation_label.configure(text="")
