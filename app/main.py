@@ -19,6 +19,7 @@ Package as exe with PyInstaller (see README.md).
 """
 
 import os
+import re
 import sys
 import json
 import math
@@ -742,6 +743,85 @@ class AutocompleteEntry(ttk.Frame):
 
 
 # ---------------------------------------------------------------------------
+# TREE SEARCH (plain text + field mini-syntax)
+# ---------------------------------------------------------------------------
+_NUM_EXPR_RE = re.compile(r"^(>=|<=|>|<|=)?\s*(\d+)(?:\s*(?:-|to)\s*(\d+))?$")
+
+SEARCH_HELP = (
+    "Search tips\n\n"
+    "Plain text matches Brand / Model / Variant / ID.\n"
+    "Field filters (space-separated, ANDed):\n"
+    "  tag:bass          tag containing 'bass'\n"
+    "  price:>500        price over $500  (also >= < <= = 100-400)\n"
+    "  year:>2020        launch year after 2020\n"
+    "  ff:tws            form factor contains 'tws'\n"
+    "  driver:planar     driver type/config contains 'planar'\n"
+    "  conn:mmcx         connector contains 'mmcx'\n"
+    "  brand:moondrop    model:chu  variant:dsp  id:...\n"
+    "Example:  moondrop tag:bass price:<100")
+
+
+def _num_expr_ok(value, expr):
+    """'price'/'year' filter: supports > >= < <= = and a-b ranges."""
+    m = _NUM_EXPR_RE.match(expr)
+    if not m:
+        return str(value) == expr
+    op = m.group(1) or "="
+    a = int(m.group(2))
+    b = int(m.group(3)) if m.group(3) else None
+    if op == ">":
+        return value > a
+    if op == "<":
+        return value < a
+    if op == ">=":
+        return value >= a
+    if op == "<=":
+        return value <= a
+    return a <= value <= b if b is not None else value == a
+
+
+def _token_matches(entry, key, val):
+    """One 'key:value' filter token. Unknown keys fall back to a plain
+    substring search over the usual haystack so old habits never break."""
+    if key in ("tag", "tags"):
+        return any(val in str(t).lower() for t in (entry.get("tags") or []))
+    if key in ("ff", "form", "form_factor"):
+        return val in (entry.get("form_factor") or "").lower()
+    if key in ("conn", "connector"):
+        return val in (entry.get("connector") or "").lower()
+    if key in ("driver", "drv"):
+        hay = "{} {}".format(entry.get("driver_type") or "",
+                             entry.get("driver_config") or "").lower()
+        return val in hay
+    if key == "price":
+        return _num_expr_ok(L.coerce_int(entry.get("price_usd", 0), 0), val)
+    if key == "year":
+        return _num_expr_ok(L.coerce_int(entry.get("year", 0), 0), val)
+    if key in ("brand", "model", "variant", "id"):
+        return val in (entry.get(key) or "").lower()
+    # unknown key: search the combined haystack for the WHOLE token text
+    hay = " ".join([entry.get("brand", ""), entry.get("model", ""),
+                    entry.get("variant", ""), entry.get("id", "")]).lower()
+    return ("{}:{}".format(key, val)) in hay
+
+
+def entry_matches_query(entry, query):
+    """Tree filter: whitespace-separated tokens, ALL must match. Plain
+    tokens substring-match Brand/Model/Variant/ID; 'key:value' tokens
+    target one field (see SEARCH_HELP)."""
+    hay = " ".join([entry.get("brand", ""), entry.get("model", ""),
+                    entry.get("variant", ""), entry.get("id", "")]).lower()
+    for tok in query.split():
+        if ":" in tok:
+            key, _, val = tok.partition(":")
+            if not _token_matches(entry, key.lower(), val.lower()):
+                return False
+        elif tok not in hay:
+            return False
+    return True
+
+
+# ---------------------------------------------------------------------------
 # TEXT OVERFLOW HELPERS (ellipsization + delayed hover tooltip)
 # ---------------------------------------------------------------------------
 def ellipsize(text, max_chars):
@@ -973,6 +1053,8 @@ class TagSelectorPanel(ttk.Frame):
         self.current_price = 0
         self._auto_tier_tag = "Budget"
         self._suggestions = []
+        self._cbs = {}            # tag -> ttk.Checkbutton (conflict dimming)
+        self._emoji_labels = {}   # tag -> emoji label or None
 
         ttk.Label(self, text="TAGS  (pick 4-12 total)", style="CardHeader.TLabel").grid(
             row=0, column=0, sticky="w", padx=8, pady=(8, 2))
@@ -1039,6 +1121,8 @@ class TagSelectorPanel(ttk.Frame):
                 if e_label is not None:
                     # clicking the emoji toggles the checkbox too
                     e_label.bind("<Button-1>", lambda _e, c=cb: c.invoke())
+                self._cbs[tag] = cb
+                self._emoji_labels[tag] = e_label
 
         # FR-analysis suggestion strip (populated by "Suggest from FR Data")
         r += 1
@@ -1051,6 +1135,11 @@ class TagSelectorPanel(ttk.Frame):
         self.fr_chips = ttk.Frame(self, style="CardFlat.TFrame")
         self.fr_chips.grid(row=r, column=0, columnspan=2, sticky="w", padx=12,
                             pady=(2, 8))
+
+        # conflict dimming must follow live theme switches (colors are
+        # module-level and mutate on retheme)
+        theme.add_retheme_hook(self._refresh_conflict_hints)
+        self._refresh_conflict_hints()
 
     # -- FR suggestions ---------------------------------------------------
     def _run_fr_suggestions(self):
@@ -1153,11 +1242,44 @@ class TagSelectorPanel(ttk.Frame):
                         tag, ", ".join(other) if other else "another selected tag"))
                 return
         self._refresh_count()
+        self._refresh_conflict_hints()
         if self.on_change:
             self.on_change()
 
     def _selected_set(self):
         return {t for t, v in self.vars.items() if v.get()}
+
+    def _refresh_conflict_hints(self):
+        """Inline guardrail: dim every UNCHECKED tag that would create a
+        forbidden pair / second primary tonality if checked, so the picker
+        communicates conflicts before the click instead of via a warning
+        dialog after it. Selected tags always render normal.
+
+        Dimming swaps to the Card.Dim.TCheckbutton style (ttk checkbuttons
+        carry no widget-level foreground)."""
+        selected = self._selected_set()
+        for tag, cb in self._cbs.items():
+            if self.vars[tag].get():
+                dim = False
+            else:
+                candidate = set(selected)
+                candidate.add(tag)
+                dim = bool(L.tag_conflicts(candidate))
+            want = "Card.Dim.TCheckbutton" if dim else "Card.TCheckbutton"
+            try:
+                if str(cb.cget("style")) != want:
+                    cb.configure(style=want)
+            except Exception:
+                continue
+            e_lbl = self._emoji_labels.get(tag)
+            if e_lbl is not None and not e_lbl.cget("image"):
+                # text-glyph fallback labels carry a foreground; image
+                # labels do not
+                try:
+                    e_lbl.configure(foreground=theme.TEXT_DIM if dim
+                                    else theme.TEXT_MAIN)
+                except Exception:
+                    pass
 
     def _refresh_count(self):
         n = len(self._selected_set()) + 1  # +1 for automatic price tier tag
@@ -1188,11 +1310,20 @@ class TagSelectorPanel(ttk.Frame):
         for tag, var in self.vars.items():
             var.set(tag in tagset and tag not in L.PRICE_TIER_TAGS)
         self._refresh_count()
+        self._refresh_conflict_hints()
 
     def clear(self):
         for var in self.vars.values():
             var.set(False)
         self._refresh_count()
+        self._refresh_conflict_hints()
+
+    def destroy(self):
+        try:
+            theme.remove_retheme_hook(self._refresh_conflict_hints)
+        except Exception:
+            pass
+        super().destroy()
 
 
 # ---------------------------------------------------------------------------
@@ -1303,6 +1434,8 @@ class FileLinkerPanel(ttk.Frame):
         # ellipsization state: full strings kept for tooltips / re-widen
         self._available_full = []
         self._linked_full = []
+        self._avail_shown_n = 0     # real rows currently rendered (footer excluded)
+        self._linked_shown_n = 0
         self._avail_cap = None
         self._linked_cap = None
         self._cap_after = None
@@ -1310,7 +1443,8 @@ class FileLinkerPanel(ttk.Frame):
             lb.bind("<Configure>", self._schedule_caps, add="+")
         HoverTooltip(self.available_list,
                      lambda x, y: self._full_text_at(
-                         self.available_list, self._available_full, y))
+                         self.available_list, self._available_full, y,
+                         shown_n=getattr(self, "_avail_shown_n", None)))
         HoverTooltip(self.linked_list,
                      lambda x, y: self._full_text_at(
                          self.linked_list, self._linked_full, y))
@@ -1435,6 +1569,12 @@ class FileLinkerPanel(ttk.Frame):
             pass
         return []
 
+    # Rendering cap for the Available list: an 11k-file data folder used
+    # to be inserted into the Listbox row-by-row on EVERY entry switch
+    # (~190 ms of UI stall per click). The listbox has no virtualization,
+    # so we render the first matches plus a footer pointing at search.
+    RENDER_CAP_ROWS = 400
+
     def _refresh_available(self):
         query = self.search_var.get().strip().lower()
         self.available_list.delete(0, tk.END)
@@ -1444,10 +1584,18 @@ class FileLinkerPanel(ttk.Frame):
                 if rel not in linked_set
                 and (not query or query in rel.lower())]
         self._available_full = kept
-        self._render_truncated(self.available_list, kept, self._avail_cap)
+        shown = kept[:self.RENDER_CAP_ROWS]
+        footer = None
+        if len(kept) > len(shown):
+            footer = "... and {:,} more -- type above to narrow the list".format(
+                len(kept) - len(shown))
+        self._avail_shown_n = len(shown)
+        self._render_truncated(self.available_list, shown, self._avail_cap,
+                               footer=footer)
 
     def _refresh_linked(self):
         self._linked_full = list(self.linked)
+        self._linked_shown_n = len(self._linked_full)
         self._render_truncated(self.linked_list, self._linked_full,
                                self._linked_cap)
         n = len(self.linked)
@@ -1491,12 +1639,17 @@ class FileLinkerPanel(ttk.Frame):
         self._refresh_available()
         self._refresh_linked()
 
-    def _render_truncated(self, lb, items, cap):
+    def _render_truncated(self, lb, items, cap, footer=None):
         y0 = lb.yview()[0]                     # keep scroll position stable
         sel = set(lb.curselection())
         lb.delete(0, tk.END)
         for n, it in enumerate(items):
             lb.insert(tk.END, ellipsize_path(it, cap) if cap else it)
+        if footer:
+            # dimmed pseudo-row (never selectable for linking -- see the
+            # _avail_shown_n guards in selection/marquee/tooltip paths)
+            lb.insert(tk.END, footer)
+            lb.itemconfigure(tk.END, foreground=theme.TEXT_DIM)
         try:
             lb.yview_moveto(y0)
             for n in sorted(sel & set(range(len(items)))):
@@ -1504,9 +1657,11 @@ class FileLinkerPanel(ttk.Frame):
         except Exception:
             pass
 
-    def _full_text_at(self, lb, full_items, y):
+    def _full_text_at(self, lb, full_items, y, shown_n=None):
         idx = lb.nearest(y)
-        if 0 <= idx < len(full_items):
+        limit = len(full_items) if shown_n is None else min(shown_n,
+                                                            len(full_items))
+        if 0 <= idx < limit:
             return full_items[idx]
         return ""
 
@@ -1525,15 +1680,18 @@ class FileLinkerPanel(ttk.Frame):
 
     def _list_marquee_tick(self):
         scrolling = False
-        for key, lb, full_list in (
-                ("avail", self.available_list, self._available_full),
-                ("linked", self.linked_list, self._linked_full)):
+        for key, lb, full_list, shown_n in (
+                ("avail", self.available_list, self._available_full,
+                 getattr(self, "_avail_shown_n", 0)),
+                ("linked", self.linked_list, self._linked_full,
+                 getattr(self, "_linked_shown_n",
+                         len(self._linked_full or [])))):
             sel = lb.curselection()
             if not sel:
                 continue
             idx = sel[0]
-            if idx >= len(full_list):
-                continue
+            if idx >= shown_n or idx >= len(full_list):
+                continue                    # footer row / out of range
             full = full_list[idx]
             try:
                 disp = lb.get(idx)
@@ -1562,12 +1720,15 @@ class FileLinkerPanel(ttk.Frame):
         # Resolve from _available_full (the untruncated strings): the listbox
         # shows ellipsized text when paths overflow the widget width, and
         # storing that display text would corrupt entry["files"] with paths
-        # that do not exist on disk. Indexes are positionally aligned.
+        # that do not exist on disk. Indexes are positionally aligned; the
+        # trailing "... and N more" footer row (index >= _avail_shown_n) is
+        # never linkable.
         for i in self.available_list.curselection():
-            if 0 <= i < len(self._available_full):
+            if 0 <= i < min(len(self._available_full),
+                            self._avail_shown_n):
                 rel = self._available_full[i]
-            else:                       # defensive fallback (should not happen)
-                rel = self.available_list.get(i)
+            else:                       # footer / defensive fallback
+                continue
             if rel not in self.linked:
                 self.linked.append(rel)
         self._refresh_linked()
@@ -1951,17 +2112,24 @@ class EntryEditor(ttk.Frame):
         fr_head.pack(fill="x", padx=8, pady=(8, 2))
         ttk.Label(fr_head, text="\U0001F4C8  FR PREVIEW",
                   style="CardHeader.TLabel").pack(side="left")
-        self.fr_legend = ttk.Label(fr_head, text="", style="Card.TLabel",
-                                   foreground=theme.TEXT_DIM)
+        # color-chip legend (rebuilt on every refresh; duplicate basenames
+        # get their source folder prefixed so curves are tellable apart)
+        self.fr_legend = ttk.Frame(fr_head, style="CardFlat.TFrame")
         self.fr_legend.pack(side="left", padx=(12, 0))
+        # Toggle buttons (checkbox drawn as a flat accent button):
+        #   Show All    - draw every linked curve, one color each
+        #   Average All - draw the averaged curve of ALL linked files
+        # Both grey out while fewer than 2 files are linked.
         self.fr_avg_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(fr_head, text="Avg", variable=self.fr_avg_var,
-                        style="Card.TCheckbutton",
-                        command=self._refresh_fr_plot).pack(side="right", padx=6)
-        self.fr_overlay_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(fr_head, text="Overlay all", variable=self.fr_overlay_var,
-                        style="Card.TCheckbutton",
-                        command=self._refresh_fr_plot).pack(side="right")
+        self.fr_avg_btn = ttk.Checkbutton(
+            fr_head, text="Average All", style="Toggle.TCheckbutton",
+            variable=self.fr_avg_var, command=self._refresh_fr_plot)
+        self.fr_avg_btn.pack(side="right", padx=(0, 2))
+        self.fr_show_all_var = tk.BooleanVar(value=True)
+        self.fr_show_all_btn = ttk.Checkbutton(
+            fr_head, text="Show All", style="Toggle.TCheckbutton",
+            variable=self.fr_show_all_var, command=self._refresh_fr_plot)
+        self.fr_show_all_btn.pack(side="right", padx=(0, 8))
         self.fr_plot = fr_plot.CurvePlot(fr_card, height=230)
         self.fr_plot.pack(fill="both", expand=True, padx=8, pady=(2, 8))
 
@@ -1971,15 +2139,18 @@ class EntryEditor(ttk.Frame):
         self.file_panel.pack(fill="both", expand=True)
         fl_outer.pack(fill="x", padx=10, pady=8)
         # plot follows list interactions: linked selection -> emphasis,
-        # available browsing -> dashed ghost preview of the unlinked file
+        # available browsing -> dashed ghost preview of the unlinked file;
+        # linked-count changes grey in/out the Show All / Average toggles
         self.file_panel.on_linked_select = self._refresh_fr_plot
         self.file_panel.on_available_select = self._refresh_fr_plot
+        self.file_panel.on_files_changed = self._update_fr_buttons
 
         # ---- action buttons ----
         actions = ttk.Frame(inner, style="TFrame")
         actions.pack(fill="x", padx=10, pady=(4, 20))
         ttk.Button(actions, text="Save Entry", style="Accent.TButton",
                    command=self._on_save).pack(side="left", padx=4)
+        self.save_btn = actions.winfo_children()[-1]
         ttk.Button(actions, text="Clear / New", command=self.new_entry).pack(side="left", padx=4)
         self.validation_label = ttk.Label(actions, text="", style="TLabel", foreground=theme.ACCENT_RED,
                                            justify="left")
@@ -1991,12 +2162,40 @@ class EntryEditor(ttk.Frame):
         # touch-style drag panning for the whole editor form (passive areas)
         attach_touch_scroll_canvas(canvas, inner)
 
+        # Enter moves to the next field (Brand -> Model -> Variant -> specs
+        # -> Connector). Disabled fields (TWS-locked impedance/sensitivity)
+        # are skipped. AutocompleteEntry's own Return handler runs first,
+        # so an open suggestion popup still consumes the key.
+        chain = [self.brand_entry.entry, self.model_entry.entry,
+                 self.variant_entry.entry, self.year_entry, self.price_entry,
+                 self.impedance_entry, self.sensitivity_entry,
+                 self.connector_picker.button, self.save_btn]
+        for cur, nxt in zip(chain, chain[1:]):
+            pos = chain.index(nxt)
+            cur.bind("<Return>",
+                     self._make_focus_next(chain[pos:]), add="+")
+
         # responsive layout: switch specs to 2x2 and driver rows to a single
         # column when the form gets too narrow for the wide layout
         self._resp_after = None
         canvas.bind("<Configure>", self._schedule_responsive, add="+")
 
         self._on_form_change()
+
+    @staticmethod
+    def _make_focus_next(candidates):
+        """Return an event handler focusing the first enabled widget among
+        `candidates` (used by the Enter-to-next-field chain)."""
+        def _handler(_event=None):
+            for w in candidates:
+                try:
+                    if str(w.cget("state")) != "disabled":
+                        w.focus_set()
+                        return "break"
+                except Exception:
+                    continue
+            return "break"
+        return _handler
 
     # -- responsive layout -------------------------------------------------
     def _schedule_responsive(self, event=None):
@@ -2247,58 +2446,119 @@ class EntryEditor(ttk.Frame):
     def _refresh_fr_plot(self, *_args):
         linked = self.file_panel.get_files()
         sel = set(self.file_panel.linked_list.curselection())
+        self._update_fr_buttons(len(linked))
+        pal = fr_plot.palette()
+        show_all = self.fr_show_all_var.get() and len(linked) >= 2
+        avg_on = self.fr_avg_var.get() and len(linked) >= 2
+
+        # Duplicate basenames ("7HZ ETERNAL.txt" x4) get their source
+        # folder prefixed so the legend actually tells curves apart.
+        base_counts = {}
+        for rel in linked:
+            base_counts[os.path.basename(rel)] = \
+                base_counts.get(os.path.basename(rel), 0) + 1
+
+        def disp_name(rel):
+            base = os.path.basename(rel)
+            if base_counts.get(base, 0) > 1:
+                parts = rel.replace("\\", "/").split("/")
+                return "/".join(parts[-2:]) if len(parts) >= 2 else base
+            return base
+
+        def load_norm(rel):
+            _f, pts = self._load_linked_curve(rel)
+            norm = fr_plot.normalized(pts) if pts else []
+            return fr_plot.smooth_octaves(norm) if norm else []
+
         series = []
-        names = []
-        # solid curves: linked files (overlay-all off -> only the selected one)
+        chips = []          # (color, label) for the legend
         for i, rel in enumerate(linked):
-            if not self.fr_overlay_var.get():
+            if not show_all:
                 if sel and i not in sel:
                     continue
                 if not sel and series:
                     continue             # no selection -> first curve only
-            _full, pts = self._load_linked_curve(rel)
-            norm = fr_plot.normalized(pts) if pts else []
+            norm = load_norm(rel)
             if not norm:
                 continue
-            color = fr_plot.palette()[i % len(fr_plot.palette())]
+            color = pal[i % len(pal)]
             if sel and i in sel:
-                width = 3                 # emphasized: bold, full color
+                width = 5                # emphasized: thickest, full color
             elif sel:
-                width = 1                 # others recede while a file is picked
-                color = fr_plot.dim(color)
+                width = 3                # others recede while a file is picked
+                color = fr_plot.dim(color, 0.5)
             else:
-                width = 2
-            series.append({"name": os.path.basename(rel), "pts": norm,
+                width = 4
+            name = disp_name(rel)
+            series.append({"name": name, "pts": norm,
                            "color": color, "width": width})
-            names.append(os.path.basename(rel))
+            chips.append((color, name))
+        # Average All: mean of ALL linked curves, drawn last (on top) as a
+        # thick dashed near-white line -- the "consensus" curve.
+        avg = None
+        if avg_on:
+            all_norms = [n for n in (load_norm(r) for r in linked) if n]
+            if len(all_norms) >= 2:
+                avg = fr_plot.average(all_norms)
+                if avg:
+                    series.append({"name": "Average", "pts": avg,
+                                   "color": theme.TEXT_MAIN, "width": 3,
+                                   "dash": (7, 4)})
+                    chips.append((theme.TEXT_MAIN, "Average"))
         # ghost: browsing the Available list previews an unlinked file dashed
         av = self.file_panel.available_list.curselection()
-        if av and 0 <= av[0] < len(self.file_panel._available_full):
+        if av and 0 <= av[0] < min(len(self.file_panel._available_full),
+                                   getattr(self.file_panel,
+                                           "_avail_shown_n", 0)):
             ghost_rel = self.file_panel._available_full[av[0]]
-            _f, gpts = self._load_linked_curve(ghost_rel)
-            gnorm = fr_plot.normalized(gpts) if gpts else []
+            gnorm = load_norm(ghost_rel)
             if gnorm:
                 series.insert(0, {"name": "~ " + os.path.basename(ghost_rel),
                                   "pts": gnorm, "color": theme.TEXT_DIM,
-                                  "width": 1, "dash": (5, 3)})
-                names.insert(0, os.path.basename(ghost_rel))
-        # average of the drawn solid curves (normalized domain)
-        solids = [s["pts"] for s in series if not s.get("dash")]
-        avg = fr_plot.average(solids) if (self.fr_avg_var.get() and
-                                          len(solids) >= 2) else None
+                                  "width": 2, "dash": (5, 3)})
+                chips.insert(0, (theme.TEXT_DIM,
+                                 "~ " + os.path.basename(ghost_rel)))
+        self._set_fr_legend(chips)
         if not series:
             self.fr_plot.set_data(
-                [], msg="Select a linked file - or browse the Available list "
-                        "- to preview its curve")
-            self.fr_legend.configure(text="")
+                [], msg="Link a measurement file - or browse the Available "
+                        "list - to preview its curve")
             return
-        self.fr_plot.set_data(series, avg=avg)
-        shown = [("~ " + n if i == 0 and series[0].get("dash") else n)
-                 for i, n in enumerate(names)]
-        self.fr_legend.configure(
-            text=" \u00b7 ".join(n[:26] + ("\u2026" if len(n) > 26 else "")
-                                 for n in shown[:6])
-            + ("   (+{})".format(len(shown) - 6) if len(shown) > 6 else ""))
+        self.fr_plot.set_data(series, avg=None)   # avg already a series
+
+    def _update_fr_buttons(self, n_linked):
+        """Show All / Average All grey out while fewer than 2 files are
+        linked (a single curve needs neither)."""
+        multi = n_linked >= 2
+        for btn in (getattr(self, "fr_show_all_btn", None),
+                    getattr(self, "fr_avg_btn", None)):
+            if btn is None:
+                continue
+            try:
+                btn.state(["!disabled"] if multi else ["disabled"])
+            except Exception:
+                pass
+
+    def _set_fr_legend(self, chips):
+        """Rebuild the color-chip legend: [swatch label] per drawn curve."""
+        for w in self.fr_legend.winfo_children():
+            w.destroy()
+        shown = chips[:6]
+        for color, label in shown:
+            chip = ttk.Frame(self.fr_legend, style="CardFlat.TFrame")
+            chip.pack(side="left", padx=(0, 10))
+            swatch = tk.Label(chip, text="  ", background=color,
+                              highlightthickness=1,
+                              highlightbackground=theme.BORDER)
+            swatch.pack(side="left", padx=(0, 4))
+            short = label if len(label) <= 28 else label[:27] + "\u2026"
+            tk.Label(chip, text=short, background=theme.BG_CARD,
+                     foreground=theme.TEXT_DIM,
+                     font=theme.font(12)).pack(side="left")
+        if len(chips) > len(shown):
+            tk.Label(self.fr_legend, text="(+{})".format(len(chips) - 6),
+                     background=theme.BG_CARD, foreground=theme.TEXT_DIM,
+                     font=theme.font(12)).pack(side="left")
 
     def new_entry(self):
         self.original_id = None
@@ -2352,19 +2612,8 @@ class EntryEditor(ttk.Frame):
         self.year_hint.configure(text="")
         self.price_hint.configure(text="")
         self._capture_baseline()
-
-        if L.ENFORCE_TWS_ZERO_SPECS and entry.get("form_factor") == L.TWS_FORM_FACTOR:
-            try:
-                bad = [f for f, v in (("Impedance", entry.get("impedance", 0)),
-                                      ("Sensitivity", entry.get("sensitivity", 0)))
-                       if int(float(v or 0)) != 0]
-            except (TypeError, ValueError):
-                bad = ["Impedance/Sensitivity"]
-            if bad:
-                messagebox.showwarning(
-                    APP_TITLE,
-                    "{}: this TWS entry has {} set to a non-zero value.".format(
-                        entry.get("id"), " and ".join(bad)))
+        # TWS spec violations are surfaced by the audit engine's advisory
+        # warning (code "tws-nonzero"); no per-load modal here.
 
     def build_entry_dict(self):
         year = _int_input(self.year_var.get(), -1)
@@ -2532,12 +2781,19 @@ class MergeDialog(tk.Toplevel):
 
         self._vars = {}
         for r, (key, label) in enumerate(_MERGE_FIELDS, start=1):
-            ttk.Label(grid, text=label, style="Card.TLabel").grid(
+            # differing fields pop (amber field name, full-brightness
+            # values); identical fields recede so the eye lands on the
+            # decisions that actually matter
+            differs = self.a.get(key) != self.b.get(key)
+            name_fg = theme.ACCENT_ORANGE if differs else theme.TEXT_DIM
+            val_fg = theme.TEXT_MAIN if differs else theme.TEXT_DIM
+            ttk.Label(grid, text=label, style="Card.TLabel",
+                      foreground=name_fg).grid(
                 row=r, column=0, sticky="w", padx=(0, 8), pady=2)
             va, vb = self._fmt(self.a.get(key)), self._fmt(self.b.get(key))
             ttk.Label(grid, text=va or "\u2014",
                       style="Card.TLabel",
-                      foreground=theme.TEXT_MAIN if va else theme.TEXT_DIM,
+                      foreground=val_fg if va else theme.TEXT_DIM,
                       wraplength=250, justify="left").grid(
                 row=r, column=1, sticky="w", padx=(0, 4), pady=2)
             var = tk.StringVar(
@@ -2549,7 +2805,7 @@ class MergeDialog(tk.Toplevel):
                     row=r, column=col, sticky="w", padx=(2, 2))
             ttk.Label(grid, text=vb or "\u2014",
                       style="Card.TLabel",
-                      foreground=theme.TEXT_MAIN if vb else theme.TEXT_DIM,
+                      foreground=val_fg if vb else theme.TEXT_DIM,
                       wraplength=250, justify="left").grid(
                 row=r, column=4, sticky="w", padx=(8, 0), pady=2)
 
@@ -2569,6 +2825,12 @@ class MergeDialog(tk.Toplevel):
                   foreground=theme.TEXT_DIM).grid(row=union_row + 1, column=0,
                                                   columnspan=5, sticky="w",
                                                   pady=(4, 0))
+        # legend for the color coding
+        ttk.Label(grid, text="\u25cf differing fields highlighted",
+                  style="Card.TLabel",
+                  foreground=theme.ACCENT_ORANGE).grid(
+            row=union_row + 2, column=0, columnspan=5, sticky="w",
+            pady=(6, 0))
 
         self.status_lbl = ttk.Label(card, text="", style="Card.TLabel",
                                     foreground=theme.ACCENT_RED,
@@ -2648,6 +2910,12 @@ class MergeDialog(tk.Toplevel):
         app = self.app
         pos_a, pos_b = self.pos_a, self.pos_b
         a_obj, b_obj = app.entries[pos_a], app.entries[pos_b]
+        # Whether the editor is holding one of the two merged entries must
+        # be decided BEFORE the list is mutated: afterwards neither old
+        # object is in the list (pos_a holds the new merged dict, pos_b is
+        # gone), so the old content-equality check was effectively dead
+        # and a deleted twin could leave stale form data loaded.
+        editor_held = app.editing_index in (pos_a, pos_b)
         merged_final = L.build_clean_entry(merged)
         app.entries[pos_a] = merged_final
         del app.entries[pos_b]
@@ -2668,12 +2936,9 @@ class MergeDialog(tk.Toplevel):
         app.populate_tree()
         # if the editor is holding one of the merged entries, follow it
         new_pos = app._find_slot(None, {"id": merged_final["id"]})
-        if app.editing_index is not None and \
-                0 <= app.editing_index < len(app.entries) and \
-                app.entries[app.editing_index] in (a_obj, b_obj):
-            if new_pos >= 0:
-                app.editing_index = new_pos
-                app.editor.load_entry(app.entries[new_pos])
+        if editor_held and new_pos >= 0:
+            app.editing_index = new_pos
+            app.editor.load_entry(app.entries[new_pos])
         app.refresh_spell_vocab()
         app._autosave()
         app.status_var.set("Merged '{}' and '{}' into '{}'.".format(
@@ -2881,6 +3146,12 @@ class AuditPanel(ttk.Frame):
         if parts:
             text += " ({})".format(", ".join(parts))
         self.summary_label.configure(text=text)
+        # keep the tab badge in sync (also fires on Ignore/Un-ignore,
+        # which re-call show_issues)
+        try:
+            self.app._update_audit_badge(len(live))
+        except Exception:
+            pass
 
     def rerender(self):
         """Render the current issue list grouped by entry. Grouping
@@ -3101,7 +3372,7 @@ class AuditPanel(ttk.Frame):
     def _fix_selected(self):
         chosen = [i for i in self._issues_for_selection() if i.fix]
         self.app.apply_fixes(chosen)
-        self.app.run_audit()
+        self.app.run_audit(switch_tab=False)
 
     def _goto_selected(self):
         sel = self.tree.selection()
@@ -3154,7 +3425,7 @@ class AuditPanel(ttk.Frame):
         if not messagebox.askyesno(APP_TITLE, "Apply {} automatic fixes?".format(len(fixable))):
             return
         self.app.apply_fixes(fixable)
-        self.app.run_audit()
+        self.app.run_audit(switch_tab=False)
 
     def _export(self):
         if not self.issues:
@@ -3360,9 +3631,11 @@ class HistoryPanel(ttk.Frame):
 class StatusMarquee(tk.Canvas):
     """Bottom status bar: shows the status message, and if it is too long
     for the window it auto-scrolls (marquee) instead of clipping or needing
-    a horizontal scrollbar."""
+    a horizontal scrollbar. When the text fits, the loop drops to a cheap
+    4 Hz idle heartbeat instead of repainting 20x/second."""
 
     TICK_MS = 50
+    IDLE_MS = 250
     STEP_PX = 2
     PAUSE_TICKS = 24          # brief hold each time the text loops
 
@@ -3378,6 +3651,7 @@ class StatusMarquee(tk.Canvas):
                                       tags="t")
         self._offset = 0
         self._pause = 0
+        self._text_w = None       # cached pixel width of the current text
         self.var.trace_add("write", lambda *a: self.reset())
         self.bind("<Configure>", lambda _e: self.reset())
         self._loop()
@@ -3391,16 +3665,26 @@ class StatusMarquee(tk.Canvas):
         self._font = theme.font(12)
         self.itemconfigure(self._item, text=self.var.get(),
                            fill=theme.TEXT_DIM, font=self._font)
+        self._measure()
+
+    def _measure(self):
+        import tkinter.font as tkfont
+        try:
+            self._text_w = tkfont.Font(font=self._font).measure(self.var.get())
+        except Exception:
+            self._text_w = None
 
     def _loop(self):
+        next_tick = self.IDLE_MS
         try:
             if self.winfo_ismapped():
-                self._render()
-                text = self.var.get()
                 avail = max(1, self.winfo_width() - 16)
-                import tkinter.font as tkfont
-                tw = tkfont.Font(font=self._font).measure(text)
-                if tw > avail:
+                tw = self._text_w
+                if tw is None:
+                    self._measure()
+                    tw = self._text_w
+                if tw is not None and tw > avail:
+                    self._render()      # only while actually scrolling
                     if self._pause > 0:
                         self._pause -= 1
                     else:
@@ -3410,12 +3694,14 @@ class StatusMarquee(tk.Canvas):
                         if self._offset < limit:
                             self._offset = avail
                             self._pause = self.PAUSE_TICKS
-                else:
+                    self.coords(self._item, 8 + self._offset, 13)
+                    next_tick = self.TICK_MS
+                elif self._offset != 0:
                     self._offset = 0
-                self.coords(self._item, 8 + self._offset, 13)
+                    self.coords(self._item, 8, 13)
         except Exception:
             pass
-        self.after(self.TICK_MS, self._loop)
+        self.after(next_tick, self._loop)
 
 
 # ---------------------------------------------------------------------------
@@ -3515,7 +3801,7 @@ class MainApp(tk.Tk):
         except Exception:
             return
         if w is self.audit_panel and self.entries:
-            self.run_audit()
+            self.run_audit(switch_tab=False)
 
     def refresh_spell_vocab(self):
         """Feed every Brand/Model/Variant in the loaded database to the
@@ -3525,7 +3811,32 @@ class MainApp(tk.Tk):
             texts.extend([e.get("brand", ""), e.get("model", ""), e.get("variant", "")])
         self.speller.replace_dynamic_vocab(texts)
 
+    # Coalescing window for autosave: bursts of commits (Fix All, imports,
+    # rapid Save Entry clicks) collapse into ONE snapshot + disk write
+    # instead of a full deep-copy of the database on the UI thread per
+    # commit. Crash-recovery exposure is bounded to this many milliseconds.
+    AUTOSAVE_DELAY_MS = 2500
+
     def _autosave(self):
+        """Schedule a coalesced autosave. The snapshot itself is built on
+        the timer tick (still on the UI thread, so entry dicts are stable)
+        and serialized on the worker thread."""
+        if not self.entries or not self.db_path:
+            return
+        if getattr(self, "_as_after", None):
+            try:
+                self.after_cancel(self._as_after)
+            except Exception:
+                pass
+        try:
+            self._as_after = self.after(self.AUTOSAVE_DELAY_MS,
+                                        self._autosave_flush)
+        except Exception:
+            pass                        # shutting down
+
+    def _autosave_flush(self):
+        """Build one independent snapshot and hand it to the writer thread."""
+        self._as_after = None
         if not self.entries or not self.db_path:
             return
         if not hasattr(self, "_as_lock"):
@@ -3559,6 +3870,15 @@ class MainApp(tk.Tk):
 
         self._as_thread = threading.Thread(target=_worker, daemon=True, name="autosave")
         self._as_thread.start()
+
+    def _autosave_cancel(self):
+        after_id = getattr(self, "_as_after", None)
+        if after_id:
+            try:
+                self.after_cancel(after_id)
+            except Exception:
+                pass
+            self._as_after = None
 
     # ------------------------------------------------------------------
     # HISTORY / UNDO / REDO
@@ -3814,6 +4134,8 @@ class MainApp(tk.Tk):
         search_entry = ttk.Entry(toolbar, textvariable=self.search_var)
         search_entry.pack(side="left", padx=4, fill="x", expand=True)
         attach_entry_context_menu(search_entry)
+        # syntax help on hover (plain text + field filters)
+        HoverTooltip(search_entry, lambda x, y: SEARCH_HELP)
         self._search_debounce_id = None
         def _on_search_change(*a):
             if self._search_debounce_id:
@@ -3936,6 +4258,14 @@ class MainApp(tk.Tk):
         self.status_marquee.pack(side="left", padx=8, pady=2,
                                  fill="x", expand=True)
 
+        # app-wide shortcuts: Ctrl+S = Save Entry (editor commit),
+        # Ctrl+N = new entry. Modal dialogs run with their own grab, so
+        # these only ever fire while the main window has focus.
+        self.bind("<Control-s>", self._on_ctrl_save)
+        self.bind("<Control-S>", self._on_ctrl_save)
+        self.bind("<Control-n>", self._on_ctrl_new)
+        self.bind("<Control-N>", self._on_ctrl_new)
+
         # live-retheme hooks: canvas art + placed widgets the style engine
         # and retint walker cannot reach on their own
         theme.add_retheme_hook(self._on_retheme_hook)
@@ -3955,6 +4285,17 @@ class MainApp(tk.Tk):
             header, text="\U0001F4BE  DATABASE TOOL",
             font=theme.title_font(), bg=theme.BG_PANEL, fg=theme.TEXT_MAIN)
         self.header_title.pack(side="left", padx=14, pady=6)
+
+    def _on_ctrl_save(self, _event=None):
+        """Ctrl+S: commit the editor form (same as the Save Entry button)."""
+        if self.entries or self.editor.form_is_dirty() or \
+                self.editor.brand_entry.get() or self.editor.model_entry.get():
+            self.editor._on_save()
+        return "break"
+
+    def _on_ctrl_new(self, _event=None):
+        self.add_entry()
+        return "break"
 
     def _on_retheme_hook(self):
         """Registered as a live-retheme hook: refreshes the placed header
@@ -4027,6 +4368,9 @@ class MainApp(tk.Tk):
                 # if still dirty after save attempt, stay
                 if self.dirty:
                     return
+        # capture whatever the coalescing autosave had not flushed yet
+        self._autosave_cancel()
+        self._autosave_flush()
         self.destroy()
 
     # ------------------------------------------------------------------
@@ -4112,16 +4456,14 @@ class MainApp(tk.Tk):
             messagebox.showwarning(APP_TITLE, "Notes while loading:\n\n" + preview)
         self.status_var.set(msg)
         self._notify_db_changed()
-        # run audit without blocking the UI (threaded for large DBs / when a
-        # data folder with thousands of measurement files is linked)
-        self.run_audit(done=self._audit_done_popup)
+        # Post-load audit runs WITHOUT yanking the user off the Editor tab;
+        # results surface via the Audit tab's live issue-count badge.
+        self.run_audit(switch_tab=False)
 
     def _audit_done_popup(self, issue_count):
-        if issue_count:
-            messagebox.showinfo(
-                APP_TITLE,
-                "Database loaded.\n\nThe automatic audit found {} item(s) to review "
-                "in the Audit tab.".format(issue_count))
+        # Kept for backward compatibility with external callers; the badge
+        # on the Audit tab replaced the post-load modal.
+        pass
 
     def set_data_folder(self):
         path = filedialog.askdirectory(title="Select the folder that contains the 'data' subfolder")
@@ -4175,7 +4517,7 @@ class MainApp(tk.Tk):
             if self._audit_dirty and self.entries:
                 self.status_var.set(
                     "Changes made since the last audit - refreshing...")
-                self.run_audit()
+                self.run_audit(switch_tab=False)
         elif widget is self.editor:
             try:
                 self.editor.file_panel.poll_now()
@@ -4348,8 +4690,7 @@ class MainApp(tk.Tk):
         query = self.search_var.get().strip().lower()
         by_brand = {}
         for idx, e in enumerate(self.entries):
-            hay = " ".join([e.get("brand", ""), e.get("model", ""), e.get("variant", ""), e.get("id", "")]).lower()
-            if query and query not in hay:
+            if query and not entry_matches_query(e, query):
                 continue
             by_brand.setdefault(e.get("brand", "(no brand)"), []).append(idx)
         for brand in sorted(by_brand.keys(), key=str.lower):
@@ -4753,11 +5094,15 @@ class MainApp(tk.Tk):
     # ------------------------------------------------------------------
     # AUDIT
     # ------------------------------------------------------------------
-    def run_audit(self, done=None):
+    def run_audit(self, done=None, switch_tab=True):
         """Run the full audit. Heavy runs happen in a daemon thread that only
         computes; ALL tkinter access happens here on the main thread via an
         after()-poll loop, so this is safe during startup, shutdown, and any
-        Tcl build."""
+        Tcl build.
+
+        switch_tab=False keeps the user wherever they are (post-load audit,
+        silent auto-refreshes); results still land via the Audit tab's
+        issue-count badge."""
         if not self.entries:
             messagebox.showinfo(APP_TITLE, "No database loaded.")
             return
@@ -4771,20 +5116,25 @@ class MainApp(tk.Tk):
             except Exception as e:
                 return [], e
 
-        if len(self.entries) < 5000 and not self.data_root:
+        # Small databases audit in well under a second even with a data
+        # folder walk; doing it synchronously avoids the tab switch and
+        # status flicker entirely. Large ones go to the worker thread.
+        if len(self.entries) <= 2000:
             issues, err = _compute()
             if err:
                 messagebox.showwarning(APP_TITLE, "Audit failed:\n{}".format(err))
             else:
                 self.audit_panel.show_issues(issues)
-                self.notebook.select(self.audit_panel)
+                if switch_tab:
+                    self.notebook.select(self.audit_panel)
                 self._audit_dirty = False
             if done:
                 done(len(issues))
             return
 
         self.status_var.set("Running audit...")
-        self.notebook.select(self.audit_panel)
+        if switch_tab:
+            self.notebook.select(self.audit_panel)
 
         result = {}
         th = threading.Thread(
@@ -4809,6 +5159,27 @@ class MainApp(tk.Tk):
 
         th.start()
         self.after(60, poll)
+
+    # ------------------------------------------------------------------
+    # AUDIT TAB BADGE (live issue count on the tab label)
+    # ------------------------------------------------------------------
+    AUDIT_TAB_BASE = "  Audit  "
+
+    def _update_audit_badge(self, live_issues):
+        """Show unresolved issue count on the Audit tab so results are
+        visible from any tab (replaces yanking the user to Audit after a
+        load). Errors and warnings share one number; 0 hides the badge."""
+        label = self.AUDIT_TAB_BASE
+        if live_issues:
+            label = "  Audit \u26a0 {}  ".format(live_issues)
+        try:
+            for i, tab in enumerate(self.notebook.tabs()):
+                if str(self.audit_panel) == tab or \
+                        self.notebook.tab(tab, "text").startswith("  Audit"):
+                    self.notebook.tab(i, text=label)
+                    break
+        except Exception:
+            pass
 
     def apply_fixes(self, issues):
         fixable = [i for i in issues if i.fix]
@@ -4846,15 +5217,34 @@ class MainApp(tk.Tk):
             len(changes), n_entries, "y" if n_entries == 1 else "ies")
         self._record_op("fixes", desc, changes)
         note = ""
-        skipped = max(0, len(fixable) - len(changes))
-        if failed or skipped:
-            note = " ({} stale/failed)".format(skipped + failed)
+        not_applied = stale + failed
+        if not_applied:
+            # Counted from the actual fix results (stale = target moved or
+            # gone; failed = raised), NOT derived from len(changes): several
+            # fixes can land on the SAME entry and collapse into one change
+            # record, which made the old derivation over-report skips.
+            note = " ({} of {} skipped: {} stale, {} failed)".format(
+                not_applied, len(fixable), stale, failed)
         self.dirty = True
         self.populate_tree()
+        self._reload_editor_if_affected({c["pos_hint"] for c in changes})
         self.status_var.set("Applied {} fix(es){}. Remember to Save As to keep them.".format(
             len(changes), note))
         self._notify_db_changed()
         self._autosave()
+
+    def _reload_editor_if_affected(self, positions):
+        """Reload the editor form when the entry it is showing was mutated
+        in place (audit fixes). Without this the form keeps the PRE-fix
+        values and a later Save Entry silently reverts the repairs."""
+        idx = self.editing_index
+        if idx is None or not (0 <= idx < len(self.entries)):
+            return
+        if idx in positions:
+            try:
+                self.editor.load_entry(self.entries[idx])
+            except Exception:
+                L.log("Editor reload after fixes failed")
 
     # ------------------------------------------------------------------
     # AUTOCOMPLETE SUGGESTION PROVIDERS
@@ -4906,7 +5296,11 @@ def main():
 
 
 def _int_input(raw, default=None):
-    s = str(raw).strip().replace("_", "")
+    s = str(raw).strip()
+    # Reject Python-style digit separators ("2_023" -> 2023 used to slip
+    # through); underscores are never valid in these spec fields.
+    if "_" in s:
+        return default
     if s == "":
         return default
     try:

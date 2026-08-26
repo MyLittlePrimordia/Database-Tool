@@ -87,6 +87,12 @@ def enable_native_file_drop(widget, on_files) -> bool:
 
         pending = []
         poll_job = []
+        # Adaptive cadence: fast (50 ms) only while drops are actually
+        # being delivered, slow idle heartbeat otherwise. The hook used to
+        # spin at 20 Hz forever per hooked window even when nothing ever
+        # dropped.
+        POLL_ACTIVE_MS = 50
+        POLL_IDLE_MS = 250
 
         def _proc(h, msg, wp, lp, _uid, _ref):
             if msg == WM_DROPFILES:
@@ -117,6 +123,7 @@ def enable_native_file_drop(widget, on_files) -> bool:
             if getattr(widget, "_drop_cleanup", None) is None:
                 return  # unsubscribed; stop the poller
             try:
+                had_pending = bool(pending)
                 while pending:
                     files = pending.pop(0)
                     if files:
@@ -124,7 +131,8 @@ def enable_native_file_drop(widget, on_files) -> bool:
             except Exception:  # noqa: BLE001
                 pass
             try:
-                poll_job.append(widget.after(50, _poll))
+                delay = POLL_ACTIVE_MS if had_pending else POLL_IDLE_MS
+                poll_job.append(widget.after(delay, _poll))
             except Exception:  # noqa: BLE001
                 pass
 

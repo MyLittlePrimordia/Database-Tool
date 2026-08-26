@@ -42,6 +42,8 @@ class CurveImportPanel(ttk.Frame):
         self._busy = False
         self._queue_rows = []      # [(row, label)] for click-to-preview
         self._sel_queue = -1       # index into self.files shown in the plot
+        self._queue_sel = set()    # multi-select (normcased paths)
+        self._queue_anchor = None  # shift-range anchor row index
         self._plan_rows = []       # [(row, bg_widgets)] for click-to-preview
         self._sel_plan = -1        # index into self._plans shown in the plot
 
@@ -102,6 +104,10 @@ class CurveImportPanel(ttk.Frame):
             side="right", padx=2)
         ttk.Button(header, text="Clear all", command=self._clear_files).pack(
             side="right", padx=2)
+        self.remove_sel_btn = ttk.Button(header, text="Remove selected",
+                                         command=self._remove_queued_selected,
+                                         state="disabled")
+        self.remove_sel_btn.pack(side="right", padx=2)
 
         # Native OS drag & drop is a Windows-only ctypes hook (win_drop);
         # on macOS/Linux it silently no-ops, so say "Select files..." there
@@ -180,6 +186,10 @@ class CurveImportPanel(ttk.Frame):
         self.count_var.set("{} file(s) queued".format(n))
         self._queue_rows = []
         self._sel_queue = -1
+        # prune multi-select to paths still queued
+        alive = set(self.files)
+        self._queue_sel &= alive
+        self._update_remove_sel_btn()
         if not n:
             tk.Label(self.queue_inner,
                      text="No files queued yet - use \"Select files...\" or "
@@ -191,6 +201,7 @@ class CurveImportPanel(ttk.Frame):
             return
         for i, path in enumerate(self.files):
             self._add_queue_row(path, i)
+        self._render_queue_selection()
         self._set_plans(CL.plan_groups(self.files))
 
     def _add_queue_row(self, path, idx):
@@ -206,9 +217,15 @@ class CurveImportPanel(ttk.Frame):
         x_btn.bind("<Button-1>", lambda e, p=path: self._remove_file(p))
         x_btn.bind("<Enter>", lambda e, b=x_btn: b.configure(fg=theme.ACCENT_RED))
         x_btn.bind("<Leave>", lambda e, b=x_btn: b.configure(fg=theme.TEXT_DIM))
-        # clicking a queued file previews its raw curve
+        # clicking a queued file previews its raw curve; Ctrl+click toggles
+        # it in the multi-select, Shift+click selects a range (plain click
+        # selects just that row AND previews it)
         for w in (row, lbl):
-            w.bind("<Button-1>", lambda e, i=idx: self._select_queue_row(i))
+            w.bind("<Button-1>",
+                   lambda e, i=idx: self._select_queue_row(
+                       i,
+                       "toggle" if e.state & 0x0004 else
+                       ("range" if e.state & 0x0001 else "only")))
         self._queue_rows.append((row, lbl))
 
     def _remove_file(self, path):
@@ -217,6 +234,25 @@ class CurveImportPanel(ttk.Frame):
         except ValueError:
             pass
         self._refresh_queue()
+
+    def _remove_queued_selected(self):
+        if not self._queue_sel:
+            return
+        self.files = [p for p in self.files if p not in self._queue_sel]
+        self._queue_sel.clear()
+        self._refresh_queue()
+
+    def _update_remove_sel_btn(self):
+        try:
+            self.remove_sel_btn.state(
+                ["!disabled"] if self._queue_sel else ["disabled"])
+        except Exception:
+            pass
+
+    # selection-highlight color derived from the live palette (the old
+    # hardcoded #26304a was unreadable under light themes)
+    def _queue_sel_bg(self):
+        return theme.blend(theme.BG_INPUT, theme.ACCENT_BLUE, 0.35)
 
     # ------------------------------------------------------------------
     # Curve preview (live plot of the selected queued file / plan)
@@ -243,23 +279,46 @@ class CurveImportPanel(ttk.Frame):
                 "to see its curve")
         self.preview_info.configure(text="")
 
-    def _select_queue_row(self, idx):
+    def _select_queue_row(self, idx, how="only"):
+        """Queue-row selection with multi-select support.
+
+        how='only'  -> single-select + preview (plain click)
+        how='toggle'-> Ctrl+click: add/remove this row from the selection
+        how='range' -> Shift+click: extend from the last anchor row"""
         if not (0 <= idx < len(self.files)):
             return
-        self._sel_queue = idx
-        self._sel_plan = -1
-        for i, (row, lbl) in enumerate(self._queue_rows):
-            bg = "#26304a" if i == idx else theme.BG_INPUT
-            row.configure(bg=bg)
-            lbl.configure(bg=bg)
-        self._render_plan_selection()
+        path = self.files[idx]
+        if how == "toggle":
+            if path in self._queue_sel:
+                self._queue_sel.discard(path)
+            else:
+                self._queue_sel.add(path)
+            self._queue_anchor = idx
+        elif how == "range" and getattr(self, "_queue_anchor", None) is not None:
+            # Explorer-style: shift+click REPLACES the selection with the
+            # anchor..clicked range
+            lo, hi = sorted((self._queue_anchor, idx))
+            self._queue_sel = {self.files[k] for k in range(lo, hi + 1)}
+        else:
+            self._queue_sel.clear()
+            self._queue_sel.add(path)
+            self._queue_anchor = idx
+            self._sel_plan = -1
+            self._render_plan_selection()
+            self._preview_queue_idx(idx)
+        self._sel_queue = idx if len(self._queue_sel) == 1 else -1
+        self._render_queue_selection()
+        self._update_remove_sel_btn()
+
+    def _preview_queue_idx(self, idx):
         pts = fr_plot.get_curve_points(self.files[idx])
         norm = fr_plot.normalized(pts) if pts else []
+        norm = fr_plot.smooth_octaves(norm) if norm else []
         name = os.path.basename(self.files[idx])
         if norm:
             self.preview_plot.set_data(
                 [{"name": name, "pts": norm,
-                  "color": fr_plot.palette()[0], "width": 2}])
+                  "color": fr_plot.palette()[0], "width": 4}])
             self.preview_info.configure(
                 text="RAW  \u00b7  {}".format(name),
                 fg=theme.TEXT_DIM)
@@ -281,11 +340,12 @@ class CurveImportPanel(ttk.Frame):
         for k, (p, _role) in enumerate(plan.sources):
             pts = fr_plot.get_curve_points(p)
             norm = fr_plot.normalized(pts) if pts else []
+            norm = fr_plot.smooth_octaves(norm) if norm else []
             if not norm:
                 continue
             series.append({"name": os.path.basename(p), "pts": norm,
                            "color": fr_plot.palette()[k % len(fr_plot.palette())],
-                           "width": 2})
+                           "width": 4})
             names.append(os.path.basename(p))
         badge = ("PAIR\u2192AVG" if plan.averaged else
                  ("SOLO" if len(plan.sources) == 1 else "GROUP"))
@@ -298,9 +358,11 @@ class CurveImportPanel(ttk.Frame):
         avg = None
         if plan.averaged and len(series) == 2:
             # exact same math convert_plan uses: mean on raw SPL, first grid
+            # (smoothed for display, like every preview curve)
             pa = fr_plot.get_curve_points(plan.sources[0][0])
             pb = fr_plot.get_curve_points(plan.sources[1][0])
             avg = fr_plot.average_raw(pa, pb) if pa and pb else None
+            avg = fr_plot.smooth_octaves(avg) if avg else None
             if avg:
                 names.append("average")
         self.preview_plot.set_data(series, avg=avg)
@@ -310,14 +372,18 @@ class CurveImportPanel(ttk.Frame):
             fg=theme.TEXT_DIM)
 
     def _render_queue_selection(self):
+        sel_bg = self._queue_sel_bg()
         for i, (row, lbl) in enumerate(self._queue_rows):
-            bg = "#26304a" if i == self._sel_queue else theme.BG_INPUT
+            if not (0 <= i < len(self.files)):
+                continue
+            bg = sel_bg if self.files[i] in self._queue_sel else theme.BG_INPUT
             row.configure(bg=bg)
             lbl.configure(bg=bg)
 
     def _render_plan_selection(self):
+        sel_bg = self._queue_sel_bg()
         for i, widgets in enumerate(self._plan_rows):
-            bg = "#26304a" if i == self._sel_plan else widgets[-1]
+            bg = sel_bg if i == self._sel_plan else widgets[-1]
             for w in widgets[:-1]:
                 try:
                     w.configure(bg=bg)
@@ -366,8 +432,16 @@ class CurveImportPanel(ttk.Frame):
             card, text="Link converted files into the entry being edited",
             variable=self.autolink_var, style="Card.TCheckbutton",
             command=self._autolink_toggled)
-        self.autolink_check.grid(row=3, column=0, columnspan=3, sticky="w",
+        self.autolink_check.grid(row=3, column=0, columnspan=2, sticky="w",
                                  padx=8, pady=(6, 2))
+        # opt-in Explorer popup: auto-opening a window after EVERY convert
+        # annoyed more than it helped
+        self.openfolder_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            card, text="Open output folder after converting",
+            variable=self.openfolder_var, style="Card.TCheckbutton"
+        ).grid(row=3, column=2, columnspan=2, sticky="e", padx=8,
+               pady=(6, 2))
 
         hint = ("\u26a0 Set the data folder first (File \u25b8 Set Data Folder...)"
                 if not self.app.get_data_root() else "")
@@ -531,7 +605,8 @@ class CurveImportPanel(ttk.Frame):
                 final = "{} ({}){}".format(stem, count + 1, ext.lower())
             taken[final.lower()] = count + 1
 
-            row_bg = theme.BG_CARD if i % 2 == 0 else "#232736"
+            row_bg = theme.BG_CARD if i % 2 == 0 else \
+                theme.blend(theme.BG_CARD, theme.TEXT_MAIN, 0.04)
             row = tk.Frame(self.preview_inner, bg=row_bg, cursor="hand2")
             row.pack(fill="x")
 
@@ -764,7 +839,7 @@ class CurveImportPanel(ttk.Frame):
             ok_count, dest, linked_note))
         self.app.status_var.set(
             "Imported {} measurement file(s) -> {}".format(ok_count, dest))
-        if hasattr(os, "startfile"):
+        if self.openfolder_var.get() and hasattr(os, "startfile"):
             try:
                 os.startfile(dest)  # noqa: S606 - explorer shortcut
             except Exception:  # noqa: BLE001

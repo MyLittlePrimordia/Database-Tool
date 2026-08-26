@@ -205,7 +205,8 @@ def analyze_points(points):
     if pinna_peak is not None:
         m["pinna_peak"] = round(pinna_peak - ref, 1)
     treb_hi = min(15000, fmax)
-    treble_coverage = (min(treb_hi, 15000) - 6000) / (15000 - 6000)
+    # fraction of the 6-15 kHz band this file actually covers
+    treble_coverage = (treb_hi - 6000) / 9000.0
     treb_avg = _band(points, 6000, treb_hi)
     treb_peak = _band_peak(points, 6000, treb_hi)
     if treb_avg is not None and treble_coverage >= 0.25:

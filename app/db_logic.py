@@ -202,6 +202,8 @@ WARN_ZERO_YEAR = True             # year == 0  -> warning ("unknown" fallback)
 WARN_ZERO_PRICE = True            # price == 0 -> warning
 WARN_UNVERIFIED_DRIVERS = True    # driver_type AND driver_config both empty
 WARN_ZERO_SPECS_NON_TWS = True    # impedance/sensitivity == 0 on wired forms
+WARN_TWS_SPECS_NONZERO = True     # nonzero impedance/sensitivity on TWS
+                                  # (AUDIT PROMPT: TWS must be 0/0; advisory)
 NO_FILES_WARN_THRESHOLD = 25      # fileless entries: <=N -> warning row,
                                   #              >N -> info summary row
 UNLINKED_ROW_CAP = 200            # unlinked files: <=N -> one info row per
@@ -303,6 +305,25 @@ def classify_driver(components):
     return "Tribrid", config
 
 
+# Case-insensitive lookup for driver tech tokens ("1dd" == "1DD").
+# Canonical spelling always wins on output, so a lowercase or mixed-case
+# config is normalized instead of being treated as unknown data.
+_TECH_BY_UPPER = {t.upper(): t for t in DRIVER_TECH_ORDER}
+
+
+def _split_driver_token(part):
+    """'2BA' -> (2, 'BA'); returns count 0 when the token is not a valid
+    <count><tech> pair. Tech matching is case-insensitive."""
+    m = re.match(r"^(\d+)([A-Za-z]+)$", part)
+    if not m:
+        return 0, None
+    count, tech = m.groups()
+    tech = _TECH_BY_UPPER.get(tech.upper())
+    if tech is None:
+        return 0, None
+    return coerce_int(count, 0), tech
+
+
 def parse_driver_config(config_str):
     result = {}
     if not config_str:
@@ -311,14 +332,9 @@ def parse_driver_config(config_str):
     for part in parts:
         if not part:
             continue
-        m = re.match(r"^(\d+)([A-Za-z]+)$", part)
-        if not m:
-            continue
-        count, tech = m.groups()
-        if tech in DRIVER_TECH_ORDER:
-            c = coerce_int(count, 0)
-            if c > 0:
-                result[tech] = c
+        c, tech = _split_driver_token(part)
+        if tech is not None and c > 0:
+            result[tech] = c
     return result
 
 
@@ -328,8 +344,8 @@ def driver_config_unknown_tokens(config_str):
     for part in str(config_str).replace(" ", "").split("+"):
         if not part:
             continue
-        m = re.match(r"^(\d+)([A-Za-z]+)$", part)
-        if not m or m.group(2) not in DRIVER_TECH_ORDER:
+        c, tech = _split_driver_token(part)
+        if tech is None or c <= 0:
             out.append(part)
     return out
 
@@ -996,19 +1012,47 @@ def _dup_norm_name(entry):
 
 
 def _dup_specs_match(a, b):
-    """How many of (year, price_usd, driver_config) agree between the two
-    entries (0..3). Identical specs on 'different' products raise the
-    suspicion; differing specs hint at legit generations/variants."""
+    """How many of (year, price_usd, driver_config) genuinely agree between
+    the two entries (0..3). Identical specs on 'different' products raise
+    the suspicion; differing specs hint at legit generations/variants.
+    Missing/zero values on BOTH sides count as NON-matching: two entries
+    that simply lack specs must not corroborate each other."""
     same = 0
     for f in ("year", "price_usd", "driver_config"):
-        va, vb = a.get(f, 0), b.get(f, 0)
+        va, vb = a.get(f), b.get(f)
+
+        def _missing(v):
+            return v in (None, "", 0) or str(v).strip() == ""
+
+        if _missing(va) or _missing(vb):
+            continue
         try:
-            if int(str(va) or 0) == int(str(vb) or 0):
+            if int(str(va)) == int(str(vb)):
                 same += 1
         except (TypeError, ValueError):
-            if str(va) == str(vb) and str(va):
+            if str(va) == str(vb):
                 same += 1
     return same
+
+
+# "k67" vs "k167", "liberty 2" vs "liberty 3": one token differs and both
+# differing tokens are the SAME model-number shape -- identical alpha
+# prefix/suffix around digits that differ. That is a generation/model
+# number, not a duplicate ("MACH 10" vs "MACH 80" are different products).
+_MODEL_NUM_RE = re.compile(r"^([a-z]*)(\d{1,5})([a-z]*)$")
+
+
+def _model_number_siblings(x, y):
+    """True when x and y are model numbers of the same shape that differ
+    only in their digits ('k67'/'k167', '2'/'3', 'mk2' is NOT -- letters
+    inside keep it out via prefix/suffix mismatch... 'mk2' vs 'mk3' share
+    prefix 'mk' so they ARE siblings by this rule, matching _GEN_TOKENS)."""
+    mx = _MODEL_NUM_RE.match(x)
+    my = _MODEL_NUM_RE.match(y)
+    if not mx or not my:
+        return False
+    return ((mx.group(1), mx.group(3)) == (my.group(1), my.group(3))
+            and mx.group(2) != my.group(2))
 
 
 def _dup_prefix_pair(na, nb):
@@ -1108,6 +1152,22 @@ def find_duplicate_pairs(entries, referenced_map=None):
                             or all(t.isdigit() for t in rest_tokens)):
                         continue
 
+                # mid-name model-number guard: when the token SETS differ
+                # by exactly one token per side and those tokens are the
+                # same model-number shape with different digits
+                # ("liberty 2 pro"/"liberty 3 pro", "k67"/"k167"), the two
+                # entries are distinct generations -- the trailing-name
+                # guard above cannot see these because the number is not
+                # name-final.
+                ta_, tb_ = info[ia][2], info[ib][2]
+                if ta_ != tb_:
+                    da = ta_ - tb_
+                    db_ = tb_ - ta_
+                    if len(da) == 1 and len(db_) == 1 and \
+                            _model_number_siblings(next(iter(da)),
+                                                   next(iter(db_))):
+                        continue
+
                 # --- cheap rejection filters (no difflib yet) ----------
                 la, lb = info[ia][1], info[ib][1]
                 # length upper bound: ratio can never exceed 2*min/sum
@@ -1150,15 +1210,29 @@ def find_duplicate_pairs(entries, referenced_map=None):
                     continue
 
                 spec_n = _dup_specs_match(a, b)
-                if spec_n == 3:
-                    confidence = "high"
-                    reasons.append("year, price and driver config all match")
-                elif spec_n >= 2 and confidence == "low":
-                    confidence = "medium"
-                    reasons.append("{} of 3 key specs match".format(spec_n))
-                if (ia, ib) in shared_boost or (ib, ia) in shared_boost:
+                shares_files = ((ia, ib) in shared_boost
+                                or (ib, ia) in shared_boost)
+                similar_names = confidence in ("medium", "high") and \
+                    any("alike" in r for r in reasons)
+                if shares_files:
+                    # strongest possible signal, any brand
                     confidence = "high"
                     reasons.append("entries also share linked measurement files")
+                elif similar_names and spec_n == 3:
+                    # typo/restyled double-entry of the SAME product:
+                    # near-identical name AND year + price + driver all agree
+                    confidence = "high"
+                elif confidence == "high":
+                    # Name shape alone is weak evidence: sibling models
+                    # (K67/K167, Liberty 2/3 Pro) coincidentally share
+                    # specs far too often to call them duplicates on
+                    # similarity alone.
+                    confidence = "medium"
+                    reasons.append(
+                        "similarity without corroborating specs")
+                # prefix-extension findings ("Chu" vs "Chu Pro") stay LOW:
+                # official variants legitimately extend names, so only a
+                # shared measurement file (above) may escalate them.
                 emit(ia, ib, confidence, reasons)
 
     # materialize findings best-first (high confidence at the top)
@@ -1226,6 +1300,12 @@ def run_full_audit(entries, data_root=None):
                 continue                       # reported per-entry below
             norm = rel.replace("\\", "/")
             norm = re.sub(r"/+", "/", norm.strip())
+            # "./data/x.txt" and "data/./x.txt" are the same file as
+            # "data/x.txt"; without collapsing "." segments they would
+            # false-positive as Missing File against the disk walk.
+            while norm.startswith("./"):
+                norm = norm[2:]
+            norm = re.sub(r"/\./", "/", norm)
             if norm:
                 referenced_map.setdefault(norm, []).append(idx)
     if data_root:
@@ -1587,6 +1667,20 @@ def run_full_audit(entries, data_root=None):
                         severity="warning",
                         code="impedance-unknown" if field == "impedance"
                         else "sensitivity-unknown"))
+        if WARN_TWS_SPECS_NONZERO and ff == TWS_FORM_FACTOR \
+                and not ENFORCE_TWS_ZERO_SPECS:
+            # AUDIT PROMPT: TWS entries must be impedance 0 / sensitivity 0
+            # (no wired out path). Enforcement stays opt-in; this advisory
+            # surfaces violations without blocking saves.
+            bad = [label for field, label in
+                   (("impedance", "Impedance"), ("sensitivity", "Sensitivity"))
+                   if coerce_int(entry.get(field, 0), -1) != 0]
+            if bad:
+                issues.append(AuditIssue(
+                    "Missing Data", idx, eid,
+                    "{} must be 0 on {} (wireless: no DAC/amp chain).".format(
+                        " and ".join(bad), TWS_FORM_FACTOR),
+                    severity="warning", code="tws-nonzero"))
 
         conflicts = tag_conflicts(set(map(str, tags)))
         for pair in conflicts:

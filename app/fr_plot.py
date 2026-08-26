@@ -72,11 +72,33 @@ def _nice_bounds(lo, hi):
     hi = min(40.0, 5.0 * math.ceil(hi / 5.0))
     return lo, hi
 
+# Fixed 10-color categorical palette (Okabe-Ito-inspired hues chosen for
+# maximum mutual separation, incl. common color-vision types). Resolved at
+# call time; on LIGHT themes every hue is darkened so curves keep contrast
+# against pale surfaces (bright-on-dark, deep-on-light).
+_PALETTE_BASE = ["#4fc3f7",   # sky blue
+                 "#ffb74d",   # amber
+                 "#81c784",   # green
+                 "#e57373",   # red
+                 "#ba68c8",   # purple
+                 "#f06292",   # pink
+                 "#4db6ac",   # teal
+                 "#aed581",   # lime
+                 "#7986cb",   # indigo
+                 "#ffd54f"]   # yellow
+
+
+def _bg_is_light():
+    r, g, b = _rgb(theme.BG_INPUT)
+    return (0.299 * r + 0.587 * g + 0.114 * b) / 255.0 > 0.5
+
+
 def palette():
     """Curve colors, resolved at call time so theme switches re-palette
-    the next redraw (the accent color is per-theme)."""
-    return [theme.ACCENT_BLUE, theme.ACCENT_GREEN, theme.ACCENT_ORANGE,
-            theme.ACCENT_PURPLE, theme.ACCENT_RED]
+    the next redraw. Up to 10 distinct series before colors repeat."""
+    if _bg_is_light():
+        return [blend(c, "#000000", 0.35) for c in _PALETTE_BASE]
+    return list(_PALETTE_BASE)
 
 # parsed-curve cache: abspath -> (mtime_ns, size, [(f, db), ...])
 _CACHE = {}
@@ -129,10 +151,12 @@ def normalized(points):
     return [(f, d - r) for f, d in pts]
 
 
-def get_curve_points(path, max_points=200000):
+def get_curve_points(path, max_points=20000):
     """Parse any supported measurement file into [(freq, spl)] with caching.
     Returns [] when unreadable / no data rows. Huge inputs are strided down
-    to max_points before caching."""
+    to max_points before caching (plots decimate per pixel column anyway,
+    and averaging interpolates, so 20k points loses nothing visible while
+    keeping worst-case cache memory bounded: 96 curves x 20k points)."""
     try:
         st = os.stat(path)
     except OSError:
@@ -168,6 +192,32 @@ def _interp_at(freqs, dbs, f):
     if f1 == f0:
         return dbs[j - 1]
     return dbs[j - 1] + (dbs[j] - dbs[j - 1]) * (f - f0) / (f1 - f0)
+
+
+def smooth_octaves(pts, frac=1 / 12.0):
+    """Fractional-octave display smoothing: each sample's dB becomes the
+    mean over a +/- frac/2 octave window (the standard FR-tool treatment,
+    e.g. squig.link's 1/12). Display-only -- never written back to files.
+    Frequencies are preserved exactly; a flat curve is a fixed point."""
+    n = len(pts)
+    if n < 5:
+        return list(pts)
+    lfs = [math.log2(f) for f, _d in pts]
+    half = frac / 2.0
+    out = []
+    lo = hi = 0
+    for i, (f, _d) in enumerate(pts):
+        while lfs[lo] < lfs[i] - half:
+            lo += 1
+        if hi <= i:
+            hi = i + 1
+        while hi < n and lfs[hi] <= lfs[i] + half:
+            hi += 1
+        total = 0.0
+        for k in range(lo, hi):
+            total += pts[k][1]
+        out.append((f, total / (hi - lo)))
+    return out
 
 
 def average(curves):
@@ -306,11 +356,13 @@ class CurvePlot(tk.Canvas):
         for s in self._series:
             coords = self._polyline(s["pts"], x_of, y_of, w)
             if len(coords) >= 4:
-                # smooth=True rounds the per-pixel-column transitions without
-                # erasing real peaks (each peak is its own bucket), giving
-                # the anti-aliased look of squig.link's rendering
-                kw = {"fill": s["color"], "width": s.get("width", 2),
-                      "smooth": True, "splinesteps": 8, "tags": ("curve",)}
+                # smooth=True + high splinesteps rounds the per-pixel
+                # column transitions; combined with thick lines and
+                # 1/12-oct data smoothing this is what gives the curves
+                # their squig-like look (Tk has no true anti-aliasing).
+                kw = {"fill": s["color"], "width": s.get("width", 4),
+                      "smooth": True, "splinesteps": 14, "tags": ("curve",),
+                      "capstyle": "round", "joinstyle": "round"}
                 if s.get("dash"):
                     kw["dash"] = s["dash"]
                 self.create_line(*coords, **kw)
@@ -326,9 +378,10 @@ class CurvePlot(tk.Canvas):
         if self._avg:
             coords = self._polyline(self._avg, x_of, y_of, w)
             if len(coords) >= 4:
-                self.create_line(*coords, fill=theme.TEXT_MAIN, width=1,
-                                 smooth=True, splinesteps=8,
-                                 dash=(6, 4), tags=("avg",))
+                self.create_line(*coords, fill=theme.TEXT_MAIN, width=3,
+                                 smooth=True, splinesteps=14,
+                                 capstyle="round", joinstyle="round",
+                                 dash=(7, 4), tags=("avg",))
 
         # hover readout lives with the cursor position, cheap and useful
         self._bind_hover()

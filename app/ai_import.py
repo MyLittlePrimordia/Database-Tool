@@ -46,6 +46,9 @@ _TRAILING_COMMA_RE = re.compile(r",\s*([}\]])")
 _SR_BLOCK_RE = re.compile(
     r"SEARCH\s*:\s*(?P<search>.*?)REPLACE\s*:\s*(?P<replace>.*?)(?=\n\s*SEARCH\s*:|\Z)",
     re.DOTALL | re.IGNORECASE)
+# Explicit deletion marker at the start of a REPLACE region: bare `null`
+# or an empty object (optionally spaced).
+_EMPTY_REPLACE_RE = re.compile(r"^(?:null|\{\s*\})", re.IGNORECASE)
 
 
 def _clean(text):
@@ -127,46 +130,55 @@ def parse_search_replace(text):
     replacements = []
     standalone = []
     errors = []
+    # Spans MUST be computed on the SAME cleaned text that
+    # _balanced_objects() scans below: stripping fences/comment lines
+    # shifts offsets, and mixing the two bases used to attribute REPLACE
+    # objects to "standalone" whenever a // comment preceded the block
+    # (the format our own generated prompt recommends).
+    clean = _clean(text)
     spans = [(m.start("search"), m.end("search"),
               m.start("replace"), m.end("replace"))
-             for m in _SR_BLOCK_RE.finditer(text)]
+             for m in _SR_BLOCK_RE.finditer(clean)]
     if not spans:
         return replacements, standalone, errors
 
-    # Attribute every JSON object in the text to its region: the SEARCH
-    # part of a block, the REPLACE part of a block, or neither. The
-    # REPLACE capture can over-run to the next SEARCH (or EOF); any
-    # objects past the first in that over-run are standalone entries,
-    # not lost data.
-    search_cands = [[] for _ in spans]
-    replace_cands = [[] for _ in spans]
-    for obj, start, _end in _balanced_objects(_clean(text)):
-        placed = False
-        for bi, (ss, se, rs, re_) in enumerate(spans):
-            if ss <= start < se:
-                search_cands[bi].append(obj)
-                placed = True
-                break
-            if rs <= start < re_:
-                replace_cands[bi].append(obj)
-                placed = True
-                break
-        if not placed:
-            standalone.append(obj)
-
-    for bi in range(len(spans)):
-        sc, rc = search_cands[bi], replace_cands[bi]
-        if not sc and not rc:
-            continue
+    # Attribute content per block directly (no global positional matching):
+    # - SEARCH region -> first balanced object is the target entry
+    # - REPLACE region -> first object is the corrected entry; a bare
+    #   `null` / `{}` is an EXPLICIT deletion marker (it produces no
+    #   balanced object, so without this check a deletion followed by a
+    #   standalone new entry made the new entry masquerade as the
+    #   replacement). Anything past the first object in either region is
+    #   standalone data, never silently dropped.
+    covered = []
+    for bi, (ss, se, rs, re_) in enumerate(spans):
+        sc = [o for o, _s, _e in _balanced_objects(clean[ss:se])]
+        r_txt = clean[rs:re_]
+        stripped = r_txt.lstrip()
+        dele = _EMPTY_REPLACE_RE.match(stripped)
+        if dele is not None:
+            replace_obj = None
+            tail = r_txt[len(r_txt) - len(stripped) + dele.end():]
+            extra = [o for o, _s, _e in _balanced_objects(tail)]
+        else:
+            robjs = [o for o, _s, _e in _balanced_objects(r_txt)]
+            replace_obj = robjs[0] if robjs else None
+            extra = robjs[1:]
         if not sc:
             errors.append("A SEARCH block contained no parseable JSON "
                           "entry; it was skipped.")
-            standalone.extend(rc)
+            standalone.extend(extra)
             continue
-        # "No changes needed for this section." -> empty REPLACE region
-        replace_obj = rc[0] if rc else None
-        standalone.extend(rc[1:])
         replacements.append((sc[0], replace_obj, ""))
+        standalone.extend(sc[1:])
+        standalone.extend(extra)
+        covered.append((ss, re_))
+
+    # Any object OUTSIDE every block's span is a standalone entry (e.g. a
+    # new entry appended after the last block).
+    for obj, start, _end in _balanced_objects(clean):
+        if not any(a <= start < b for a, b in covered):
+            standalone.append(obj)
     return replacements, standalone, errors
 
 
@@ -279,7 +291,9 @@ def classify_against(entries, parsed):
             continue
         claimed.add(pos)
         if not isinstance(replace_obj, dict) or not replace_obj:
-            # REPLACE: null / {} -> proposed deletion (opt-in only)
+            # REPLACE: null / {} -> proposed deletion (opt-in only).
+            # The delete CLAIMS the position like every other action so
+            # the same entry can never receive a second proposal.
             proposals.append({"action": "delete", "pos": pos,
                               "old": entries[pos]})
             continue
@@ -635,46 +649,66 @@ class ImportDialog(tk.Toplevel):
                     parent=self):
                 return
 
-        # apply on the live list + build ONE history op
+        # apply on the live list + build ONE history op.
+        # ORDER MATTERS: every proposal's `pos` was captured against the
+        # ORIGINAL list. Edits (in-place replacement) never shift
+        # positions, so they go first in ascending order; deletions are
+        # applied LAST in DESCENDING position order so each removal still
+        # points at the right row no matter how many deletes ran before
+        # it. The old interleaved loop deleted at pos N and then edited
+        # pos M > N, silently hitting whatever shifted into M.
         changes = []
         applied_new = applied_changed = 0
+        n_deleted = 0
+
+        def _edit_change(pos, old, clean):
+            return {
+                "pos_hint": pos,
+                "ref_before": old, "copy_before": app._deepcopy(old),
+                "ref_after": clean, "copy_after": app._deepcopy(clean),
+            }
+
         for p, candidate in staged:
-            if p["action"] == "delete":
-                pos = p["pos"]
-                old = app.entries[pos]
-                del app.entries[pos]
-                changes.append({
-                    "pos_hint": pos,
-                    "ref_before": old, "copy_before": app._deepcopy(old),
-                    "ref_after": None, "copy_after": None})
+            if p["action"] != "new":
                 continue
             clean = L.build_clean_entry(candidate)
-            if p["action"] == "new":
-                pos = len(app.entries)
-                app.entries.append(clean)
-                applied_new += 1
-                changes.append({
-                    "pos_hint": pos,
-                    "ref_before": None, "copy_before": None,
-                    "ref_after": clean, "copy_after": app._deepcopy(clean)})
-            else:
-                pos = p["pos"]
-                old = app.entries[pos]
-                app.entries[pos] = clean
-                applied_changed += 1
-                changes.append({
-                    "pos_hint": pos,
-                    "ref_before": old, "copy_before": app._deepcopy(old),
-                    "ref_after": clean, "copy_after": app._deepcopy(clean)})
+            pos = len(app.entries)
+            app.entries.append(clean)
+            applied_new += 1
+            changes.append({
+                "pos_hint": pos,
+                "ref_before": None, "copy_before": None,
+                "ref_after": clean, "copy_after": app._deepcopy(clean)})
+        for p, candidate in staged:
+            if p["action"] != "changed":
+                continue
+            clean = L.build_clean_entry(candidate)
+            pos = p["pos"]
+            old = app.entries[pos]
+            app.entries[pos] = clean
+            applied_changed += 1
+            changes.append(_edit_change(pos, old, clean))
+        for p, _candidate in sorted(
+                ((p, c) for p, c in staged if p["action"] == "delete"),
+                key=lambda pc: pc[0]["pos"], reverse=True):
+            pos = p["pos"]
+            if not (0 <= pos < len(app.entries)) or \
+                    app.entries[pos].get("id") != p["old"].get("id"):
+                continue            # stale (defensive; cannot normally happen)
+            old = app.entries[pos]
+            del app.entries[pos]
+            n_deleted += 1
+            changes.append({
+                "pos_hint": pos,
+                "ref_before": old, "copy_before": app._deepcopy(old),
+                "ref_after": None, "copy_after": None})
 
         if not changes:
             return
         desc = "Imported {} entr{} from AI output{}".format(
             applied_new + applied_changed,
             "y" if applied_new + applied_changed == 1 else "ies",
-            " ({} deleted)".format(len(staged) - applied_new -
-                                   applied_changed)
-            if any(p["action"] == "delete" for p, _c in staged) else "")
+            " ({} deleted)".format(n_deleted) if n_deleted else "")
         app._record_op("import", desc, changes)
         app.dirty = True
         app._mark_audit_dirty()

@@ -884,6 +884,15 @@ def apply_styles(root):
               background=[("active", BG_CARD)],
               indicatorcolor=[("selected", ACCENT_BLUE), ("!selected", BG_INPUT)],
               foreground=[("disabled", TEXT_DIM)])
+    # dimmed variant: tags that would create a forbidden conflict are
+    # rendered muted (tag picker inline hints) -- same geometry, muted text
+    style.configure("Card.Dim.TCheckbutton", background=BG_CARD,
+                    foreground=TEXT_DIM, focuscolor=BG_CARD, font=base,
+                    indicatorcolor=BG_INPUT, indicatormargin=0, padding=2)
+    style.map("Card.Dim.TCheckbutton",
+              background=[("active", BG_CARD)],
+              indicatorcolor=[("selected", ACCENT_BLUE), ("!selected", BG_INPUT)],
+              foreground=[("active", TEXT_MAIN), ("disabled", TEXT_DIM)])
     style.configure("Panel.TCheckbutton", background=BG_PANEL,
                     foreground=TEXT_MAIN, focuscolor=BG_PANEL, font=base,
                     indicatorcolor=BG_INPUT, indicatormargin=0, padding=2)
@@ -891,6 +900,35 @@ def apply_styles(root):
               background=[("active", BG_PANEL)],
               indicatorcolor=[("selected", ACCENT_BLUE), ("!selected", BG_INPUT)],
               foreground=[("disabled", TEXT_DIM)])
+
+    # -- toggle buttons (checkbutton drawn as a flat button block) ---------
+    # No indicator: the layout drops the check mark so the widget reads as
+    # a button that stays accent-filled while active. Used by the FR
+    # preview header (Show All / Average All).
+    try:
+        style.layout("Toggle.TCheckbutton", [
+            ("Checkbutton.padding", {"children":
+                [("Checkbutton.label", {"sticky": "ns"})], "sticky": "ns"})])
+    except Exception:
+        pass    # layout already replaced (re-theme call)
+    style.configure("Toggle.TCheckbutton", background=BG_CARD,
+                    foreground=TEXT_MAIN, focuscolor=BG_CARD, font=base_bold,
+                    bordercolor=btn_edge, lightcolor=btn_edge,
+                    darkcolor=btn_edge, relief="flat", padding=(10, 6))
+    style.map("Toggle.TCheckbutton",
+              background=[("disabled", BG_CARD),
+                          ("selected", ACCENT_BLUE),
+                          ("pressed", ACCENT_BLUE),
+                          ("active", BG_INPUT)],
+              foreground=[("disabled", TEXT_DIM),
+                          ("selected", sel_fg),
+                          ("pressed", sel_fg),
+                          ("active", TEXT_MAIN)],
+              focuscolor=[("selected", ACCENT_BLUE),
+                          ("active", BG_INPUT)],
+              bordercolor=[("disabled", BORDER)],
+              lightcolor=[("disabled", BORDER)],
+              darkcolor=[("disabled", BORDER)])
 
     # -- radiobuttons (same treatment; used by the merge dialog) -----------
     style.configure("TRadiobutton", background=BG_MAIN, foreground=TEXT_MAIN,
