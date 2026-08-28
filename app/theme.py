@@ -26,7 +26,6 @@ would freeze the value at import time.
 
 import json
 import os
-import sys
 
 import tkinter as tk
 import tkinter.font as tkfont

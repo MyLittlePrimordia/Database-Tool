@@ -384,7 +384,7 @@ class ToolsPanel(ttk.Frame):
         def _compute():
             try:
                 result["value"] = work()
-            except Exception as e:  # noqa: BLE001
+            except Exception:  # noqa: BLE001
                 import traceback
                 result["error"] = "".join(traceback.format_exc(limit=3)).strip()
 

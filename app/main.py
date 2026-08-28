@@ -21,8 +21,6 @@ Package as exe with PyInstaller (see README.md).
 import os
 import re
 import sys
-import json
-import math
 import time
 import datetime
 import threading
@@ -37,6 +35,8 @@ import tools_panel
 import curve_import
 import ai_import
 import win_drop
+import find_replace
+import curve_compare
 
 APP_TITLE = "Database Tool"
 
@@ -261,11 +261,15 @@ class IconManager:
             return None
         try:
             img = tk.PhotoImage(file=path)
-            # keep icons reasonably small in the UI
+            # keep icons reasonably small in the UI -- based on whichever
+            # dimension is larger, so a non-square icon can't slip through
+            # undersized on one axis (subsample() scales both axes by the
+            # same factor, so only the decision needs both dimensions)
             w, h = img.width(), img.height()
             target = 20
-            if w > target * 2:
-                factor = max(1, w // target)
+            largest = max(w, h)
+            if largest > target * 2:
+                factor = max(1, largest // target)
                 img = img.subsample(factor, factor)
             self.cache[name] = img
             return img
@@ -1984,8 +1988,6 @@ class EntryEditor(ttk.Frame):
         canvas.bind("<Button-4>", lambda e: canvas.yview_scroll(-1, "units"))
         canvas.bind("<Button-5>", lambda e: canvas.yview_scroll(1, "units"))
 
-        pad = dict(padx=10, pady=4)
-
         # ---- identity row ----
         card_outer, card = make_card(inner)
         card_outer.pack(fill="x", padx=10, pady=8)
@@ -3050,6 +3052,15 @@ class AuditPanel(ttk.Frame):
         # exclusive filter: unticked = ignored issues hidden; ticked = ONLY
         # ignored issues shown (ready to review / un-ignore)
         self.show_ignored_only = tk.BooleanVar(value=False)
+        # category filter: lets you isolate one issue category (e.g.
+        # "Possible Duplicate") for systematic triage instead of scrolling
+        # a mixed list. The confidence sub-filter only applies while
+        # "Possible Duplicate" is selected (every other category leaves it
+        # blank -- see find_duplicate_pairs' .confidence attribute).
+        self.ALL_CATEGORIES = "All Categories"
+        self.category_filter = tk.StringVar(value=self.ALL_CATEGORIES)
+        self.ANY_CONFIDENCE = "Any confidence"
+        self.confidence_filter = tk.StringVar(value=self.ANY_CONFIDENCE)
         self._row_issues = {}      # leaf iid  -> AuditIssue
         self._group_items = {}     # group iid -> [AuditIssue, ...]
 
@@ -3074,6 +3085,26 @@ class AuditPanel(ttk.Frame):
         ttk.Checkbutton(opt_row, text="Ignored only",
                         variable=self.show_ignored_only,
                         command=self.rerender).pack(side="left", padx=(4, 4))
+        ttk.Label(opt_row, text="Category:", style="TLabel").pack(
+            side="left", padx=(10, 4))
+        self.category_combo = ttk.Combobox(
+            opt_row, state="readonly", width=22,
+            textvariable=self.category_filter, values=[self.ALL_CATEGORIES])
+        self.category_combo.pack(side="left")
+        self.category_combo.bind("<<ComboboxSelected>>",
+                                 self._on_category_changed)
+        # only meaningful (and only shown enabled) for "Possible Duplicate":
+        # a dedicated triage aid so the ~1000 fuzzy-match findings a large
+        # database can produce are workable in confidence-ranked batches
+        # instead of one long undifferentiated list.
+        self.confidence_combo = ttk.Combobox(
+            opt_row, state="disabled", width=16,
+            textvariable=self.confidence_filter,
+            values=[self.ANY_CONFIDENCE, "High only", "Medium only",
+                    "Low only"])
+        self.confidence_combo.pack(side="left", padx=(6, 0))
+        self.confidence_combo.bind("<<ComboboxSelected>>",
+                                   lambda e: self.rerender())
 
         # summary lives on its own row: packed alongside the checkbox it
         # used to get squeezed out of view (or overlap it) on a narrow
@@ -3214,15 +3245,52 @@ class AuditPanel(ttk.Frame):
         return iss.waiver_key() in getattr(self.app, "waivers", set())
 
     def _display_issues(self):
-        """Exclusive filter: normal mode shows active issues only;
-        'Ignored only' shows ONLY the waived ones (review / un-ignore)."""
+        """Exclusive ignored/active filter, plus the optional category and
+        (for Possible Duplicate only) confidence filters, all applied
+        together on top of the current sort order."""
         iss = self._sorted_issues()
         if self.show_ignored_only.get():
-            return [i for i in iss if self._waived(i)]
-        return [i for i in iss if not self._waived(i)]
+            iss = [i for i in iss if self._waived(i)]
+        else:
+            iss = [i for i in iss if not self._waived(i)]
+        cat = self.category_filter.get()
+        if cat and cat != self.ALL_CATEGORIES:
+            iss = [i for i in iss if i.category == cat]
+        if cat == "Possible Duplicate":
+            conf = self.confidence_filter.get()
+            want = {"High only": "high", "Medium only": "medium",
+                    "Low only": "low"}.get(conf)
+            if want:
+                iss = [i for i in iss
+                       if getattr(i, "confidence", None) == want]
+        return iss
+
+    def _on_category_changed(self, _event=None):
+        self._sync_confidence_enabled()
+        self.rerender()
+
+    def _sync_confidence_enabled(self):
+        is_dup = self.category_filter.get() == "Possible Duplicate"
+        self.confidence_combo.configure(
+            state="readonly" if is_dup else "disabled")
+        if not is_dup:
+            self.confidence_filter.set(self.ANY_CONFIDENCE)
+
+    def _refresh_category_choices(self):
+        """Repopulate the category dropdown from the current issue list,
+        keeping the active selection if it's still valid (falls back to
+        'All Categories' otherwise -- e.g. after a category is fully
+        resolved and no longer appears)."""
+        cats = sorted({i.category for i in self.issues})
+        values = [self.ALL_CATEGORIES] + cats
+        self.category_combo.configure(values=values)
+        if self.category_filter.get() not in values:
+            self.category_filter.set(self.ALL_CATEGORIES)
+        self._sync_confidence_enabled()
 
     def show_issues(self, issues):
         self.issues = list(issues)
+        self._refresh_category_choices()
         self.rerender()
         live = [i for i in issues if not self._waived(i)]
         hidden = len(issues) - len(live)
@@ -3409,6 +3477,9 @@ class AuditPanel(ttk.Frame):
         menu.add_command(label="Merge Duplicate...",
                          state="normal" if has_pair else "disabled",
                          command=self._merge_selected)
+        menu.add_command(label="Compare Curves...",
+                         state="normal" if has_pair else "disabled",
+                         command=self._compare_selected)
         menu.add_separator()
         menu.add_command(label="Ignore Selected",
                          state="normal" if has_ignorable else "disabled",
@@ -3496,6 +3567,17 @@ class AuditPanel(ttk.Frame):
                 "refresh duplicate findings.".format(", ".join(missing)))
             return
         MergeDialog(self.winfo_toplevel(), self.app, pos_a, pos_b)
+
+    def _compare_selected(self):
+        pair = None
+        for iss in self._issues_for_selection():
+            if getattr(iss, "pair_ids", None):
+                pair = iss.pair_ids
+                break
+        if not pair:
+            return
+        curve_compare.CurveCompareDialog(self.winfo_toplevel(), self.app,
+                                         id_a=pair[0], id_b=pair[1])
 
     def _on_issue_activate(self, _event=None):
         """Double-click / Enter on an issue leaf jumps to that entry in the
@@ -4162,6 +4244,13 @@ class MainApp(tk.Tk):
             label="Convert Measurement Curves...",
             command=lambda: self.notebook.select(self.curve_panel))
         toolmenu.add_command(
+            label="Find & Replace...",
+            command=self.open_find_replace)
+        toolmenu.add_command(
+            label="Compare Curves...",
+            command=self.open_curve_compare)
+        toolmenu.add_separator()
+        toolmenu.add_command(
             label="Compress to database.json.gz",
             command=self._open_export_tab)
         toolmenu.add_command(
@@ -4206,6 +4295,18 @@ class MainApp(tk.Tk):
 
     def _open_export_tab(self):
         self.notebook.select(self.tools_panel)
+
+    def open_find_replace(self):
+        if not self.entries:
+            messagebox.showinfo(APP_TITLE, "Open a database first.")
+            return
+        find_replace.FindReplaceDialog(self, self)
+
+    def open_curve_compare(self, id_a=None, id_b=None):
+        if not self.entries:
+            messagebox.showinfo(APP_TITLE, "Open a database first.")
+            return
+        curve_compare.CurveCompareDialog(self, self, id_a=id_a, id_b=id_b)
 
     def _build_layout(self):
         self._build_header()

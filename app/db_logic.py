@@ -236,6 +236,52 @@ def build_id(brand, model, variant):
     return idstr
 
 
+def _brand_fold(brand):
+    """Aggressive fold used ONLY to group brand spellings that are the same
+    name with different casing/spacing/punctuation ('Moondrop' / 'MoonDrop'
+    / 'Moon Drop' / 'Moon-Drop' all fold to 'moondrop'). Deliberately
+    stricter than normalize_component (which keeps underscores as word
+    separators): a brand-name typo check wants those treated as the same
+    brand, not as siblings."""
+    if not brand:
+        return ""
+    text = unicodedata.normalize("NFKD", str(brand))
+    text = text.encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"[^a-z0-9]", "", text.lower())
+
+
+def brand_spelling_fixes(entries):
+    """Find brands whose spelling is inconsistent across the database
+    (case, spacing, or punctuation variants of the same fold) and return
+    {entry_index: (current_spelling, canonical_spelling, variant_summary)}
+    for every entry NOT already using the majority spelling. The majority
+    spelling (most entries; ties broken alphabetically for determinism)
+    is treated as canonical. Buckets of size 1 (no inconsistency) are
+    skipped entirely."""
+    buckets = {}   # fold -> {exact_spelling: [idx, ...]}
+    for idx, e in enumerate(entries):
+        brand = (e.get("brand") or "").strip()
+        if not brand:
+            continue
+        fold = _brand_fold(brand)
+        if not fold:
+            continue
+        buckets.setdefault(fold, {}).setdefault(brand, []).append(idx)
+
+    fixes = {}
+    for fold, spellings in buckets.items():
+        if len(spellings) < 2:
+            continue
+        ranked = sorted(spellings.items(), key=lambda kv: (-len(kv[1]), kv[0]))
+        canonical = ranked[0][0]
+        summary = ", ".join("'{}' ({})".format(sp, len(idxs))
+                             for sp, idxs in ranked)
+        for spelling, idxs in ranked[1:]:
+            for idx in idxs:
+                fixes[idx] = (spelling, canonical, summary)
+    return fixes
+
+
 def price_tier_for(price_usd):
     try:
         p = float(price_usd)
@@ -1250,6 +1296,9 @@ def find_duplicate_pairs(entries, referenced_map=None):
             severity="warning", code="dup-pair",
             subject="dup|{}|{}".format(*sorted([id_a, id_b])))
         iss.pair_ids = (id_a, id_b)
+        iss.confidence = confidence   # "high" / "medium" / "low" -- read by
+                                       # the Audit tab's confidence filter
+                                       # instead of re-parsing the message
         issues.append(iss)
     return issues
 
@@ -1325,6 +1374,11 @@ def run_full_audit(entries, data_root=None):
             on_disk_set = set(on_disk)
             disk_index = {p.lower(): p for p in on_disk}
 
+    # brand-spelling prepass: needs to see every entry's brand before it can
+    # tell majority from minority spelling, so it runs once here rather than
+    # inline in the per-entry loop below (see brand_spelling_fixes).
+    _brand_fixes = brand_spelling_fixes(entries)
+
     for idx, entry in enumerate(entries):
         eid = entry.get("id", "") or "(no id) #{}".format(idx)
 
@@ -1358,6 +1412,25 @@ def run_full_audit(entries, data_root=None):
                 "ID Format", idx, eid, msg,
                 fix=make_fix(entry, real_id or eid, idx,
                              lambda en, exp=expected_id: en.__setitem__("id", exp)),
+            ))
+
+        if idx in _brand_fixes:
+            current, canonical, summary = _brand_fixes[idx]
+
+            def _brand_mut(en, val=canonical):
+                en["brand"] = val
+                new_id = build_id(val, en.get("model", ""), en.get("variant", ""))
+                if new_id:
+                    en["id"] = new_id
+
+            issues.append(AuditIssue(
+                "Brand Spelling", idx, eid,
+                "Brand '{}' is spelled inconsistently with other entries "
+                "for the same brand ({}). Auto-fix renames it to the "
+                "majority spelling '{}' and rebuilds the id.".format(
+                    current, summary, canonical),
+                fix=make_fix(entry, real_id or eid, idx, _brand_mut),
+                severity="warning", code="brand-spelling",
             ))
 
         dc = entry.get("driver_config", "")

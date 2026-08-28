@@ -204,6 +204,11 @@ form_factor ({n_ff} values ONLY):
 connector ({n_conn} values ONLY):
 {connectors}
 
+Allowed connectors per form factor (authoritative -- generated from the
+app's own validator, so this list can never drift out of sync with what
+is actually enforced):
+{connector_matrix}
+
 MANDATORY HARD PAIRING RULES:
 1. Wireless Devices:
    - "{tws}" and "Wireless Over-Ear Headphones" MUST use connector "Bluetooth" (even if a backup analog cable is included in the box).
