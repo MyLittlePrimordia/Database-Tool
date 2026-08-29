@@ -664,6 +664,18 @@ def sort_key(entry):
     )
 
 
+def format_entry_label(entry):
+    """Human-readable 'Brand Model [Variant]' display string (as opposed to
+    the underscored id), used anywhere entries are listed for the user to
+    pick from (e.g. the Import tab's link-to-entry dropdown)."""
+    parts = [entry.get("brand") or "", entry.get("model") or ""]
+    label = " ".join(p for p in parts if p).strip()
+    variant = (entry.get("variant") or "").strip()
+    if variant:
+        label = "{}  [{}]".format(label, variant) if label else variant
+    return label or (entry.get("id") or "(unnamed entry)")
+
+
 def describe_entry_change(before, after, max_fields=3):
     if before is None and after is None:
         return ""
@@ -806,51 +818,41 @@ def save_database(path, entries):
 
 
 # --------------------------------------------------------------------------
-# AUTOSAVE BACKUPS
+# BACKUP FOLDER
 # --------------------------------------------------------------------------
-AUTOSAVE_DIR_NAME = ".db_editor_backups"
+# Everything backup/undo/ignore-related lives in one plain, visible folder
+# next to the database, instead of scattered across a hidden autosave
+# folder + loose files beside database.json.
+BACKUP_DIR_NAME = "backup"
+BACKUP_FILE_NAME = "database.json.bak"
 AUTOSAVE_PREFIX = "autosave_"
 AUTOSAVE_KEEP = 15
 AUTOSAVE_SEEN_MARKER = ".autosave_seen"
 
 
 def backup_dir_for(db_path):
-    return os.path.join(os.path.dirname(os.path.abspath(db_path)), AUTOSAVE_DIR_NAME)
+    return os.path.join(os.path.dirname(os.path.abspath(db_path)), BACKUP_DIR_NAME)
 
 
-OVERWRITE_SNAPSHOT_PREFIX = "pre_overwrite_"
-OVERWRITE_SNAPSHOT_KEEP = 10
-
-
-def write_pre_overwrite_snapshot(db_path, keep=OVERWRITE_SNAPSHOT_KEEP):
-    """Copy the original database into the backup folder BEFORE the user
-    deliberately overwrites it via Save As. Returns the snapshot path, or
-    None when the copy fails (overwriting is then still allowed -- autosave
-    history already provides a second net). Keeps the newest `keep`
-    snapshots so the folder cannot grow without bound."""
+def write_database_backup(db_path):
+    """Copy the CURRENT on-disk database.json into backup/database.json.bak
+    BEFORE it gets overwritten by a save. A single rolling file (not a
+    timestamped history) -- one clear safety copy of "the database as it
+    was right before your last save", not a folder of ambiguous snapshots.
+    Returns the backup path, or None when there was nothing to back up yet
+    (first-ever save) or the copy failed (the save itself still proceeds --
+    the periodic autosave snapshots are a second net)."""
+    if not db_path or not os.path.isfile(db_path):
+        return None
     bdir = backup_dir_for(db_path)
     try:
         os.makedirs(bdir, exist_ok=True)
-        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        dest = os.path.join(bdir, "{}{}_{}".format(
-            OVERWRITE_SNAPSHOT_PREFIX, stamp, os.path.basename(db_path)))
+        dest = os.path.join(bdir, BACKUP_FILE_NAME)
         shutil.copy2(db_path, dest)
+        return dest
     except OSError as e:
-        log("Pre-overwrite snapshot failed: {}".format(e))
+        log("Database backup failed: {}".format(e))
         return None
-    snaps = []
-    try:
-        snaps = [os.path.join(bdir, fn) for fn in os.listdir(bdir)
-                 if fn.startswith(OVERWRITE_SNAPSHOT_PREFIX)]
-    except OSError:
-        pass
-    snaps.sort(key=lambda p: (os.path.getmtime(p) if os.path.exists(p) else 0,
-                              p), reverse=True)
-    for stale in snaps[keep:]:
-        try:
-            os.remove(stale)
-        except OSError:
-            pass
     return dest
 
 
@@ -953,6 +955,121 @@ def unseen_autosave(db_path):
 
 
 # --------------------------------------------------------------------------
+# PERSISTENT UNDO/REDO HISTORY  (backup/history.json)
+# --------------------------------------------------------------------------
+# Mirrors the in-memory op format the app already records (kind/desc/when/
+# changes), minus the two keys that are only meaningful as LIVE Python
+# object references within one running session (ref_before/ref_after).
+# Those two keys exist purely as a same-session fast-path identity lookup
+# in _find_slot(); the id-based fallback _find_slot already has is exactly
+# what cross-session (file-based) replay uses, so persisting just the
+# deep-copied snapshots (copy_before/copy_after) plus pos_hint is enough to
+# faithfully replay history after a restart. An op whose target entry can
+# no longer be located (e.g. the id was removed by something other than
+# undo/redo) is simply skipped when applied -- same as the existing
+# same-session behavior; history is a convenience, not a ledger.
+HISTORY_FILENAME = "history.json"
+HISTORY_VERSION = 1
+
+
+def history_path_for(db_path):
+    return os.path.join(backup_dir_for(db_path), HISTORY_FILENAME)
+
+
+def _op_to_json(op):
+    return {
+        "kind": op.get("kind", ""),
+        "desc": op.get("desc", ""),
+        "when": op.get("when", ""),
+        "changes": [
+            {
+                "pos_hint": ch.get("pos_hint"),
+                "copy_before": ch.get("copy_before"),
+                "copy_after": ch.get("copy_after"),
+            }
+            for ch in op.get("changes", [])
+        ],
+    }
+
+
+def _op_from_json(raw):
+    if not isinstance(raw, dict):
+        return None
+    changes = raw.get("changes")
+    if not isinstance(changes, list):
+        return None
+    out_changes = []
+    for ch in changes:
+        if not isinstance(ch, dict):
+            return None
+        cb, ca = ch.get("copy_before"), ch.get("copy_after")
+        out_changes.append({
+            "pos_hint": ch.get("pos_hint") if isinstance(ch.get("pos_hint"), int) else 0,
+            # _apply_history_changes() distinguishes add/delete/edit by
+            # None-ness of ref_before/ref_after, not just as an identity
+            # fast-path -- so this must preserve that None <-> "no entry
+            # existed there" invariant, not just blank both out. Reusing
+            # the deserialized copy itself as the "ref" is safe: it can
+            # never identity-match a live entry (harmless no-op check),
+            # so _find_slot() correctly falls through to its id-based
+            # lookup every time, which is exactly the intended
+            # cross-session behavior.
+            "ref_before": cb, "ref_after": ca,
+            "copy_before": cb, "copy_after": ca,
+        })
+    return {
+        "kind": str(raw.get("kind", "")),
+        "desc": str(raw.get("desc", "")),
+        "when": str(raw.get("when", "")),
+        "changes": out_changes,
+    }
+
+
+def write_history(db_path, history, redo_stack):
+    """Persist the undo/redo stacks atomically to backup/history.json.
+    Best-effort: a failure here never blocks the edit that triggered it."""
+    if not db_path:
+        return
+    path = history_path_for(db_path)
+    parent = os.path.dirname(path)
+    try:
+        if parent and not os.path.isdir(parent):
+            os.makedirs(parent, exist_ok=True)
+        payload = {
+            "version": HISTORY_VERSION,
+            "history": [_op_to_json(op) for op in history],
+            "redo_stack": [_op_to_json(op) for op in redo_stack],
+        }
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+        os.replace(tmp, path)
+    except OSError as e:
+        log("History save failed: {}".format(e))
+
+
+def load_history(db_path):
+    """Returns (history, redo_stack) reconstructed from backup/history.json,
+    or ([], []) when missing/corrupt (a clean start, never a hard error)."""
+    if not db_path:
+        return [], []
+    path = history_path_for(db_path)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return [], []
+    if not isinstance(data, dict):
+        return [], []
+    history = [op for op in (_op_from_json(o) for o in data.get("history", []) or [])
+               if op is not None]
+    redo_stack = [op for op in (_op_from_json(o) for o in data.get("redo_stack", []) or [])
+                  if op is not None]
+    return history, redo_stack
+
+
+# --------------------------------------------------------------------------
 # AUDIT ENGINE
 # --------------------------------------------------------------------------
 
@@ -980,20 +1097,44 @@ class AuditIssue:
 
 
 # --------------------------------------------------------------------------
-# AUDIT WAIVERS (user-ignored findings, persisted beside the database)
+# IGNORED AUDIT FINDINGS (user-waived issues, persisted in backup/ignored.json)
 # --------------------------------------------------------------------------
-WAIVER_FILENAME = "audit_waivers.json"
+WAIVER_FILENAME = "ignored.json"
+# Pre-reorg location, kept only so existing installs migrate cleanly instead
+# of silently losing their waivers the first time this version runs.
+_LEGACY_WAIVER_FILENAME = "audit_waivers.json"
 
 
 def waivers_path_for(db_path):
+    return os.path.join(backup_dir_for(db_path), WAIVER_FILENAME)
+
+
+def _legacy_waivers_path_for(db_path):
     return os.path.join(os.path.dirname(os.path.abspath(db_path or "")),
-                        WAIVER_FILENAME)
+                        _LEGACY_WAIVER_FILENAME)
 
 
 def load_waivers(db_path):
-    """Set of waiver keys persisted next to the database. Corrupt or
-    missing files simply mean 'no waivers'."""
+    """Set of waiver keys persisted in the backup folder. Corrupt or
+    missing files simply mean 'no waivers'. One-time migration: if the old
+    beside-the-database file exists but the new one doesn't yet, read the
+    old file and adopt it (the old file is left in place untouched -- only
+    copied forward -- so nothing is destroyed if something goes wrong)."""
     path = waivers_path_for(db_path)
+    if not os.path.isfile(path):
+        legacy = _legacy_waivers_path_for(db_path)
+        if os.path.isfile(legacy):
+            try:
+                with open(legacy, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                waived = data.get("waived", []) if isinstance(data, dict) else data
+                if isinstance(waived, list):
+                    migrated = {str(k) for k in waived if isinstance(k, str) and k}
+                    save_waivers(db_path, migrated)
+                    return migrated
+            except (OSError, ValueError):
+                pass
+        return set()
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -1007,7 +1148,7 @@ def load_waivers(db_path):
 
 
 def save_waivers(db_path, waivers):
-    """Persist waiver keys atomically beside the database."""
+    """Persist waiver keys atomically into the backup folder."""
     path = waivers_path_for(db_path)
     parent = os.path.dirname(path)
     if parent and not os.path.isdir(parent):

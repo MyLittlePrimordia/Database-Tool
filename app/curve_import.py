@@ -23,6 +23,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
 
 import curve_logic as CL
+import db_logic as L
 import fr_plot
 import theme
 
@@ -81,10 +82,9 @@ class CurveImportPanel(ttk.Frame):
             "<Button-5>", lambda e: self.scroll_canvas.yview_scroll(1, "units"))
 
         body = self.scroll_inner
-        self._build_queue_section(body)
-        self._build_curve_preview_card(body)
-        self._build_destination_card(body)
-        self._build_preview_card(body)
+        queue_wrap = self._build_queue_section(body)
+        self._build_curve_preview_card(queue_wrap)
+        self._build_options_and_outputs_card(body)
         self._build_log(body)
 
         self.refresh_data_root()
@@ -102,9 +102,10 @@ class CurveImportPanel(ttk.Frame):
                   style="CardHeader.TLabel").pack(side="left")
         ttk.Button(header, text="Select files...", command=self._pick_files).pack(
             side="right", padx=2)
-        ttk.Button(header, text="Clear all", command=self._clear_files).pack(
-            side="right", padx=2)
+        ttk.Button(header, text="Clear all", style="Danger.TButton",
+                   command=self._clear_files).pack(side="right", padx=2)
         self.remove_sel_btn = ttk.Button(header, text="Remove selected",
+                                         style="Danger.TButton",
                                          command=self._remove_queued_selected,
                                          state="disabled")
         self.remove_sel_btn.pack(side="right", padx=2)
@@ -145,6 +146,7 @@ class CurveImportPanel(ttk.Frame):
         self.count_var = tk.StringVar(value="0 file(s) queued")
         ttk.Label(wrap, textvariable=self.count_var, style="Card.TLabel",
                   foreground=theme.TEXT_DIM).pack(anchor="e", padx=8, pady=(0, 6))
+        return wrap
 
     def add_paths(self, paths, quiet=False):
         """Add paths to the queue (deduped). Called by drag & drop and by
@@ -258,18 +260,19 @@ class CurveImportPanel(ttk.Frame):
     # Curve preview (live plot of the selected queued file / plan)
     # ------------------------------------------------------------------
     def _build_curve_preview_card(self, host):
-        card_outer, card = theme.make_card(host)
-        card_outer.pack(fill="x", padx=10, pady=6)
-        head = ttk.Frame(card, style="CardFlat.TFrame")
-        head.pack(fill="x", padx=8, pady=(8, 2))
-        ttk.Label(head, text="\U0001F4C9  CURVE PREVIEW",
-                  style="CardHeader.TLabel").pack(side="left")
+        # Folded into the RAW CURVE FILES card (no separate card of its own)
+        # -- one fewer top-level section for a new user to parse. `host` is
+        # that card's own inner frame.
+        ttk.Separator(host, orient="horizontal").pack(fill="x", padx=8, pady=(2, 4))
+        head = ttk.Frame(host, style="CardFlat.TFrame")
+        head.pack(fill="x", padx=8, pady=(0, 2))
+        ttk.Label(head, text="Preview", style="CardHeader.TLabel").pack(side="left")
         self.preview_info = tk.Label(head, text="", bg=theme.BG_CARD, fg=theme.TEXT_DIM,
                                      font=theme.font(12), anchor="w")
         self.preview_info.pack(side="left", padx=(12, 0))
         ttk.Label(head, text="click a queued file or a planned-output row",
                   style="Card.TLabel", foreground=theme.TEXT_DIM).pack(side="right")
-        self.preview_plot = fr_plot.CurvePlot(card, height=190)
+        self.preview_plot = fr_plot.CurvePlot(host, height=130)
         self.preview_plot.pack(fill="both", expand=True, padx=8, pady=(2, 8))
         self._show_preview_empty()
 
@@ -391,68 +394,71 @@ class CurveImportPanel(ttk.Frame):
                     pass
 
     # ------------------------------------------------------------------
-    # Destination
+    # Destination + Planned Outputs -- one shared card (used to be two),
+    # since Destination is really just a few settings, not its own
+    # first-class step in the workflow.
     # ------------------------------------------------------------------
-    def _build_destination_card(self, host):
+    def _build_options_and_outputs_card(self, host):
         card_outer, card = theme.make_card(host)
         card_outer.pack(fill="x", padx=10, pady=6)
+        self._build_destination_section(card)
+        ttk.Separator(card, orient="horizontal").pack(fill="x", padx=8, pady=(2, 4))
+        self._build_output_section(card)
 
-        ttk.Label(card, text="\U0001F4C2  DESTINATION", style="CardHeader.TLabel").grid(
-            row=0, column=0, columnspan=4, sticky="w", padx=8, pady=(8, 0))
+    def _build_destination_section(self, host):
+        sub = ttk.Frame(host, style="CardFlat.TFrame")
+        sub.pack(fill="x", padx=8, pady=(8, 2))
 
-        ttk.Label(card, text="Data folder:", style="Card.TLabel").grid(
-            row=1, column=0, sticky="w", padx=8, pady=(6, 2))
+        ttk.Label(sub, text="Data folder:", style="Card.TLabel").grid(
+            row=0, column=0, sticky="w", pady=(0, 2))
         self.root_var = tk.StringVar(value="(not set)")
-        root_lbl = ttk.Label(card, textvariable=self.root_var, style="Card.TLabel",
+        root_lbl = ttk.Label(sub, textvariable=self.root_var, style="Card.TLabel",
                   foreground=theme.ACCENT_BLUE, justify="left")
-        root_lbl.grid(row=1, column=1, columnspan=2,
-                      sticky="w", padx=4, pady=(6, 2))
+        root_lbl.grid(row=0, column=1, columnspan=2,
+                      sticky="w", padx=4, pady=(0, 2))
         # long absolute paths used to force this column wide enough to show
         # the whole string on one line, which pushed "Change..." (and the
-        # rest of the card) past the tab's right edge -- wrap instead.
-        theme.bind_dynamic_wrap(root_lbl, source=card, min_wrap=160)
-        ttk.Button(card, text="Change...", command=self._change_root,
-                   width=10).grid(row=1, column=3, sticky="e", padx=8, pady=(6, 2))
+        # rest of the row) past the tab's right edge -- wrap instead.
+        theme.bind_dynamic_wrap(root_lbl, source=sub, min_wrap=160)
+        ttk.Button(sub, text="Change...", command=self._change_root,
+                   width=10).grid(row=0, column=3, sticky="e", pady=(0, 2))
 
-        ttk.Label(card, text="Sub-folder:", style="Card.TLabel").grid(
-            row=2, column=0, sticky="w", padx=8, pady=(4, 2))
+        ttk.Label(sub, text="Sub-folder:", style="Card.TLabel").grid(
+            row=1, column=0, sticky="w", pady=2)
         self.subfolder_var = tk.StringVar(value="")
-        self.subfolder_combo = ttk.Combobox(card, textvariable=self.subfolder_var)
-        self.subfolder_combo.grid(row=2, column=1, columnspan=2, sticky="ew",
-                                  padx=4, pady=(4, 2))
+        self.subfolder_combo = ttk.Combobox(sub, textvariable=self.subfolder_var)
+        self.subfolder_combo.grid(row=1, column=1, columnspan=2, sticky="ew",
+                                  padx=4, pady=2)
         self.subfolder_combo.bind("<<ComboboxSelected>>", lambda e: self._refresh_exists_markers())
-        ttk.Button(card, text="\u2795 New Folder...", command=self._new_subfolder,
-                   width=15).grid(row=2, column=3, sticky="ew", padx=8, pady=(4, 2))
+        ttk.Button(sub, text="\u2795 New Folder...", style="Blue.TButton",
+                   command=self._new_subfolder, width=15).grid(
+                       row=1, column=3, sticky="ew", pady=2)
         # column 1 absorbs the extra width instead of the folder-path label
-        # or the sub-folder combo forcing the card wider than the tab.
-        card.columnconfigure(1, weight=1)
+        # or the sub-folder combo forcing the row wider than the tab.
+        sub.columnconfigure(1, weight=1)
 
-        self.autolink_var = tk.BooleanVar(value=False)
-        self.autolink_check = ttk.Checkbutton(
-            card, text="Link converted files into the entry being edited",
-            variable=self.autolink_var, style="Card.TCheckbutton",
-            command=self._autolink_toggled)
-        self.autolink_check.grid(row=3, column=0, columnspan=2, sticky="w",
-                                 padx=8, pady=(6, 2))
-        # opt-in Explorer popup: auto-opening a window after EVERY convert
-        # annoyed more than it helped
+        # Which entry converted files link to is now chosen per planned
+        # output (see the "Link to" dropdown next to each row below,
+        # default "Current Entry") -- this used to be one global checkbox
+        # that could only ever target the entry open in the Editor.
         self.openfolder_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
-            card, text="Open output folder after converting",
+            sub, text="Open output folder after converting",
             variable=self.openfolder_var, style="Card.TCheckbutton"
-        ).grid(row=3, column=2, columnspan=2, sticky="e", padx=8,
-               pady=(6, 2))
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 2))
+        self.remove_source_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            sub, text="Remove source files after conversion",
+            variable=self.remove_source_var, style="Card.TCheckbutton"
+        ).grid(row=2, column=2, columnspan=2, sticky="e", pady=(6, 2))
 
         hint = ("\u26a0 Set the data folder first (File \u25b8 Set Data Folder...)"
                 if not self.app.get_data_root() else "")
-        self.dest_hint = ttk.Label(card, text=hint, style="Card.TLabel",
+        self.dest_hint = ttk.Label(sub, text=hint, style="Card.TLabel",
                                    foreground=theme.ACCENT_ORANGE,
                                    justify="left")
-        self.dest_hint.grid(row=4, column=0, columnspan=4, sticky="w",
-                            padx=8, pady=(2, 8))
-        theme.bind_dynamic_wrap(self.dest_hint, source=card)
-
-        card.columnconfigure(1, weight=1)
+        self.dest_hint.grid(row=3, column=0, columnspan=4, sticky="w", pady=(2, 0))
+        theme.bind_dynamic_wrap(self.dest_hint, source=sub)
 
     def _data_dir(self):
         root = self.app.get_data_root()
@@ -524,22 +530,17 @@ class CurveImportPanel(ttk.Frame):
         # make the new folder visible to the file linker immediately
         self._poke_file_linker()
 
-    def _autolink_toggled(self):
-        self._update_convert_state()
-
     # ------------------------------------------------------------------
-    # Output preview
+    # Planned outputs (folded into the same card as Destination above)
     # ------------------------------------------------------------------
-    def _build_preview_card(self, host):
-        card_outer, card = theme.make_card(host)
-        card_outer.pack(fill="x", padx=10, pady=6)
-
-        # The action button lives in the CARD HEADER (not below the output
-        # list) so it stays visible even before any scrolling -- it used to
-        # sit under the list at the bottom of the tab and was routinely
-        # clipped off-screen entirely.
+    def _build_output_section(self, host):
+        card = host
+        # The action button lives in the section HEADER (not below the
+        # output list) so it stays visible even before any scrolling -- it
+        # used to sit under the list at the bottom of the tab and was
+        # routinely clipped off-screen entirely.
         header = ttk.Frame(card, style="CardFlat.TFrame")
-        header.pack(fill="x", padx=8, pady=(8, 0))
+        header.pack(fill="x", padx=8, pady=(4, 0))
         ttk.Label(header, text="\U0001F4DD  PLANNED OUTPUTS",
                   style="CardHeader.TLabel").pack(side="left")
         self.convert_btn = ttk.Button(header, text="Convert & Save",
@@ -553,7 +554,8 @@ class CurveImportPanel(ttk.Frame):
         convert_status_lbl.pack(side="right", padx=12)
         theme.bind_dynamic_wrap(convert_status_lbl, source=header, min_wrap=100)
         rename_hint = ttk.Label(card,
-                  text="Rename the file \u26a0 marks files that already exist.",
+                  text="Rename the file, pick who it links to \u00b7 \u26a0 marks "
+                       "files that already exist.",
                   style="Card.TLabel", foreground=theme.TEXT_DIM, justify="left")
         rename_hint.pack(anchor="w", fill="x", padx=8)
         theme.bind_dynamic_wrap(rename_hint, source=card)
@@ -582,6 +584,7 @@ class CurveImportPanel(ttk.Frame):
         self._include_vars = []
         self._exists_labels = []
         self._plan_rows = []
+        self._link_vars = []
         self._sel_plan = -1
         for w in self.preview_inner.winfo_children():
             w.destroy()
@@ -594,6 +597,16 @@ class CurveImportPanel(ttk.Frame):
                      ).pack(fill="x", padx=10, pady=8)
             self._update_convert_state()
             return
+
+        # "Link to" dropdown choices: same list for every row, built once
+        # here rather than per-row. "Current Entry" first (the default --
+        # whatever's open in the Editor right now), then every database
+        # entry sorted alphabetically by its human-readable "Brand Model
+        # [Variant]" label (not the underscored id) so users can quickly
+        # find the entry they want to redirect a file to.
+        entries_sorted = sorted(self.app.entries, key=L.sort_key)
+        link_labels = ["Current Entry"] + [L.format_entry_label(e) for e in entries_sorted]
+        self._entry_link_map = {L.format_entry_label(e): e.get("id") for e in entries_sorted}
 
         taken = {}
         for i, plan in enumerate(plans):
@@ -628,7 +641,7 @@ class CurveImportPanel(ttk.Frame):
             name_var = tk.StringVar(value=display_name)
             entry = tk.Entry(row, textvariable=name_var, bg=theme.BG_INPUT, fg=theme.TEXT_MAIN,
                               insertbackground=theme.TEXT_MAIN, relief="flat",
-                              font=self._font, width=30)
+                              font=self._font, width=22)
             entry.pack(side="left", padx=(0, 2), pady=3, ipady=2)
             entry.bind("<FocusOut>", lambda e, v=name_var: self._on_name_edit(v))
             entry.bind("<Return>", lambda e, v=name_var: self._on_name_edit(v))
@@ -637,26 +650,32 @@ class CurveImportPanel(ttk.Frame):
                                  font=self._font, anchor="w")
             ext_lbl.pack(side="left", padx=(0, 6))
 
+            link_var = tk.StringVar(value=link_labels[0])
+            link_combo = ttk.Combobox(row, textvariable=link_var, values=link_labels,
+                                      state="readonly", width=20, font=self._font)
+            link_combo.pack(side="left", padx=(0, 6), pady=3)
+
             exists_lbl = tk.Label(row, text="", bg=row_bg, fg=theme.ACCENT_RED,
                                   font=theme.font(12, "bold"))
             exists_lbl.pack(side="left", padx=(0, 6))
 
             srcs = "  +  ".join(plan.source_names)
-            if len(srcs) > 58:
-                srcs = srcs[:57] + "\u2026"
+            if len(srcs) > 40:
+                srcs = srcs[:39] + "\u2026"
             src_lbl = tk.Label(row, text=srcs, bg=row_bg, fg=theme.TEXT_DIM,
                                font=theme.font(12), anchor="w",
                                cursor="hand2")
             src_lbl.pack(side="left", fill="x", expand=True, padx=(0, 8))
 
-            # clicking a planned-output row previews its curve(s); the Entry
-            # and Checkbutton keep their own click behavior
+            # clicking a planned-output row previews its curve(s); the Entry,
+            # Checkbutton and "Link to" combobox keep their own click behavior
             for w in (row, badge, ext_lbl, exists_lbl, src_lbl):
                 w.bind("<Button-1>", lambda e, i=i: self._select_plan_row(i))
 
             self._name_vars.append(name_var)
             self._include_vars.append((inc_var, plan))
             self._exists_labels.append(exists_lbl)
+            self._link_vars.append(link_var)
             self._plan_rows.append((row, cb, badge, ext_lbl, exists_lbl, src_lbl, row_bg))
 
         self._refresh_exists_markers()
@@ -740,17 +759,21 @@ class CurveImportPanel(ttk.Frame):
     def _run_convert(self):
         if self._busy:
             return
-        jobs = []       # [(plan, target_path)]
-        for (inc_var, plan), name_var in zip(self._include_vars, self._name_vars):
+        jobs = []       # [(plan, target_path, link_entry_id_or_None, source_paths)]
+        for (inc_var, plan), name_var, link_var in zip(
+                self._include_vars, self._name_vars, self._link_vars):
             if not inc_var.get():
                 continue
             target = self._planned_target(name_var.get())
             if target:
-                jobs.append((plan, target))
+                link_label = link_var.get()
+                link_id = self._entry_link_map.get(link_label)  # None == "Current Entry"
+                sources = [p for p, _role in plan.sources]
+                jobs.append((plan, target, link_id, sources))
         if not jobs:
             return
 
-        existing = [t for _p, t in jobs if os.path.exists(t)]
+        existing = [t for _p, t, _lid, _src in jobs if os.path.exists(t)]
         overwrite = True
         if existing:
             overwrite = messagebox.askyesno(
@@ -758,12 +781,12 @@ class CurveImportPanel(ttk.Frame):
                 "{} planned output file(s) already exist.\n\nOverwrite them?"
                 .format(len(existing)))
             if not overwrite:
-                jobs = [(p, t) for p, t in jobs if t not in existing]
+                jobs = [j for j in jobs if j[1] not in existing]
                 if not jobs:
                     self._log("[SKIPPED] Nothing converted - all targets existed.")
                     return
 
-        for _plan, target in jobs:
+        for _plan, target, _lid, _src in jobs:
             parent = os.path.dirname(target)
             try:
                 os.makedirs(parent, exist_ok=True)
@@ -776,19 +799,24 @@ class CurveImportPanel(ttk.Frame):
         self.convert_btn.state(["disabled"])
         self.convert_status.set("Converting...")
 
-        result = {"written": []}
+        result = {"written": [], "written_by_target": []}
         log_q = _q.Queue()
 
         def work_logged():
             def sink(msg):
                 log_q.put(msg)
             written = []
+            written_by_target = []   # [(link_id_or_None, [out_paths], [source_paths])]
             try:
-                for plan, target in jobs:
-                    written.extend(CL.convert_plan(plan, target, log=sink))
+                for plan, target, link_id, sources in jobs:
+                    out = CL.convert_plan(plan, target, log=sink)
+                    written.extend(out)
+                    if out:
+                        written_by_target.append((link_id, out, sources))
             except Exception as e:  # noqa: BLE001 - last-resort guard so the
                 log_q.put("[FAILED]  {}".format(e))  # UI can never stall
             result["written"] = written
+            result["written_by_target"] = written_by_target
             log_q.put(None)
 
         th = threading.Thread(target=work_logged, daemon=True)
@@ -800,7 +828,7 @@ class CurveImportPanel(ttk.Frame):
                 except _q.Empty:
                     break
                 if msg is None:
-                    self._finish_convert(result["written"])
+                    self._finish_convert(result["written"], result["written_by_target"])
                     return
                 self._log(msg)
             self.after(80, poll)
@@ -808,7 +836,7 @@ class CurveImportPanel(ttk.Frame):
         th.start()
         self.after(80, poll)
 
-    def _finish_convert(self, written):
+    def _finish_convert(self, written, written_by_target=()):
         self._busy = False
         ok_count = len(written)
         self._log("-" * 46)
@@ -824,18 +852,34 @@ class CurveImportPanel(ttk.Frame):
         # make the new files visible to the measurement-file linker
         self._poke_file_linker()
 
-        linked_note = ""
-        if self.autolink_var.get():
-            n_linked = self._link_written(written)
-            if n_linked:
-                # Say WHICH form received the links: a brand-new entry that
-                # has never been saved is a perfectly valid target (the
-                # links live in the form until Save Entry commits them).
-                target = self.app.editor.original_id or "(new unsaved entry)"
-                linked_note = ("  \u2022 {} linked to {} -- click Save Entry "
-                               "in the Editor to keep them".format(
-                                   n_linked, target))
+        current_written = []       # rows left on "Current Entry"
+        other_targets = {}         # entry_id -> [written paths]
+        converted_sources = []     # every source file whose job succeeded
+        for link_id, out_paths, source_paths in written_by_target:
+            converted_sources.extend(source_paths)
+            if link_id is None:
+                current_written.extend(out_paths)
+            else:
+                other_targets.setdefault(link_id, []).extend(out_paths)
 
+        notes = []
+        n_linked_current = self._link_written(current_written) if current_written else 0
+        if n_linked_current:
+            target = self.app.editor.original_id or "(new unsaved entry)"
+            notes.append("{} linked to {} (current entry) -- click Save Entry "
+                        "to keep them".format(n_linked_current, target))
+
+        n_linked_other, other_ids = self._link_to_other_entries(other_targets)
+        if n_linked_other:
+            notes.append("{} linked to {} other entr{}".format(
+                n_linked_other, len(other_ids), "y" if len(other_ids) == 1 else "ies"))
+
+        if self.remove_source_var.get() and converted_sources:
+            removed = self._remove_converted_sources(converted_sources)
+            if removed:
+                notes.append("{} source file(s) removed from the queue".format(removed))
+
+        linked_note = ("  \u2022 " + "; ".join(notes)) if notes else ""
         dest = os.path.dirname(written[0])
         self.convert_status.set("Wrote {} file(s) to {}{}".format(
             ok_count, dest, linked_note))
@@ -846,6 +890,19 @@ class CurveImportPanel(ttk.Frame):
                 os.startfile(dest)  # noqa: S606 - explorer shortcut
             except Exception:  # noqa: BLE001
                 pass
+
+    def _remove_converted_sources(self, source_paths):
+        """Drop the queued source files that fed a successful conversion
+        (opt-in via 'Remove source files after conversion'). Only removes
+        entries still present in the queue -- never touches files a plan
+        didn't actually convert."""
+        norm_sources = {os.path.normcase(os.path.abspath(p)) for p in source_paths}
+        before = len(self.files)
+        self.files = [p for p in self.files if p not in norm_sources]
+        removed = before - len(self.files)
+        if removed:
+            self._refresh_queue()
+        return removed
 
     def _poke_file_linker(self):
         # One forced background rescan is enough: _invalidate_cache now
@@ -882,24 +939,106 @@ class CurveImportPanel(ttk.Frame):
                   tag="ok")
         return len(fresh)
 
+    def _link_to_other_entries(self, other_targets):
+        """other_targets: {entry_id: [full_output_paths]}. Appends the new
+        relative paths to each target entry's saved 'files' list (deduped),
+        as ONE undoable history op even when several different entries are
+        touched in the same conversion batch -- this is what lets paired/
+        averaged measurement files be linked to DIFFERENT entries in a
+        single Convert & Save click, not just the entry open in the
+        Editor. Returns (n_files_linked, [entry_ids_touched])."""
+        if not other_targets:
+            return 0, []
+        app = self.app
+        changes = []
+        n_linked = 0
+        touched = []
+        for entry_id, paths in other_targets.items():
+            idx = next((i for i, e in enumerate(app.entries)
+                       if e.get("id") == entry_id), None)
+            if idx is None:
+                self._log("[SKIPPED] Target entry '{}' no longer exists.".format(entry_id))
+                continue
+            rels = [r for r in (self._relative_for_db(p) for p in paths) if r]
+            if not rels:
+                self._log("[SKIPPED] Could not link to '{}': no data folder set.".format(entry_id))
+                continue
+            old = app.entries[idx]
+            current_files = list(old.get("files") or [])
+            fresh = [r for r in rels if r not in current_files]
+            if not fresh:
+                self._log("[SKIPPED] Already linked to {}: {}".format(
+                    entry_id, ", ".join(rels)))
+                continue
+            new_entry = app._deepcopy(old)
+            new_entry["files"] = current_files + fresh
+            app.entries[idx] = new_entry
+            changes.append({
+                "pos_hint": idx,
+                "ref_before": old, "copy_before": app._deepcopy(old),
+                "ref_after": new_entry, "copy_after": app._deepcopy(new_entry),
+            })
+            n_linked += len(fresh)
+            touched.append(entry_id)
+            self._log("[OK] Linked to {}: {}".format(entry_id, ", ".join(fresh)), tag="ok")
+        if changes:
+            desc = "Linked {} file(s) to {} other entr{} via Import".format(
+                n_linked, len(touched), "y" if len(touched) == 1 else "ies")
+            app._record_op("link_files", desc, changes)
+            app.dirty = True
+            app._mark_audit_dirty()
+            app.populate_tree()
+            app._autosave()
+            app._notify_db_changed()
+        return n_linked, touched
+
     # ------------------------------------------------------------------
-    # Log console
+    # Log console -- collapsed to a one-line status strip by default; the
+    # common case is "did it work, yes/no", not staring at a scrolling
+    # console, so the full log is one click away instead of always-open.
     # ------------------------------------------------------------------
     def _build_log(self, host):
         wrap_outer, wrap = theme.make_card(host)
-        wrap_outer.pack(fill="both", expand=True, padx=10, pady=(0, 10))
-        ttk.Label(wrap, text="CONVERSION LOG", style="CardHeader.TLabel").pack(
-            anchor="w", padx=8, pady=(6, 2))
-        self.log = tk.Text(wrap, height=7, bg=theme.BG_INPUT, fg=theme.TEXT_MAIN,
+        wrap_outer.pack(fill="x", padx=10, pady=(0, 10))
+        header = ttk.Frame(wrap, style="CardFlat.TFrame")
+        header.pack(fill="x", padx=8, pady=(6, 2))
+        self.log_summary_var = tk.StringVar(value="No conversions yet.")
+        summary_lbl = ttk.Label(header, textvariable=self.log_summary_var,
+                                style="Card.TLabel", foreground=theme.TEXT_DIM,
+                                justify="left")
+        summary_lbl.pack(side="left", fill="x", expand=True)
+        theme.bind_dynamic_wrap(summary_lbl, source=header, min_wrap=140)
+        self.log_toggle_btn = ttk.Button(header, text="Show details \u25be",
+                                         width=16, command=self._toggle_log)
+        self.log_toggle_btn.pack(side="right")
+
+        self.log_body = ttk.Frame(wrap, style="CardFlat.TFrame")
+        # not packed yet -- starts collapsed
+        self.log = tk.Text(self.log_body, height=7, bg=theme.BG_INPUT, fg=theme.TEXT_MAIN,
                            insertbackground=theme.TEXT_MAIN, font=self._font,
                            relief="flat", wrap="word", padx=10, pady=8)
         self.log.pack(fill="both", expand=True, padx=8, pady=(0, 8))
         self.log.tag_configure("ok", foreground=theme.ACCENT_GREEN)
         self.log.tag_configure("fail", foreground=theme.ACCENT_RED)
         self.log.configure(state="disabled")
+        self._log_expanded = False
+
+    def _toggle_log(self):
+        self._log_expanded = not self._log_expanded
+        if self._log_expanded:
+            self.log_body.pack(fill="both", expand=True)
+            self.log_toggle_btn.configure(text="Hide details \u25b4")
+        else:
+            self.log_body.pack_forget()
+            self.log_toggle_btn.configure(text="Show details \u25be")
 
     def _log(self, text, tag=None):
         self.log.configure(state="normal")
         self.log.insert("end", text + "\n", tag)
         self.log.configure(state="disabled")
         self.log.see("end")
+        # first line of a multi-line message (e.g. "Done: N file(s)
+        # written") is usually the meaningful summary line for the
+        # collapsed strip; a raw per-file [OK]/[SKIPPED] line is still
+        # shown too since it's the most recent activity either way.
+        self.log_summary_var.set(text.splitlines()[0] if text else "")

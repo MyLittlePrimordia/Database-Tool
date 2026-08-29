@@ -660,6 +660,11 @@ class ImportDialog(tk.Toplevel):
         changes = []
         applied_new = applied_changed = 0
         n_deleted = 0
+        # Selection target for after the import: the FIRST new/changed
+        # entry, tracked by id (not position) since later deletions in
+        # this same batch can shift list indices out from under any
+        # position captured earlier.
+        first_touch_id = None
 
         def _edit_change(pos, old, clean):
             return {
@@ -675,6 +680,8 @@ class ImportDialog(tk.Toplevel):
             pos = len(app.entries)
             app.entries.append(clean)
             applied_new += 1
+            if first_touch_id is None:
+                first_touch_id = clean["id"]
             changes.append({
                 "pos_hint": pos,
                 "ref_before": None, "copy_before": None,
@@ -687,6 +694,8 @@ class ImportDialog(tk.Toplevel):
             old = app.entries[pos]
             app.entries[pos] = clean
             applied_changed += 1
+            if first_touch_id is None:
+                first_touch_id = clean["id"]
             changes.append(_edit_change(pos, old, clean))
         for p, _candidate in sorted(
                 ((p, c) for p, c in staged if p["action"] == "delete"),
@@ -705,9 +714,9 @@ class ImportDialog(tk.Toplevel):
 
         if not changes:
             return
+        n_touched = applied_new + applied_changed
         desc = "Imported {} entr{} from AI output{}".format(
-            applied_new + applied_changed,
-            "y" if applied_new + applied_changed == 1 else "ies",
+            n_touched, "y" if n_touched == 1 else "ies",
             " ({} deleted)".format(n_deleted) if n_deleted else "")
         app._record_op("import", desc, changes)
         app.dirty = True
@@ -716,7 +725,46 @@ class ImportDialog(tk.Toplevel):
         app.refresh_spell_vocab()
         app._autosave()
         app._notify_db_changed()
-        app.status_var.set(desc + ". Remember to Save As to keep them.")
+        jump_note = ""
+        if first_touch_id is not None:
+            idx = next((i for i, e in enumerate(app.entries)
+                       if e.get("id") == first_touch_id), None)
+            if idx is not None:
+                if app.search_var.get():
+                    # a filter may be hiding the imported row -- lift it so
+                    # the reveal works, same as reveal_entry() does for the
+                    # Audit tab's "jump to entry".
+                    app.search_var.set("")
+                    if getattr(app, "_search_debounce_id", None):
+                        try:
+                            app.after_cancel(app._search_debounce_id)
+                        except Exception:
+                            pass
+                        app._search_debounce_id = None
+                    app.populate_tree()
+                iid = "entry:{}".format(idx)
+                parent = app.tree.parent(iid)
+                if parent:
+                    app.tree.item(parent, open=True)
+                try:
+                    app.tree.see(iid)
+                    app.tree.selection_set(iid)
+                except Exception:
+                    pass
+                # selection_set fires <<TreeviewSelect>>, which loads the
+                # entry into the editor and switches tabs (respecting the
+                # unsaved-changes guard) -- but only re-do it explicitly if
+                # that guard skipped it (form was already clean, no reload
+                # needed a second time is harmless; a dirty form that the
+                # user chose to keep should NOT be silently replaced).
+                if not app.editor.form_is_dirty():
+                    app.editing_index = idx
+                    app._selected_iid = iid
+                    app.editor.load_entry(app.entries[idx])
+                    app.notebook.select(app.editor)
+                if n_touched > 1:
+                    jump_note = "  \u2022 jumped to 1 of {} imported entries".format(n_touched)
+        app.status_var.set(desc + jump_note + ". Remember to Save to keep them.")
         self.destroy()
 
 

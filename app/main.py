@@ -28,6 +28,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 import db_logic as L
+import export_tools as EX
 import spell_logic as SP
 import fr_plot
 import theme
@@ -3799,6 +3800,7 @@ class HistoryPanel(ttk.Frame):
                                "the undo/redo list."):
             self.app.history.clear()
             self.app.redo_stack.clear()
+            self.app._persist_history()
             self.refresh()
 
 
@@ -3897,7 +3899,7 @@ class MainApp(tk.Tk):
         self.dirty = False
         self.editing_index = None  # index into self.entries currently loaded in editor, or None for "new"
         # waived audit findings ("Ignore Selected" in the Audit tab);
-        # persisted in audit_waivers.json beside the database file
+        # persisted in backup/ignored.json next to the database file
         self.waivers = set()
 
         # undo/redo history (chronological ops; redo holds undone ops)
@@ -4077,8 +4079,19 @@ class MainApp(tk.Tk):
         if len(self.history) > self.HISTORY_MAX:
             self.history = self.history[-self.HISTORY_MAX:]
         self.redo_stack.clear()   # new work invalidates the redo branch
+        self._persist_history()
         if self.history_panel is not None:
             self.history_panel.refresh()
+
+    def _persist_history(self):
+        """Best-effort flush of the undo/redo stacks to backup/history.json.
+        Never blocks the edit that triggered it."""
+        if not self.db_path:
+            return
+        try:
+            L.write_history(self.db_path, self.history, self.redo_stack)
+        except Exception as e:  # noqa: BLE001
+            L.log("History persist failed: {}".format(e))
 
     def _find_slot(self, target_ref, target_copy):
         """Locate an entry's current list position: object identity first,
@@ -4165,6 +4178,7 @@ class MainApp(tk.Tk):
             else:
                 self._remove_op(self.history, op)
                 self.redo_stack.append(op)
+        self._persist_history()
         if all_affected:
             self.dirty = True
             self._mark_audit_dirty()
@@ -4219,6 +4233,7 @@ class MainApp(tk.Tk):
         filemenu.add_command(label="Open Database...", command=self.open_database)
         filemenu.add_command(label="Set Data Folder...", command=self.set_data_folder)
         filemenu.add_separator()
+        filemenu.add_command(label="Save", command=self.save)
         filemenu.add_command(label="Save As...", command=self.save_as)
         filemenu.add_separator()
         filemenu.add_command(label="Exit", command=self._on_close)
@@ -4314,7 +4329,7 @@ class MainApp(tk.Tk):
         toolbar = ttk.Frame(self, style="Panel.TFrame")
         toolbar.pack(fill="x", side="top")
         ttk.Button(toolbar, text="Open Database", command=self.open_database).pack(side="left", padx=4, pady=6)
-        ttk.Button(toolbar, text="Save", style="Accent.TButton", command=self.save_as).pack(side="left", padx=4, pady=6)
+        ttk.Button(toolbar, text="Save", style="Accent.TButton", command=self.save).pack(side="left", padx=4, pady=6)
         ttk.Button(toolbar, text="Add Entry", command=self.add_entry).pack(side="left", padx=4, pady=6)
         ttk.Button(toolbar, text="Import Entries",
                    command=self._import_entries).pack(side="left", padx=4, pady=6)
@@ -4544,20 +4559,21 @@ class MainApp(tk.Tk):
             "the standard format and file them into your data folder\n"
             "  \u2022 Export - database.json.gz compression and AI-friendly "
             "chunk splitting\n\n"
-            "Saving: always via Save As. Overwriting the loaded original is "
-            "possible after a confirmation, and a safety snapshot of the "
-            "original is kept in '.db_editor_backups' first.".format(
-                APP_TITLE, APP_VERSION))
+            "Saving: Save overwrites database.json directly (a safety copy "
+            "of the previous version is kept as 'backup/database.json.bak' "
+            "first, and 'database.json.gz' is refreshed alongside it). "
+            "Use Save As... to save to a different file/location "
+            "instead.".format(APP_TITLE, APP_VERSION))
 
     def _on_close(self):
         if self.dirty:
             resp = messagebox.askyesnocancel(
                 APP_TITLE,
-                "You have unsaved changes. Save before exiting?\n\nYes = Save As..., No = Exit without saving, Cancel = Stay.")
+                "You have unsaved changes. Save before exiting?\n\nYes = Save, No = Exit without saving, Cancel = Stay.")
             if resp is None:
                 return
             if resp:
-                self.save_as()
+                self.save()
                 # if still dirty after save attempt, stay
                 if self.dirty:
                     return
@@ -4570,9 +4586,14 @@ class MainApp(tk.Tk):
     # LOADING / SAVING
     # ------------------------------------------------------------------
     def _try_auto_load(self):
+        # .json is preferred when both exist (it's the one being actively
+        # edited); .json.gz is only a fallback for a folder that ships
+        # solely the compressed archive.
         candidates = [
             os.path.join(script_folder(), "database.json"),
             os.path.join(os.getcwd(), "database.json"),
+            os.path.join(script_folder(), "database.json.gz"),
+            os.path.join(os.getcwd(), "database.json.gz"),
         ]
         seen = set()
         for candidate in candidates:
@@ -4626,15 +4647,25 @@ class MainApp(tk.Tk):
             messagebox.showerror(APP_TITLE, "Unexpected error loading database:\n\n{}".format(e))
             return
         self.entries = entries
-        self.db_path = path
+        # Working save target is always the plain .json sibling, even when
+        # the user opened (or auto-load found only) the .gz archive: the
+        # .gz is a compiled export artifact the app regenerates on every
+        # save, never something it edits/overwrites/backs-up in place.
+        if path.lower().endswith(".gz") and path.lower().endswith(".json.gz"):
+            self.db_path = path[:-3]  # "database.json.gz" -> "database.json"
+        else:
+            self.db_path = path
         self.data_root = os.path.dirname(os.path.abspath(path))
-        self.waivers = L.load_waivers(path)
+        self.waivers = L.load_waivers(self.db_path)
+        self.history, self.redo_stack = L.load_history(self.db_path)
         self.dirty = False
         self.editing_index = None
         self.editor.new_entry()
         self.refresh_spell_vocab()
         self.file_panel_root_changed()
         self.populate_tree()
+        if self.history_panel is not None:
+            self.history_panel.refresh()
         msg = "Loaded {} entries from {}{}".format(
             len(entries), path,
             "  (RECOVERED from autosave backup -- use Save As to keep it)" if restored else "")
@@ -4737,14 +4768,17 @@ class MainApp(tk.Tk):
         except Exception:
             pass
 
-    def save_as(self):
+    def _pre_save_checks(self):
+        """Shared Save / Save As gate. Returns True when it's OK to proceed
+        (blocking problems are refused outright; advisory ones need an
+        explicit yes). Advisory gate only: reuse the freshest cached audit
+        results instead of re-running the full audit (incl. a data-folder
+        walk) on the UI thread every save. The Audit tab auto-refreshes on
+        mutations, so stale results simply mean "no prompt", never a wrong
+        save."""
         if not self.entries:
             messagebox.showwarning(APP_TITLE, "Nothing to save -- no database loaded.")
-            return
-        # Advisory gate only: reuse the freshest cached audit results instead
-        # of re-running the full audit (incl. a data-folder walk) on the UI
-        # thread every save. The Audit tab auto-refreshes on mutations, so
-        # stale results simply mean "no prompt", never a wrong save.
+            return False
         issues = [] if getattr(self, "_audit_dirty", True) \
             else list(getattr(self.audit_panel, "issues", []) or [])
         blocking = [i for i in issues if i.severity == "error"]
@@ -4755,68 +4789,47 @@ class MainApp(tk.Tk):
                     for k, v in dup_ids.items() if len(v) > 1]
         if dup_msgs:
             messagebox.showerror(APP_TITLE, "Cannot save -- fix these first:\n\n" + "\n".join(dup_msgs))
-            return
+            return False
         if blocking:
             proceed = messagebox.askyesno(
                 APP_TITLE,
                 "The audit found {} error-level issue(s) (see Audit tab).\n"
                 "Save anyway?".format(len(blocking)))
             if not proceed:
-                return
-        initial = "database_edited.json"
-        if self.db_path:
-            base = os.path.splitext(os.path.basename(self.db_path))[0]
-            initial = "{}_edited.json".format(base)
-        path = filedialog.asksaveasfilename(
-            title="Save database as...", defaultextension=".json",
-            filetypes=[("JSON database", "*.json")], initialfile=initial,
-            initialdir=self.data_root or ".")
-        if not path:
-            return
-        overwriting_original = bool(self.db_path) and \
-            os.path.normcase(os.path.abspath(path)) == \
-            os.path.normcase(os.path.abspath(self.db_path))
-        if overwriting_original:
-            resp = messagebox.askyesno(
-                APP_TITLE,
-                "You picked the ORIGINAL database you loaded:\n\n{}\n\n"
-                "Overwrite it?\n\nA safety copy of the original is saved "
-                "into '.db_editor_backups' first.".format(path))
-            if not resp:
-                return
+                return False
+        return True
+
+    def _write_database_to(self, path):
+        """Back up whatever currently sits at `path` (if anything) into
+        backup/database.json.bak, write the new content, then refresh
+        database.json.gz right alongside it. Returns (ordered_entries,
+        backup_path_or_None, gz_path_or_None). Raises on the primary
+        save failing; a gzip failure is logged but never blocks the save
+        that already succeeded."""
+        snap = L.write_database_backup(path)
+        ordered = L.save_database(path, self.entries)
+        gz_path = None
         try:
-            current_id = None
-            if self.editing_index is not None and 0 <= self.editing_index < len(self.entries):
-                current_id = self.entries[self.editing_index].get("id")
-            snapshot_note = ""
-            if overwriting_original:
-                snap = L.write_pre_overwrite_snapshot(self.db_path)
-                if snap:
-                    snapshot_note = "  (original backed up to {})".format(
-                        os.path.basename(snap))
-            ordered = L.save_database(path, self.entries)
-        except OSError as e:
-            messagebox.showerror(APP_TITLE, "Failed to save:\n{}".format(e))
-            return
-        except Exception as e:
-            messagebox.showerror(APP_TITLE, "Unexpected error while saving:\n{}".format(e))
-            return
+            gz_path, _raw, _gz = EX.compress_to_gz(
+                entries=ordered, dest_dir=os.path.dirname(os.path.abspath(path)))
+        except Exception as e:  # noqa: BLE001 - never let gzip block a save
+            L.log("Auto database.json.gz refresh failed: {}".format(e))
+        return ordered, snap, gz_path
+
+    def _after_save(self, path, ordered, snap, gz_path, extra_note=""):
         self.entries = ordered
-        # Adopt the saved file as the working database so autosave backups,
-        # crash recovery, pre-overwrite snapshots, waiver storage and the
-        # overwrite-original check all track the file the user actually
-        # keeps editing. data_root is deliberately left alone: measurements
-        # stay where they are, and relinking is an explicit action.
+        current_id = None
+        if self.editing_index is not None and 0 <= self.editing_index < len(self.entries):
+            current_id = self.entries[self.editing_index].get("id")
         self.db_path = path
         self.dirty = False
-        # carry any audit waivers along to the saved location so the edited
-        # database keeps its ignored-findings list
         try:
             L.save_waivers(path, self.waivers)
         except OSError:
             pass
-        # FIX C6: everything is committed to disk now -- do not offer the
-        # pre-save autosave as "recovery" on the next launch.
+        self._persist_history()
+        # everything is committed to disk now -- do not offer the pre-save
+        # autosave as "recovery" on the next launch.
         L.mark_autosave_seen(self.db_path)
         if current_id:
             for i, e in enumerate(self.entries):
@@ -4833,15 +4846,63 @@ class MainApp(tk.Tk):
                 self.tree.see(iid)
             except Exception:
                 pass
+        note = extra_note
+        if snap:
+            note += "  (previous version backed up to {})".format(
+                os.path.relpath(snap, os.path.dirname(path)))
+        if gz_path:
+            note += "  \u2022 {} refreshed".format(os.path.basename(gz_path))
         self.status_var.set("Saved {} entries to {}{}".format(
-            len(ordered), path, snapshot_note))
-        if overwriting_original:
-            messagebox.showinfo(APP_TITLE,
-                                "Saved (overwrote original):\n{}\n{}"
-                                .format(path, snapshot_note))
-        else:
-            messagebox.showinfo(APP_TITLE, "Saved as:\n{}".format(path))
+            len(ordered), path, note))
         self._notify_db_changed()
+
+    def save(self):
+        """One-click save: overwrites the currently-loaded database.json
+        directly (no dialog). Falls back to Save As when nothing is loaded
+        yet (there is no file to overwrite)."""
+        if not self.db_path:
+            self.save_as()
+            return
+        if not self._pre_save_checks():
+            return
+        try:
+            ordered, snap, gz_path = self._write_database_to(self.db_path)
+        except OSError as e:
+            messagebox.showerror(APP_TITLE, "Failed to save:\n{}".format(e))
+            return
+        except Exception as e:
+            messagebox.showerror(APP_TITLE, "Unexpected error while saving:\n{}".format(e))
+            return
+        self._after_save(self.db_path, ordered, snap, gz_path)
+
+    def save_as(self):
+        """Explicit 'save a copy elsewhere' -- picks a new file/location and
+        adopts it as the working database from then on."""
+        if not self._pre_save_checks():
+            return
+        initial = os.path.basename(self.db_path) if self.db_path else "database.json"
+        path = filedialog.asksaveasfilename(
+            title="Save database as...", defaultextension=".json",
+            filetypes=[("JSON database", "*.json")], initialfile=initial,
+            initialdir=self.data_root or ".")
+        if not path:
+            return
+        overwriting_original = bool(self.db_path) and \
+            os.path.normcase(os.path.abspath(path)) == \
+            os.path.normcase(os.path.abspath(self.db_path))
+        try:
+            ordered, snap, gz_path = self._write_database_to(path)
+        except OSError as e:
+            messagebox.showerror(APP_TITLE, "Failed to save:\n{}".format(e))
+            return
+        except Exception as e:
+            messagebox.showerror(APP_TITLE, "Unexpected error while saving:\n{}".format(e))
+            return
+        # data_root is deliberately left alone: measurements stay where
+        # they are, and relinking is an explicit action.
+        self._after_save(path, ordered, snap, gz_path,
+                         extra_note="  (overwrote original)" if overwriting_original
+                         else "  (new location -- now the working database)")
 
     # ------------------------------------------------------------------
     # TREE / SELECTION
