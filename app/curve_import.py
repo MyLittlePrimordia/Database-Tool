@@ -493,6 +493,7 @@ class CurveImportPanel(ttk.Frame):
             text="" if data_dir else
             "\u26a0 Set the data folder first (File \u25b8 Set Data Folder...)")
         self._refresh_exists_markers()
+        self.refresh_link_choices()
 
     def _change_root(self):
         self.app.set_data_folder()
@@ -578,6 +579,34 @@ class CurveImportPanel(ttk.Frame):
         self.preview_canvas.pack(side="left", fill="both", expand=True)
         vsb.pack(side="right", fill="y")
 
+    def _compute_link_choices(self):
+        """(Re)build the "Link to" label list + label->id lookup from
+        whatever's in self.app.entries right now. Split out from
+        _set_plans() so it can also be re-run later, WITHOUT rebuilding
+        the rows, when the database loads/changes after files were
+        already queued (queuing files before a database is open used to
+        leave every row stuck showing only "Current Entry")."""
+        entries_sorted = sorted(self.app.entries, key=L.sort_key)
+        self._entry_link_map = {L.format_entry_label(e): e.get("id") for e in entries_sorted}
+        return ["Current Entry"] + [L.format_entry_label(e) for e in entries_sorted]
+
+    def refresh_link_choices(self):
+        """Refresh the "Link to" dropdown's available values on already-
+        built rows (e.g. after the database is loaded/changed) without
+        touching each row's rename text, include checkbox, or current
+        selection. Call this any time app.entries can have changed
+        independently of the Import tab's own queue."""
+        if not getattr(self, "_link_combos", None):
+            return
+        link_labels = self._compute_link_choices()
+        for combo, link_var in zip(self._link_combos, self._link_vars):
+            combo.configure(values=link_labels)
+            # the entry a row was pointed at may since have been renamed,
+            # merged, or deleted -- fall back to the safe default rather
+            # than silently keeping a now-meaningless label selected.
+            if link_var.get() not in link_labels:
+                link_var.set(link_labels[0])
+
     def _set_plans(self, plans):
         self._plans = plans
         self._name_vars = []
@@ -585,6 +614,7 @@ class CurveImportPanel(ttk.Frame):
         self._exists_labels = []
         self._plan_rows = []
         self._link_vars = []
+        self._link_combos = []
         self._sel_plan = -1
         for w in self.preview_inner.winfo_children():
             w.destroy()
@@ -604,9 +634,7 @@ class CurveImportPanel(ttk.Frame):
         # entry sorted alphabetically by its human-readable "Brand Model
         # [Variant]" label (not the underscored id) so users can quickly
         # find the entry they want to redirect a file to.
-        entries_sorted = sorted(self.app.entries, key=L.sort_key)
-        link_labels = ["Current Entry"] + [L.format_entry_label(e) for e in entries_sorted]
-        self._entry_link_map = {L.format_entry_label(e): e.get("id") for e in entries_sorted}
+        link_labels = self._compute_link_choices()
 
         taken = {}
         for i, plan in enumerate(plans):
@@ -676,6 +704,7 @@ class CurveImportPanel(ttk.Frame):
             self._include_vars.append((inc_var, plan))
             self._exists_labels.append(exists_lbl)
             self._link_vars.append(link_var)
+            self._link_combos.append(link_combo)
             self._plan_rows.append((row, cb, badge, ext_lbl, exists_lbl, src_lbl, row_bg))
 
         self._refresh_exists_markers()
