@@ -553,7 +553,7 @@ class CurveImportPanel(ttk.Frame):
         convert_status_lbl.pack(side="right", padx=12)
         theme.bind_dynamic_wrap(convert_status_lbl, source=header, min_wrap=100)
         rename_hint = ttk.Label(card,
-                  text="Rename freely before converting. \u26a0 marks files that already exist.",
+                  text="Rename the file \u26a0 marks files that already exist.",
                   style="Card.TLabel", foreground=theme.TEXT_DIM, justify="left")
         rename_hint.pack(anchor="w", fill="x", padx=8)
         theme.bind_dynamic_wrap(rename_hint, source=card)
@@ -604,6 +604,7 @@ class CurveImportPanel(ttk.Frame):
             if count:
                 final = "{} ({}){}".format(stem, count + 1, ext.lower())
             taken[final.lower()] = count + 1
+            display_name = os.path.splitext(final)[0]
 
             row_bg = theme.BG_CARD if i % 2 == 0 else \
                 theme.blend(theme.BG_CARD, theme.TEXT_MAIN, 0.04)
@@ -624,13 +625,17 @@ class CurveImportPanel(ttk.Frame):
                              cursor="hand2")
             badge.pack(side="left", padx=(0, 6))
 
-            name_var = tk.StringVar(value=final)
+            name_var = tk.StringVar(value=display_name)
             entry = tk.Entry(row, textvariable=name_var, bg=theme.BG_INPUT, fg=theme.TEXT_MAIN,
-                             insertbackground=theme.TEXT_MAIN, relief="flat",
-                             font=self._font, width=34)
-            entry.pack(side="left", padx=(0, 6), pady=3, ipady=2)
+                              insertbackground=theme.TEXT_MAIN, relief="flat",
+                              font=self._font, width=30)
+            entry.pack(side="left", padx=(0, 2), pady=3, ipady=2)
             entry.bind("<FocusOut>", lambda e, v=name_var: self._on_name_edit(v))
             entry.bind("<Return>", lambda e, v=name_var: self._on_name_edit(v))
+
+            ext_lbl = tk.Label(row, text=".txt", bg=row_bg, fg=theme.TEXT_DIM,
+                                 font=self._font, anchor="w")
+            ext_lbl.pack(side="left", padx=(0, 6))
 
             exists_lbl = tk.Label(row, text="", bg=row_bg, fg=theme.ACCENT_RED,
                                   font=theme.font(12, "bold"))
@@ -646,13 +651,13 @@ class CurveImportPanel(ttk.Frame):
 
             # clicking a planned-output row previews its curve(s); the Entry
             # and Checkbutton keep their own click behavior
-            for w in (row, badge, exists_lbl, src_lbl):
+            for w in (row, badge, ext_lbl, exists_lbl, src_lbl):
                 w.bind("<Button-1>", lambda e, i=i: self._select_plan_row(i))
 
             self._name_vars.append(name_var)
             self._include_vars.append((inc_var, plan))
             self._exists_labels.append(exists_lbl)
-            self._plan_rows.append((row, cb, badge, exists_lbl, src_lbl, row_bg))
+            self._plan_rows.append((row, cb, badge, ext_lbl, exists_lbl, src_lbl, row_bg))
 
         self._refresh_exists_markers()
         self._update_convert_state()
@@ -664,9 +669,8 @@ class CurveImportPanel(ttk.Frame):
         if not data_dir:
             return None
         sub = _sanitize_folder(self.subfolder_var.get().strip())
-        clean_name = CL.sanitize_filename(name_value.strip())
-        if not clean_name.lower().endswith(".txt"):
-            clean_name += ".txt"
+        stem = os.path.splitext(CL.sanitize_filename(name_value.strip()))[0]
+        clean_name = "{}.txt".format(stem)
         parts = [seg for seg in sub.split("/") if seg]
         return os.path.join(data_dir, *parts, clean_name) if parts else \
             os.path.join(data_dir, clean_name)
@@ -693,9 +697,7 @@ class CurveImportPanel(ttk.Frame):
                 text="\u26a0 exists" if target and os.path.exists(target) else "")
 
     def _on_name_edit(self, name_var):
-        clean = CL.sanitize_filename(name_var.get().strip())
-        if not clean.lower().endswith(".txt"):
-            clean += ".txt"
+        clean = os.path.splitext(CL.sanitize_filename(name_var.get().strip()))[0]
         if clean != name_var.get():
             name_var.set(clean)
         self._refresh_exists_markers()
