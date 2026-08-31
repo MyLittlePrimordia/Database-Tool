@@ -774,6 +774,10 @@ def _num_expr_ok(value, expr):
     op = m.group(1) or "="
     a = int(m.group(2))
     b = int(m.group(3)) if m.group(3) else None
+    if b is not None and op != "=":
+        # Operator with a range (e.g. '>100-400') is ambiguous — treat as
+        # invalid syntax rather than silently ignoring the operator.
+        return False
     if op == ">":
         return value > a
     if op == "<":
@@ -1522,39 +1526,43 @@ class FileLinkerPanel(ttk.Frame):
         """Pure data-folder scan (no UI): returns (sorted_rel_paths,
         data_dir) where paths are forward-slash relative like database.json
         stores them. Returns ([], None) when the root has no 'data'
-        subfolder. Safe to call from a worker thread."""
-        if os.path.basename(os.path.normpath(root)).lower() == "data" and os.path.isdir(root):
-            # selected the data folder itself -> rel against its parent so
-            # stored paths stay 'data/...'
-            data_dir = root
-            base_root = os.path.dirname(root)
+        subfolder. Safe to call from a worker thread. Delegates to the
+        shared memoized scanner in db_logic."""
+        try:
+            import db_logic as _L
+            return _L.scan_data_files(root)
+        except Exception:
+            # Fallback walk (should never be needed)
+            if os.path.basename(os.path.normpath(root)).lower() == "data" and os.path.isdir(root):
+                data_dir = root
+                base_root = os.path.dirname(root)
+                results = []
+                for r, _, files in os.walk(data_dir):
+                    for fn in files:
+                        if fn.lower().endswith(".txt"):
+                            full = os.path.join(r, fn)
+                            try:
+                                rel = os.path.relpath(full, base_root).replace("\\", "/")
+                            except ValueError:
+                                rel = os.path.join("data", os.path.relpath(full, data_dir)).replace("\\", "/")
+                            results.append(rel)
+                results.sort()
+                return results, data_dir
+            data_dir = os.path.join(root, "data")
             results = []
-            for r, _, files in os.walk(data_dir):
-                for fn in files:
-                    if fn.lower().endswith(".txt"):
-                        full = os.path.join(r, fn)
-                        try:
-                            rel = os.path.relpath(full, base_root).replace("\\", "/")
-                        except ValueError:
-                            rel = os.path.join("data", os.path.relpath(full, data_dir)).replace("\\", "/")
-                        results.append(rel)
-            results.sort()
-            return results, data_dir
-        data_dir = os.path.join(root, "data")
-        results = []
-        if os.path.isdir(data_dir):
-            for r, _, files in os.walk(data_dir):
-                for fn in files:
-                    if fn.lower().endswith(".txt"):
-                        full = os.path.join(r, fn)
-                        try:
-                            rel = os.path.relpath(full, root).replace("\\", "/")
-                        except ValueError:
-                            continue
-                        results.append(rel)
-            results.sort()
-            return results, data_dir
-        return [], None
+            if os.path.isdir(data_dir):
+                for r, _, files in os.walk(data_dir):
+                    for fn in files:
+                        if fn.lower().endswith(".txt"):
+                            full = os.path.join(r, fn)
+                            try:
+                                rel = os.path.relpath(full, root).replace("\\", "/")
+                            except ValueError:
+                                continue
+                            results.append(rel)
+                results.sort()
+                return results, data_dir
+            return [], None
 
     def _all_files(self):
         root = self.get_data_root()
@@ -1778,7 +1786,6 @@ class FileLinkerPanel(ttk.Frame):
         now = time.time()
         if not force and (now - self._last_walk) < self.MIN_REWALK_SECS:
             return
-        self._last_walk = now
         # One walk at a time; the scan itself runs in a daemon thread so an
         # 11k-file data folder never blocks the UI thread (~0.2 s per walk).
         if getattr(self, "_walk_thread", None) is not None \
@@ -1807,6 +1814,7 @@ class FileLinkerPanel(ttk.Frame):
             cur = tuple(res or [])
             self._all_files_cache = list(cur)
             self._cache_root = root
+            self._last_walk = time.time()
             changed = prev is None or cur != prev
             if changed:
                 self._refresh_available()
@@ -4015,7 +4023,7 @@ class MainApp(tk.Tk):
         self._as_after = None
         if not self.entries or not self.db_path:
             return
-        if not hasattr(self, "_as_lock"):
+        if "_as_lock" not in self.__dict__:
             self._as_lock = threading.Lock()
             self._as_pending = None
             self._as_thread = None
@@ -4565,6 +4573,38 @@ class MainApp(tk.Tk):
             "Use Save As... to save to a different file/location "
             "instead.".format(APP_TITLE, APP_VERSION))
 
+    def _autosave_flush_sync(self):
+        """Synchronous flush used on exit: capture any pending coalesced
+        snapshot and write it immediately on the UI thread so it cannot be
+        lost when the daemon thread is killed at destroy()."""
+        self._as_after = None
+        if not self.entries or not self.db_path:
+            return
+        # Ensure structures exist even if no prior autosave was scheduled
+        if "_as_lock" not in self.__dict__:
+            self._as_lock = threading.Lock()
+            self._as_pending = None
+            self._as_thread = None
+        # Build snapshot on UI thread (dicts are stable here)
+        with self._as_lock:
+            # If a daemon is already mid-write, let it finish via join
+            snapshot = [L.build_clean_entry(e) for e in self.entries]
+            db_path = self.db_path
+            # Clear coalesced pending — we are writing the freshest state
+            self._as_pending = None
+        # Block until any in-flight daemon finishes (avoid concurrent writes)
+        th = getattr(self, "_as_thread", None)
+        if th is not None and th.is_alive():
+            try:
+                th.join(timeout=2.0)
+            except Exception:
+                pass
+        try:
+            with _autosave_lock:
+                L.write_autosave(db_path, snapshot)
+        except Exception as e:
+            L.log("Autosave (sync) failed: {}".format(e))
+
     def _on_close(self):
         if self.dirty:
             resp = messagebox.askyesnocancel(
@@ -4577,9 +4617,10 @@ class MainApp(tk.Tk):
                 # if still dirty after save attempt, stay
                 if self.dirty:
                     return
-        # capture whatever the coalescing autosave had not flushed yet
+        # capture whatever the coalescing autosave had not flushed yet —
+        # synchronous so the file is durable before the window is destroyed
         self._autosave_cancel()
-        self._autosave_flush()
+        self._autosave_flush_sync()
         self.destroy()
 
     # ------------------------------------------------------------------

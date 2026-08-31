@@ -114,6 +114,7 @@ class SpellChecker:
         self._pool_cache = None   # cached small-pool buckets for fast suggestions
         self._sorted_known = None  # cached sorted(self._known) for deterministic scans
         self._flag_cache = {}     # memoized per-token flag results
+        self._suggest_cache = {}  # core -> [suggestions]
         self._full_loaded = False
         self._ready = False
         self._lock = threading.Lock()
@@ -160,6 +161,7 @@ class SpellChecker:
             self._pool_cache = None
             self._sorted_known = None
             self._flag_cache = {}
+            self._suggest_cache = {}
 
     def load_async(self):
         t = threading.Thread(target=self.load_sync, daemon=True)
@@ -205,6 +207,7 @@ class SpellChecker:
             self._pool_cache = None
             self._sorted_known = None
             self._flag_cache = {}
+            self._suggest_cache = {}
 
     def add_vocab(self, text):
         """Add one free-text value (e.g. after saving a new entry)."""
@@ -215,6 +218,7 @@ class SpellChecker:
             self._pool_cache = None
             self._sorted_known = None
             self._flag_cache = {}
+            self._suggest_cache = {}
 
     # ------------------------------------------------------------------
     # Checking
@@ -314,9 +318,7 @@ class SpellChecker:
         checked = 0
         for w in words:
             checked += 1
-            # F-C8: check far more often so worst-case stall stays small,
-            # and stop once we already have plenty of candidates.
-            if checked % 10000 == 0 and time.time() - start > budget:
+            if checked % 5000 == 0 and time.time() - start > budget:
                 break
             if len(found) >= 60:
                 break
@@ -341,6 +343,10 @@ class SpellChecker:
         core = alpha_core(word)
         if not core or not self._ready:
             return []
+        cache_key = (core, limit)
+        cached = self._suggest_cache.get(cache_key)
+        if cached is not None:
+            return list(cached)
         deadline = time.time() + SUGGEST_TIME_BUDGET
         dists = dict(self._fast_candidates(core, exclude=core))
         remaining = deadline - time.time()
@@ -354,7 +360,11 @@ class SpellChecker:
             dists.items(),
             key=lambda kv: (kv[1], self._ranks.get(kv[0], 10 ** 9), kv[0]),
         )
-        return [w for w, _ in ranked[:limit]]
+        result = [w for w, _ in ranked[:limit]]
+        if len(self._suggest_cache) > 200:
+            self._suggest_cache.clear()
+        self._suggest_cache[cache_key] = list(result)
+        return result
 
     def known_word(self, word):
         """True if word is a known English/domain/DB term (for tests/UI)."""

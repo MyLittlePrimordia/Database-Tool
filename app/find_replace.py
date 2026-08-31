@@ -256,6 +256,16 @@ class FindReplaceDialog(tk.Toplevel):
                     continue
                 if replace:
                     new_tags = [replace if t == find else t for t in tags]
+                    # Deduplicate: renaming Warm->Budget when Budget already
+                    # present would create ['Budget','Budget'] which always
+                    # fails validation. Keep first occurrence, preserve order.
+                    seen = set()
+                    deduped = []
+                    for t in new_tags:
+                        if t not in seen:
+                            seen.add(t)
+                            deduped.append(t)
+                    new_tags = deduped
                 else:
                     new_tags = [t for t in tags if t != find]
                 if new_tags != tags:

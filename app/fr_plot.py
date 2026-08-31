@@ -18,6 +18,7 @@ curve. Helper functions here (get_curve_points / normalized / average /
 dim) do the parsing, normalization and styling math.
 """
 
+import collections
 import os
 import bisect
 import math
@@ -118,8 +119,8 @@ def palette():
         return [blend(c, "#000000", 0.35) for c in _PALETTE_BASE]
     return list(_PALETTE_BASE)
 
-# parsed-curve cache: abspath -> (mtime_ns, size, [(f, db), ...])
-_CACHE = {}
+# parsed-curve cache: normcase abspath -> (mtime_ns, size, [(f, db), ...])
+_CACHE = collections.OrderedDict()
 _CACHE_MAX = 96
 
 
@@ -179,8 +180,13 @@ def get_curve_points(path, max_points=20000):
         st = os.stat(path)
     except OSError:
         return []
-    hit = _CACHE.get(path)
+    key = os.path.normcase(os.path.abspath(path))
+    hit = _CACHE.get(key)
     if hit and hit[0] == st.st_mtime_ns and hit[1] == st.st_size:
+        try:
+            _CACHE.move_to_end(key)
+        except Exception:
+            pass
         return hit[2]
     try:
         import curve_logic as CL   # lazy: keeps this module import-light
@@ -192,11 +198,11 @@ def get_curve_points(path, max_points=20000):
         step = len(pts) / float(max_points)
         pts = [pts[int(i * step)] for i in range(max_points)]
     if len(_CACHE) >= _CACHE_MAX:
-        # FIFO eviction of the oldest entry (dicts preserve insertion
-        # order): clearing wholesale thrashed the cache when browsing
-        # more than _CACHE_MAX distinct files.
-        _CACHE.pop(next(iter(_CACHE)), None)
-    _CACHE[path] = (st.st_mtime_ns, st.st_size, pts)
+        try:
+            _CACHE.popitem(last=False)
+        except Exception:
+            _CACHE.pop(next(iter(_CACHE)), None)
+    _CACHE[key] = (st.st_mtime_ns, st.st_size, pts)
     return pts
 
 

@@ -30,7 +30,9 @@ import theme
 
 def _sanitize_folder(name):
     cleaned = CL.sanitize_filename(name)
-    return "" if cleaned == "curve.txt" else cleaned
+    if cleaned == "curve.txt" or cleaned in (".", ".."):
+        return ""
+    return cleaned
 
 
 class CurveImportPanel(ttk.Frame):
@@ -716,10 +718,11 @@ class CurveImportPanel(ttk.Frame):
         data_dir = self._data_dir()
         if not data_dir:
             return None
-        sub = _sanitize_folder(self.subfolder_var.get().strip())
+        raw_sub = self.subfolder_var.get().strip()
+        parts = [ _sanitize_folder(s) for s in raw_sub.split("/") if s.strip() ]
+        parts = [p for p in parts if p]
         stem = os.path.splitext(CL.sanitize_filename(name_value.strip()))[0]
         clean_name = "{}.txt".format(stem)
-        parts = [seg for seg in sub.split("/") if seg]
         return os.path.join(data_dir, *parts, clean_name) if parts else \
             os.path.join(data_dir, clean_name)
 

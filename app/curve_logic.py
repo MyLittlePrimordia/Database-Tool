@@ -95,17 +95,23 @@ def _split_fields(stripped):
         (the strong delimiter), then split each chunk further on plain
         whitespace (handles stray alignment spaces), then treat a
         comma inside any resulting field as a decimal separator.
-      - Anything else: fall back to the original combined comma/
-        whitespace split. This supports comma-delimited CSV exports like
-        "20,112.594" (freq/SPL separated by a bare comma, each value
-        itself using a dot decimal) - here comma genuinely IS the
-        delimiter, so it must NOT be reinterpreted as a decimal mark.
+      - Anything else: if whitespace-separated tokens ALL look like
+        bare decimal-comma numbers ("20,5 60,25"), spaces are the
+        delimiter and the commas are decimals. Otherwise fall back to
+        the original combined comma/whitespace split. This supports
+        both comma-delimited CSV exports like "20,112.594" (freq/SPL
+        separated by a bare comma, each value itself using a dot
+        decimal) — here comma genuinely IS the delimiter, so it must
+        NOT be reinterpreted — and space-separated European exports.
     """
     if ";" in stripped:
         chunks = [c.strip() for c in stripped.split(";") if c.strip()]
     elif "\t" in stripped:
         chunks = [c.strip() for c in stripped.split("\t") if c.strip()]
     else:
+        toks = stripped.split()
+        if len(toks) >= 2 and all(DECIMAL_COMMA_RE.match(t) for t in toks):
+            return [_normalize_decimal_comma(t) for t in toks]
         return [f for f in FIELD_SPLIT_RE.split(stripped) if f]
 
     fields = []
@@ -340,6 +346,8 @@ def sanitize_filename(name):
     whitespace left behind."""
     cleaned = re.sub(_FILENAME_SANITIZER, "", name).strip()
     cleaned = re.sub(r"\s+", " ", cleaned)
+    if cleaned in (".", ".."):
+        return "curve.txt"
     return cleaned or "curve.txt"
 
 

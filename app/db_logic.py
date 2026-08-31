@@ -64,6 +64,58 @@ PRICE_MAX = 10000000       # USD
 LOG_DIR = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
                        "DatabaseEditor")
 
+# Short-lived memo for data-folder walks: audit + file panel often ask
+# for the same directory within seconds of each other. Re-walking 11k
+# files twice is pure wasted I/O.
+_SCAN_CACHE = {"root": None, "time": 0, "on_disk": None, "data_dir": None}
+
+
+def scan_data_files(data_root):
+    """Walk `data_root/data` for .txt measurement files. Memoized for
+    ~2 s so concurrent callers (audit + file linker) share one walk."""
+    import time
+    now = time.time()
+    cached = _SCAN_CACHE
+    if cached["root"] == data_root and (now - cached["time"]) < 2.0 \
+            and cached["on_disk"] is not None:
+        return list(cached["on_disk"]), cached["data_dir"]
+    data_dir = os.path.join(data_root, "data") if data_root else None
+    on_disk = []
+    if data_dir and os.path.isdir(data_dir):
+        for root, _, files in os.walk(data_dir):
+            for fn in files:
+                if fn.lower().endswith(".txt"):
+                    full = os.path.join(root, fn)
+                    try:
+                        rel = os.path.relpath(full, data_root).replace("\\", "/")
+                    except ValueError:
+                        continue
+                    rel = re.sub(r"/+", "/", rel)
+                    on_disk.append(rel)
+        on_disk.sort()
+    elif data_root and os.path.isdir(data_root) \
+            and os.path.basename(os.path.normpath(data_root)).lower() == "data":
+        # data_root itself is the data folder
+        data_dir = data_root
+        base_root = os.path.dirname(data_root)
+        for root, _, files in os.walk(data_dir):
+            for fn in files:
+                if fn.lower().endswith(".txt"):
+                    full = os.path.join(root, fn)
+                    try:
+                        rel = os.path.relpath(full, base_root).replace("\\", "/")
+                    except ValueError:
+                        rel = os.path.join("data", os.path.relpath(full, data_dir)).replace("\\", "/")
+                    rel = re.sub(r"/+", "/", rel)
+                    on_disk.append(rel)
+        on_disk.sort()
+    else:
+        data_dir = None
+        on_disk = []
+    cached.update({"root": data_root, "time": now,
+                   "on_disk": list(on_disk), "data_dir": data_dir})
+    return on_disk, data_dir
+
 
 def log(msg):
     """Best-effort diagnostic log visible even in --windowed builds."""
@@ -299,6 +351,27 @@ def price_tier_for(price_usd):
     return "Budget"
 
 
+def price_tier_basis(price_usd):
+    """Price value used to determine the expected tier tag.
+
+    When the price is a valid whole $5 multiple we use it as-is; otherwise
+    we use the rounded value (the price the entry will have after the
+    rounding fix). This keeps `validate_entry` and the audit engine
+    agreeing on the expected tier and avoids oscillating fix messages for
+    prices like 498 vs 500."""
+    if isinstance(price_usd, str) and "_" in price_usd:
+        return price_usd
+    try:
+        p_check = float(price_usd)
+        if not math.isfinite(p_check) or p_check < 0:
+            return price_usd
+        if float(p_check).is_integer() and int(p_check) % 5 == 0:
+            return p_check
+        return round_price_to_5(p_check)
+    except (TypeError, ValueError):
+        return price_usd
+
+
 def round_price_to_5(price_usd):
     try:
         p = float(price_usd)
@@ -320,6 +393,8 @@ def coerce_int(value, default=0):
         return int(value)
     if isinstance(value, int):
         return value
+    if isinstance(value, str) and "_" in value:
+        return default
     try:
         f = float(value)
         if not math.isfinite(f):
@@ -454,12 +529,15 @@ def validate_entry(entry, existing_ids=None, exclude_id=None):
         errors.append("Price must be a finite number.")
         price = -1
     else:
-        if isinstance(price_raw, str) and "." in price_raw:
+        if isinstance(price_raw, str) and "_" in price_raw:
+            errors.append("Price must be a whole number (underscores not allowed, got '{}').".format(price_raw))
+            price = -1
+        elif isinstance(price_raw, str) and "." in price_raw:
             errors.append("Price must be a whole number (got '{}').".format(price_raw))
             price = coerce_int(price_raw, -1)
         elif isinstance(price_raw, str):
             try:
-                price = int(price_raw.strip().replace("_", ""))
+                price = int(price_raw.strip())
             except ValueError:
                 errors.append("Price must be a whole number.")
                 price = -1
@@ -563,7 +641,8 @@ def validate_entry(entry, existing_ids=None, exclude_id=None):
     if len(tier_tags_present) != 1:
         errors.append("Exactly one price-tier tag is required (Budget/Mid-Tier/Premium/Flagship).")
     else:
-        expected_tier = price_tier_for(entry.get("price_usd", 0))
+        basis = price_tier_basis(entry.get("price_usd", 0))
+        expected_tier = price_tier_for(basis)
         if tier_tags_present[0] != expected_tier:
             errors.append(
                 "Price-tier tag '{}' does not match price ${} (expected '{}').".format(
@@ -597,7 +676,10 @@ def build_clean_entry(source, notes=None, where=""):
                 sval = val.strip()
                 if sval == "":
                     val = 0
-                elif re.fullmatch(r"[+-]?\d+", sval.replace("_", "")) is None \
+                elif "_" in sval:
+                    note("{} value '{}' contains underscores (not allowed); reset to 0.".format(_label(f), orig))
+                    val = 0
+                elif re.fullmatch(r"[+-]?\d+", sval) is None \
                         and "." in sval:
                     try:
                         fv = float(sval.replace(",", "."))
@@ -612,7 +694,7 @@ def build_clean_entry(source, notes=None, where=""):
                         note("{} value '{}' is not numeric; reset to 0.".format(_label(f), orig))
                         val = 0
                 else:
-                    val = coerce_int(sval.replace("_", ""), 0)
+                    val = coerce_int(sval, 0)
                     if str(val) != sval:
                         note("{} value '{}' coerced to {}.".format(_label(f), orig, val))
             elif isinstance(val, bool):
@@ -853,7 +935,6 @@ def write_database_backup(db_path):
     except OSError as e:
         log("Database backup failed: {}".format(e))
         return None
-    return dest
 
 
 def _autosave_sort_key(p):
@@ -1499,21 +1580,15 @@ def run_full_audit(entries, data_root=None):
             if norm:
                 referenced_map.setdefault(norm, []).append(idx)
     if data_root:
-        data_dir = os.path.join(data_root, "data")
-        if os.path.isdir(data_dir):
-            on_disk = []
-            for root, _, files in os.walk(data_dir):
-                for fn in files:
-                    if fn.lower().endswith(".txt"):
-                        full = os.path.join(root, fn)
-                        try:
-                            rel = os.path.relpath(full, data_root).replace("\\", "/")
-                        except ValueError:
-                            continue
-                        rel = re.sub(r"/+", "/", rel)
-                        on_disk.append(rel)
+        on_disk, data_dir = scan_data_files(data_root)
+        if on_disk:
             on_disk_set = set(on_disk)
             disk_index = {p.lower(): p for p in on_disk}
+        elif data_dir is not None:
+            # data dir exists but empty — keep empty set so Missing File
+            # checks still run (on_disk_set stays empty rather than None)
+            on_disk_set = set()
+            disk_index = {}
 
     # brand-spelling prepass: needs to see every entry's brand before it can
     # tell majority from minority spelling, so it runs once here rather than
@@ -1764,15 +1839,7 @@ def run_full_audit(entries, data_root=None):
                 ))
 
         price = entry.get("price_usd", 0)
-        try:
-            p_check = float(price)
-            tier_basis = p_check if (math.isfinite(p_check) and float(p_check).is_integer()
-                                     and int(p_check) % 5 == 0) \
-                else round_price_to_5(p_check)
-            if p_check < 0 or not math.isfinite(p_check):
-                tier_basis = price
-        except (TypeError, ValueError):
-            tier_basis = price
+        tier_basis = price_tier_basis(price)
         expected_tier = price_tier_for(tier_basis)
         tags = entry.get("tags", []) or []
         present_tiers = [t for t in tags if t in PRICE_TIER_TAGS]

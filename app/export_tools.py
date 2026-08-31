@@ -136,34 +136,48 @@ def split_into_chunks(entries=None, external_path=None,
 
     number = 1
     current_chunk = []
+    current_chunk_jsons = []
     current_tokens = 0
     chunks_created = 0
     entries_written = 0
 
     def flush():
-        nonlocal number, current_chunk, current_tokens
+        nonlocal number, current_chunk, current_chunk_jsons, current_tokens
         nonlocal chunks_created, entries_written
         if not current_chunk:
             return
         out_name = "{}_chunk_{}.json".format(filename_only, number)
         out_path = os.path.join(output_dir, out_name)
+        # Reuse per-item serializations to avoid re-encoding each entry.
+        # json.dump(chunk) would re-serialize every item; joining cached
+        # indent=2 strings is equivalent and saves ~50% of JSON work.
+        # Each item_json is indent=2 for a top-level object; inside a list
+        # it needs 2 extra spaces.
+        def _indent_item(s):
+            return "\n".join(("  " + line) if line else line for line in s.split("\n"))
         with open(out_path, "w", encoding="utf-8") as f:
-            json.dump(current_chunk, f, ensure_ascii=False, indent=2)
+            f.write("[\n")
+            f.write(",\n".join(_indent_item(j) for j in current_chunk_jsons))
+            f.write("\n]\n")
         log("  Created: {}  ({} entries, ~{} tokens)".format(
             out_name, len(current_chunk), current_tokens))
         chunks_created += 1
         entries_written += len(current_chunk)
         number += 1
         current_chunk = []
+        current_chunk_jsons = []
         current_tokens = 0
 
     for index, item in enumerate(src_entries):
         # indent=2 matches flush()'s serialization so the token budget is
-        # computed against what actually lands on disk.
-        item_tokens = count_tokens(item, indent=2)
+        # computed against what actually lands on disk. Cache the dump to
+        # reuse in flush().
+        item_json = json.dumps(item, ensure_ascii=False, indent=2)
+        item_tokens = max(1, len(item_json) // 4)
         if current_chunk and current_tokens + item_tokens > max_tokens:
             flush()
         current_chunk.append(item)
+        current_chunk_jsons.append(item_json)
         current_tokens += item_tokens
         if index % 200 == 0:
             log("  Processing {}/{} | Current chunk: ~{} tokens".format(
