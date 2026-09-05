@@ -18,6 +18,10 @@ on:
       - "app/**"
       - ".github/workflows/build.yml"
 
+# Needed so the release job can create/overwrite the "latest" release.
+permissions:
+  contents: write
+
 jobs:
   # F2 -- automated schema-validation & regression suite. Pure-logic
   # tests (no display needed); runs on all three OSes before any build
@@ -153,3 +157,47 @@ jobs:
           name: Database-Tool-linux
           path: app/dist/Database-Tool.appimage
           if-no-files-found: error
+
+  release:
+    name: Publish latest release (raw binaries, no zip)
+    needs: [windows, macos, linux]
+    # Builds run on every push/PR, but only pushes to main/master (plus
+    # v* tags and manual runs) overwrite the rolling "latest" release.
+    # To release from ANY branch push instead, replace this with:
+    #   if: github.event_name != 'pull_request'
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')))
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List files (and restore AppImage exec bit)
+        run: |
+          chmod +x dist/Database-Tool.appimage || true
+          ls -lh dist
+
+      - name: Overwrite "latest" release with raw files
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: Latest
+          body: |
+            Rolling build of Database Tool — overwritten on every push to main.
+
+            Raw binaries, no zip:
+            - `Database-Tool.exe` (Windows)
+            - `Database-Tool.dmg` (macOS)
+            - `Database-Tool.appimage` (Linux)
+
+            Commit: ${{ github.sha }}
+          make_latest: true
+          prerelease: false
+          generate_release_notes: false
+          fail_on_unmatched_files: true
+          files: |
+            dist/Database-Tool.exe
+            dist/Database-Tool.dmg
+            dist/Database-Tool.appimage
