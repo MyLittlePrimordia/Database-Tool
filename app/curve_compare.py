@@ -99,6 +99,14 @@ class CurveCompareDialog(tk.Toplevel):
                   foreground=theme.ACCENT_ORANGE).grid(row=0, column=2,
                                                        sticky="w")
         self.combo_b.grid(row=1, column=2, sticky="ew", padx=(8, 0))
+        # F-5: A-B difference trace. Styled like the Editor tab's FR
+        # PREVIEW toggles (Toggle.TCheckbutton) so the dialog matches the
+        # rest of the app; disabled until BOTH sides have usable curves.
+        self.diff_var = tk.BooleanVar(value=False)
+        self.diff_btn = ttk.Checkbutton(
+            pick_row, text="A \u2212 B", style="Toggle.TCheckbutton",
+            variable=self.diff_var, command=self._refresh)
+        self.diff_btn.grid(row=0, column=3, rowspan=2, sticky="e", padx=(8, 0))
 
         self.info_lbl = ttk.Label(card, text="", style="Card.TLabel",
                                   foreground=theme.TEXT_DIM,
@@ -174,6 +182,27 @@ class CurveCompareDialog(tk.Toplevel):
             return norms[0], 1, len(files)
         return fr_plot.average(norms), len(norms), len(files)
 
+    def _diff_curve(self, pts_a, pts_b):
+        """F-5: A-B on A's frequency grid over the overlap band. Returns
+        [(freq, a_minus_b)] (raw dB difference -- NOT re-normalized, so
+        the trace shows both tonal deviation AND level mismatch between
+        the two datasets), or [] when the ranges do not overlap."""
+        if not pts_a or not pts_b:
+            return []
+        lo = max(pts_a[0][0], pts_b[0][0])
+        hi = min(pts_a[-1][0], pts_b[-1][0])
+        if lo > hi:
+            return []
+        fa = [f for f, _ in pts_a if lo <= f <= hi]
+        sa = [d for f, d in pts_a if lo <= f <= hi]
+        fb = [f for f, _ in pts_b]
+        sb = [d for _, d in pts_b]
+        out = []
+        for f, a in zip(fa, sa):
+            b = fr_plot._interp_at(fb, sb, f)
+            out.append((f, a - b))
+        return out
+
     def _refresh(self):
         entry_a = self._entry_for_label(self.var_a.get())
         entry_b = self._entry_for_label(self.var_b.get())
@@ -186,6 +215,7 @@ class CurveCompareDialog(tk.Toplevel):
         pal = fr_plot.palette()
         series = []
         info_parts = []
+        curves = {}                # "A"/"B" -> normalized points
         for entry, color, tag in ((entry_a, pal[0], "A"), (entry_b, pal[1], "B")):
             if entry is None:
                 continue
@@ -200,6 +230,27 @@ class CurveCompareDialog(tk.Toplevel):
                 "{} -- {} of {} file(s) averaged.".format(label, used, total))
             series.append({"name": label, "pts": pts, "color": color,
                            "width": 4})
+            curves[tag] = pts
+
+        # F-5: A-B difference trace on top of the two curves
+        if self.diff_var.get() and "A" in curves and "B" in curves:
+            diff = self._diff_curve(curves["A"], curves["B"])
+            if diff:
+                series.append({
+                    "name": "A \u2212 B", "pts": diff,
+                    "color": theme.ACCENT_PURPLE,
+                    "width": 3, "dash": (5, 3)})
+                info_parts.append(
+                    "A \u2212 B: max {:+.1f} dB \u00b7 mean {:+.1f} dB".format(
+                        max(d for _, d in diff),
+                        sum(d for _, d in diff) / len(diff)))
+
+        # F-5: the toggle only does anything with BOTH curves present
+        try:
+            self.diff_btn.state(
+                ["!disabled"] if len(curves) == 2 else ["disabled"])
+        except Exception:
+            pass
 
         self.info_lbl.configure(
             text="   |   ".join(info_parts) if info_parts else

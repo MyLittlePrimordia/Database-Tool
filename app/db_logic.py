@@ -30,10 +30,13 @@ import io
 import json
 import math
 import gzip
+import time
 import zlib
 import shutil
 import difflib
 import datetime
+import hashlib
+import threading
 import unicodedata
 
 CURRENT_YEAR = datetime.datetime.now().year
@@ -41,6 +44,9 @@ CURRENT_YEAR = datetime.datetime.now().year
 # Upper bound for decompressed .json.gz payloads (the 100 MB raw-file cap
 # cannot see inside a compressed archive).
 MAX_DECOMPRESSED_BYTES = 256 * 1024 * 1024
+
+# L-4: rotate editor.log once it crosses this size.
+LOG_ROTATE_BYTES = 1024 * 1024
 
 # ==========================================================================
 # BEHAVIOR SWITCHES (defaults match ADD ENTRY PROMPT.txt / AUDIT PROMPT.txt)
@@ -67,7 +73,11 @@ LOG_DIR = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
 # Short-lived memo for data-folder walks: audit + file panel often ask
 # for the same directory within seconds of each other. Re-walking 11k
 # files twice is pure wasted I/O.
-_SCAN_CACHE = {"root": None, "time": 0, "on_disk": None, "data_dir": None}
+# L-7: stored as a tuple and swapped in ONE assignment (slice-assign on
+# the cache list) so a concurrent reader on another thread can never
+# observe a torn mix of old and new fields (the previous dict.update of
+# 4 keys was 4 separate stores).
+_SCAN_CACHE = [None, 0.0, None, None]     # [root, time, on_disk, data_dir]
 
 
 def scan_data_files(data_root):
@@ -75,10 +85,10 @@ def scan_data_files(data_root):
     ~2 s so concurrent callers (audit + file linker) share one walk."""
     import time
     now = time.time()
-    cached = _SCAN_CACHE
-    if cached["root"] == data_root and (now - cached["time"]) < 2.0 \
-            and cached["on_disk"] is not None:
-        return list(cached["on_disk"]), cached["data_dir"]
+    cached_root, cached_time, cached_files, cached_dir = _SCAN_CACHE
+    if cached_root == data_root and (now - cached_time) < 2.0 \
+            and cached_files is not None:
+        return list(cached_files), cached_dir
     data_dir = os.path.join(data_root, "data") if data_root else None
     on_disk = []
     if data_dir and os.path.isdir(data_dir):
@@ -97,7 +107,7 @@ def scan_data_files(data_root):
             and os.path.basename(os.path.normpath(data_root)).lower() == "data":
         # data_root itself is the data folder
         data_dir = data_root
-        base_root = os.path.dirname(data_root)
+        base_root = os.path.dirname(data_dir)
         for root, _, files in os.walk(data_dir):
             for fn in files:
                 if fn.lower().endswith(".txt"):
@@ -112,8 +122,7 @@ def scan_data_files(data_root):
     else:
         data_dir = None
         on_disk = []
-    cached.update({"root": data_root, "time": now,
-                   "on_disk": list(on_disk), "data_dir": data_dir})
+    _SCAN_CACHE[:] = (data_root, now, list(on_disk), data_dir)
     return on_disk, data_dir
 
 
@@ -125,10 +134,138 @@ def log(msg):
         pass
     try:
         os.makedirs(LOG_DIR, exist_ok=True)
-        with open(os.path.join(LOG_DIR, "editor.log"), "a", encoding="utf-8") as f:
+        path = os.path.join(LOG_DIR, "editor.log")
+        # L-4: bound the log to ~1 MB so an unattended install can't let
+        # it grow forever. Rotate once per process, on the first write
+        # that crosses the cap (rewrite side is atomic like every other
+        # writer in this module).
+        try:
+            if not getattr(log, "_rotated", False) and \
+                    os.path.isfile(path) and \
+                    os.path.getsize(path) > LOG_ROTATE_BYTES:
+                os.replace(path, path + ".old")
+            log._rotated = True
+        except OSError:
+            pass
+        with open(path, "a", encoding="utf-8") as f:
             f.write("[{}] {}\n".format(datetime.datetime.now().isoformat(timespec="seconds"), msg))
     except Exception:
         pass
+
+
+# --------------------------------------------------------------------------
+# ATOMIC WRITE HELPERS (DL-3 / DL-4 / L-1 / L-2 / L-3)
+# --------------------------------------------------------------------------
+# Every persistence writer in this module (and the exporters) goes through
+# replace_atomic: write to <path>.tmp, flush + fsync so the DATA blocks are
+# durable before the rename (os.replace only guarantees the rename itself
+# is atomic -- without fsync a power cut right after a "successful" save
+# can still leave a zero-length or garbage target on NTFS), then replace.
+#
+# On Windows, os.replace raises PermissionError when another process holds
+# the target open without FILE_SHARE_DELETE (the IEM Tool app reading
+# database.json, a text editor, a second editor instance, antivirus...).
+# A short bounded retry rides out transient open handles; when the file
+# stays locked we re-raise with a specific, actionable message (DL-4).
+
+REPLACE_RETRY_ATTEMPTS = 4
+REPLACE_RETRY_DELAY_S = 0.3
+
+
+class FileBusyError(OSError):
+    """The target file is held open by another process -- the caller can
+    present this message verbatim instead of a raw WinError string."""
+
+
+def _fsync_path(path):
+    """fsync a directory (POSIX; needed so the rename itself is durable).
+    Windows does not support opening directories this way -- a no-op there
+    (NTFS metadata journaling covers the rename)."""
+    if os.name != "posix":
+        return
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def replace_atomic(tmp_path, path):
+    """Durable rename with bounded retry against transient Windows
+    share-lock failures (DL-4). Raises FileBusyError when the target stays
+    locked, PermissionError/OSError otherwise."""
+    last_err = None
+    for attempt in range(REPLACE_RETRY_ATTEMPTS):
+        try:
+            os.replace(tmp_path, path)
+            _fsync_path(os.path.dirname(os.path.abspath(path)) or ".")
+            return
+        except PermissionError as e:
+            # Windows: ERROR_SHARING_VIOLATION / ACCESS_DENIED while the
+            # target is open in another process. Retry briefly -- readers
+            # usually let go within milliseconds.
+            last_err = e
+            if attempt < REPLACE_RETRY_ATTEMPTS - 1:
+                time.sleep(REPLACE_RETRY_DELAY_S)
+        except OSError as e:
+            # Non-Windows rename races (e.g. NFS silly-rename) also
+            # benefit from one quick retry before giving up.
+            last_err = e
+            if attempt < REPLACE_RETRY_ATTEMPTS - 1:
+                time.sleep(REPLACE_RETRY_DELAY_S)
+    target = os.path.basename(path)
+    raise FileBusyError(
+        "Could not replace '{}' -- the file is open in another program "
+        "(close the IEM Tool app / any editor showing it and try again).\n"
+        "({})".format(target, last_err))
+
+
+def write_text_atomic(path, text):
+    """Write UTF-8 text to `path` atomically and durably (tmp + fsync +
+    retrying replace). Cleans up its tmp file on any failure."""
+    tmp_path = path + ".tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        replace_atomic(tmp_path, path)
+    except Exception:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def write_bytes_atomic(path, payload):
+    """Binary twin of write_text_atomic (gzip exports)."""
+    tmp_path = path + ".tmp"
+    try:
+        with open(tmp_path, "wb") as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        replace_atomic(tmp_path, path)
+    except Exception:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def snapshot_entries(entries):
+    """M-7: independent, schema-clean copies of the entry list for handoff
+    to a worker thread (audit / export). build_clean_entry returns a fresh
+    dict with fresh tags/files lists, so the worker can never observe a
+    half-applied UI-thread mutation."""
+    return [build_clean_entry(e) for e in entries]
 
 
 # --------------------------------------------------------------------------
@@ -279,10 +416,31 @@ def normalize_component(text):
     return text
 
 
+def _nonlatin_digest(text):
+    """H-1: stable, short ASCII token derived from the raw UTF-8 bytes of a
+    component whose ASCII fold is empty (e.g. a fully Japanese/Cyrillic/
+    Greek brand). Two different non-Latin names hash to different tokens
+    with overwhelming probability, so deterministic ID collisions between
+    them are gone. Only ever used as a LAST RESORT component suffix --
+    existing all-Latin IDs are byte-identical to before."""
+    digest = hashlib.sha1(str(text).encode("utf-8", "surrogatepass")).hexdigest()
+    return "x" + digest[:6]
+
+
 def build_id(brand, model, variant):
-    comps = [normalize_component(brand), normalize_component(model)]
-    if variant and variant.strip():
-        comps.append(normalize_component(variant))
+    comps = []
+    for raw in (brand, model):
+        norm = normalize_component(raw)
+        if norm:
+            comps.append(norm)
+        elif raw and str(raw).strip():
+            # Non-Latin component: keep the ID unique per raw value instead
+            # of silently dropping it (which made every Japanese-brand entry
+            # with the same model collide on one ID).
+            comps.append(_nonlatin_digest(raw))
+    if variant and str(variant).strip():
+        vnorm = normalize_component(variant)
+        comps.append(vnorm if vnorm else _nonlatin_digest(variant))
     idstr = "_".join(c for c in comps if c)
     idstr = re.sub(r"_+", "_", idstr).strip("_")
     return idstr
@@ -889,7 +1047,11 @@ def save_database(path, entries):
         with open(tmp_path, "w", encoding="utf-8", newline="\n") as f:
             json.dump(ordered, f, indent=2, ensure_ascii=False)
             f.write("\n")
-        os.replace(tmp_path, path)
+            # DL-3: flush + fsync BEFORE the rename so the data blocks are
+            # durable; os.replace alone only makes the swap atomic.
+            f.flush()
+            os.fsync(f.fileno())
+        replace_atomic(tmp_path, path)
     except Exception:
         try:
             os.remove(tmp_path)
@@ -921,6 +1083,9 @@ def write_database_backup(db_path):
     BEFORE it gets overwritten by a save. A single rolling file (not a
     timestamped history) -- one clear safety copy of "the database as it
     was right before your last save", not a folder of ambiguous snapshots.
+    L-1: the copy is written to .bak.tmp and fsynced before replacing the
+    previous backup, so an interruption can never corrupt BOTH the live
+    database and its safety copy at once.
     Returns the backup path, or None when there was nothing to back up yet
     (first-ever save) or the copy failed (the save itself still proceeds --
     the periodic autosave snapshots are a second net)."""
@@ -930,10 +1095,19 @@ def write_database_backup(db_path):
     try:
         os.makedirs(bdir, exist_ok=True)
         dest = os.path.join(bdir, BACKUP_FILE_NAME)
-        shutil.copy2(db_path, dest)
+        tmp = dest + ".tmp"
+        with open(db_path, "rb") as src, open(tmp, "wb") as out:
+            shutil.copyfileobj(src, out, length=1024 * 1024)
+            out.flush()
+            os.fsync(out.fileno())
+        replace_atomic(tmp, dest)
         return dest
     except OSError as e:
         log("Database backup failed: {}".format(e))
+        try:
+            os.remove(os.path.join(bdir, BACKUP_FILE_NAME + ".tmp"))
+        except OSError:
+            pass
         return None
 
 
@@ -1044,33 +1218,114 @@ def unseen_autosave(db_path):
 # Those two keys exist purely as a same-session fast-path identity lookup
 # in _find_slot(); the id-based fallback _find_slot already has is exactly
 # what cross-session (file-based) replay uses, so persisting just the
-# deep-copied snapshots (copy_before/copy_after) plus pos_hint is enough to
+# snapshots (copy_before/copy_after) plus pos_hint is enough to
 # faithfully replay history after a restart. An op whose target entry can
 # no longer be located (e.g. the id was removed by something other than
 # undo/redo) is simply skipped when applied -- same as the existing
 # same-session behavior; history is a convenience, not a ledger.
+#
+# FORMAT v2 (M-4): instead of embedding two FULL entry copies per change
+# (which made a single Fix All of N entries serialize 2N complete entries
+# -- history.json ballooned to tens of MB and was rewritten from scratch
+# after every subsequent op), each change stores one op-level "id"
+# capture plus a FIELD-LEVEL DIFF of only the fields that actually
+# changed. An insert (add) stores the full new entry (it must, to be able
+# to re-materialize the entry on undo); a delete stores the full old
+# entry. Edits store {field: old_value} / {field: new_value} maps. This
+# keeps v2 files 5-50x smaller for bulk ops while remaining fully
+# replayable. v1 files (full copies, no version key or version==1) remain
+# readable: load_history accepts both formats; only writes are v2.
 HISTORY_FILENAME = "history.json"
-HISTORY_VERSION = 1
+HISTORY_VERSION = 2
 
 
 def history_path_for(db_path):
     return os.path.join(backup_dir_for(db_path), HISTORY_FILENAME)
 
 
+def _entry_diff(before, after):
+    """{field: old_value} / {field: new_value} maps for the fields that
+    differ between two entries (dict order = SCHEMA order)."""
+    olds, news = {}, {}
+    for f in SCHEMA_FIELDS:
+        b = before.get(f) if before else None
+        a = after.get(f) if after else None
+        if b != a:
+            olds[f] = b
+            news[f] = a
+    return olds, news
+
+
 def _op_to_json(op):
+    changes = []
+    for ch in op.get("changes", []):
+        cb, ca = ch.get("copy_before"), ch.get("copy_after")
+        if cb is None:
+            # insertion: keep the full new entry (undo must re-create it)
+            changes.append({
+                "pos_hint": ch.get("pos_hint"),
+                "action": "add",
+                "after": ca,
+            })
+        elif ca is None:
+            # deletion: keep the full old entry (redo must re-create it)
+            changes.append({
+                "pos_hint": ch.get("pos_hint"),
+                "action": "delete",
+                "before": cb,
+            })
+        else:
+            olds, news = _entry_diff(cb, ca)
+            if not olds:
+                continue            # no net change: nothing to persist
+            changes.append({
+                "pos_hint": ch.get("pos_hint"),
+                "action": "edit",
+                "id": cb.get("id"),
+                "old": olds,
+                "new": news,
+            })
     return {
         "kind": op.get("kind", ""),
         "desc": op.get("desc", ""),
         "when": op.get("when", ""),
-        "changes": [
-            {
-                "pos_hint": ch.get("pos_hint"),
-                "copy_before": ch.get("copy_before"),
-                "copy_after": ch.get("copy_after"),
-            }
-            for ch in op.get("changes", [])
-        ],
+        "changes": changes,
     }
+
+
+def _change_from_v2(raw_ch):
+    """Rebuild an in-memory change dict (ref_before/ref_after/copy_before/
+    copy_after) from one v2 change record. The rebuilt dicts can never
+    identity-match a live entry, so _find_slot() correctly falls through
+    to its id-based lookup -- exactly the cross-session behavior."""
+    action = raw_ch.get("action")
+    pos_hint = raw_ch.get("pos_hint") if isinstance(raw_ch.get("pos_hint"), int) else 0
+    if action == "add":
+        ca = raw_ch.get("after")
+        return {"pos_hint": pos_hint, "ref_before": None, "copy_before": None,
+                "ref_after": ca, "copy_after": ca} if isinstance(ca, dict) else None
+    if action == "delete":
+        cb = raw_ch.get("before")
+        return {"pos_hint": pos_hint, "ref_before": cb, "copy_before": cb,
+                "ref_after": None, "copy_after": None} if isinstance(cb, dict) else None
+    if action == "edit":
+        cb = raw_ch.get("before")     # absent in v2
+        olds = raw_ch.get("old") if isinstance(raw_ch.get("old"), dict) else {}
+        news = raw_ch.get("new") if isinstance(raw_ch.get("new"), dict) else {}
+        if not news:
+            return None
+        # Re-materialize full before/after copies so the in-memory replay
+        # path (which swaps whole entries) works unchanged: start from the
+        # "after" image, then back-apply the old values.
+        after = dict(news)
+        after.setdefault("id", raw_ch.get("id"))
+        before = dict(after)
+        for f, v in olds.items():
+            before[f] = v
+        return {"pos_hint": pos_hint,
+                "ref_before": before, "copy_before": before,
+                "ref_after": after, "copy_after": after}
+    return None
 
 
 def _op_from_json(raw):
@@ -1083,6 +1338,13 @@ def _op_from_json(raw):
     for ch in changes:
         if not isinstance(ch, dict):
             return None
+        if "action" in ch:
+            # v2 record
+            built = _change_from_v2(ch)
+            if built is not None:
+                out_changes.append(built)
+            continue
+        # v1 record (full copy_before/copy_after pair)
         cb, ca = ch.get("copy_before"), ch.get("copy_after")
         out_changes.append({
             "pos_hint": ch.get("pos_hint") if isinstance(ch.get("pos_hint"), int) else 0,
@@ -1112,8 +1374,8 @@ def write_history(db_path, history, redo_stack):
     if not db_path:
         return
     path = history_path_for(db_path)
-    parent = os.path.dirname(path)
     try:
+        parent = os.path.dirname(path)
         if parent and not os.path.isdir(parent):
             os.makedirs(parent, exist_ok=True)
         payload = {
@@ -1121,11 +1383,8 @@ def write_history(db_path, history, redo_stack):
             "history": [_op_to_json(op) for op in history],
             "redo_stack": [_op_to_json(op) for op in redo_stack],
         }
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(payload, f, indent=2, ensure_ascii=False)
-            f.write("\n")
-        os.replace(tmp, path)
+        write_text_atomic(
+            path, json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
     except OSError as e:
         log("History save failed: {}".format(e))
 
@@ -1234,13 +1493,10 @@ def save_waivers(db_path, waivers):
     parent = os.path.dirname(path)
     if parent and not os.path.isdir(parent):
         os.makedirs(parent, exist_ok=True)
-    tmp = path + ".tmp"
     payload = {"version": 1,
                "waived": sorted(str(w) for w in waivers if w)}
-    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
-        json.dump(payload, f, indent=2, ensure_ascii=False)
-        f.write("\n")
-    os.replace(tmp, path)
+    write_text_atomic(
+        path, json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
 
 
 # --------------------------------------------------------------------------
@@ -1265,6 +1521,10 @@ _GEN_TOKENS = {
 # SequenceMatcher ratio above which two same-brand names are considered
 # "very similar" (typos, restyled spellings).
 _DUP_MIN_RATIO = 0.84
+
+# M-5: cap on pairwise duplicate findings emitted per shared measurement
+# file. Beyond the cap the remaining pairs collapse into one summary row.
+DUP_PAIR_CAP_PER_FILE = 50
 
 
 def _dup_norm_name(entry):
@@ -1360,17 +1620,33 @@ def find_duplicate_pairs(entries, referenced_map=None):
     # -- signal 1: shared measurement files (strongest, any brand) --------
     # (Duplicate File Link already reports the overlap per entry; here it
     # upgrades the pair to a high-confidence duplicate candidate.)
+    # M-5: one file linked to K entries would otherwise emit K*(K-1)/2
+    # pair findings -- a mistakenly mass-linked file with hundreds of
+    # entries made the audit list unusable. The first pairs are emitted
+    # as normal; the remainder collapse into one summary row.
     shared_boost = set()
+    shared_pairs_emitted = 0
+    shared_overflow = []            # [(rel, n_entries)] for the summary row
     for rel, idxs in referenced_map.items():
         uniq = sorted(set(idxs))
         if len(uniq) < 2:
             continue
+        pair_count = len(uniq) * (len(uniq) - 1) // 2
+        if shared_pairs_emitted + pair_count > DUP_PAIR_CAP_PER_FILE:
+            shared_overflow.append((rel, len(uniq)))
+            continue
+        shared_pairs_emitted += pair_count
         for i in range(len(uniq)):
             for j in range(i + 1, len(uniq)):
                 key = (uniq[i], uniq[j])
                 shared_boost.add(key)
                 emit(uniq[i], uniq[j], "high",
                      ["both entries link measurement file '{}'".format(rel)])
+    for rel, n_entries in shared_overflow:
+        pending.append((0, -1, -1, "high",
+                        ["mass-link", "{} entries share measurement file '{}' "
+                         "-- review the Duplicate File Link rows for '{}' "
+                         "instead of this pairwise list".format(n_entries, rel, rel)]))
 
     # -- signal 2: same-brand name similarity -----------------------------
     by_brand = {}
@@ -1506,6 +1782,17 @@ def find_duplicate_pairs(entries, referenced_map=None):
     # materialize findings best-first (high confidence at the top)
     pending.sort(key=lambda t: (t[0], t[1], t[2]))
     for rank, idx_a, idx_b, confidence, reasons in pending:
+        if idx_a < 0 or idx_b < 0:
+            # mass-link summary row (M-5): standalone, not a mergeable pair
+            detail = reasons[1] if len(reasons) > 1 else "; ".join(reasons)
+            issues.append(AuditIssue(
+                "Possible Duplicate", -1, "(summary)",
+                "Possible duplicate (high confidence): mass-linked "
+                "measurement file. {} Review the Duplicate File Link rows "
+                "for the file instead of this pairwise list.".format(detail),
+                severity="warning", code="dup-masslink",
+                subject="dup|mass|{}".format(detail[:80])))
+            continue
         a, b = entries[idx_a], entries[idx_b]
         id_a = a.get("id") or "entry #{}".format(idx_a)
         id_b = b.get("id") or "entry #{}".format(idx_b)
@@ -1629,6 +1916,25 @@ def run_full_audit(entries, data_root=None):
                 fix=make_fix(entry, real_id or eid, idx,
                              lambda en, exp=expected_id: en.__setitem__("id", exp)),
             ))
+
+        # H-1: surface non-Latin identity components explicitly. Their
+        # ASCII fold is empty, so the generated id carries an opaque hash
+        # suffix instead of the brand/model spelling. Never auto-fixed:
+        # the correct romanization is a human decision (the auto-fix
+        # would just re-apply the same hashed id).
+        for fname, fval in (("brand", entry.get("brand")),
+                            ("model", entry.get("model")),
+                            ("variant", entry.get("variant"))):
+            val = str(fval or "").strip()
+            if val and not normalize_component(val):
+                issues.append(AuditIssue(
+                    "ID Format", idx, eid,
+                    "{} '{}' has no Latin-alphabet spelling -- its id uses a "
+                    "hash fallback ('{}'). Add an official romanization to "
+                    "keep the id readable and stable.".format(
+                        fname.capitalize(), val, expected_id or "(no id)"),
+                    severity="warning", code="id-nonlatin",
+                ))
 
         if idx in _brand_fixes:
             current, canonical, summary = _brand_fixes[idx]

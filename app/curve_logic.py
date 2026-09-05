@@ -122,26 +122,39 @@ def _split_fields(stripped):
     return fields
 
 
-def _looks_like_date_triple(nums):
+def _looks_like_date_triple(rows, nums):
     """'2023,05,01'-style metadata lines: three BARE-INTEGER fields whose
     first looks like a calendar year and whose next two fit month/day.
     A real measurement row satisfying every constraint at once (integer
     frequency in 1900-2100, integer month-range SPL, integer day-range
-    phase) is vanishingly unlikely, while CSV date stamps are common."""
+    phase) is vanishingly unlikely, while CSV date stamps are common.
+    L-8: triple candidate rows are only dropped when they ALSO look like
+    part of a date-stamped header block -- i.e. the file contains at
+    least one other data row outside the year range for the frequency
+    column (a 20 Hz..20 kHz sweep ALWAYS has one). A pathological but
+    legitimate measurement whose every row fits the triple shape keeps
+    its low-frequency points instead of losing them all."""
     if len(nums) != 3:
         return False
-    freq, spl, phase = nums
-    for v in (freq, spl, phase):
-        if not float(v).is_integer():
+    for v in nums:
+        if v is None or not float(v).is_integer():
             return False
-    return (1900 <= freq <= 2100 and 1 <= spl <= 12 and 1 <= phase <= 31)
+    freq, spl, phase = nums
+    if not (1900 <= freq <= 2100 and 1 <= spl <= 12 and 1 <= phase <= 31):
+        return False
+    # only treat it as a date when the file proves it is one: a real
+    # sweep has rows above 2100 Hz or below 1900 Hz somewhere.
+    has_real_row = any(
+        (r[0] < 1900 or r[0] > 2100) for r in rows) if rows else False
+    return has_real_row
 
 
-def try_parse_data_row(line):
+def try_parse_data_row(line, rows=None):
     """Look at one line and decide if it's a real curve data row: freq,
     amplitude, and optionally phase. Returns (freq, spl, phase) or None
     if the line isn't a data row (header, comment, metadata, blank...).
-    """
+    `rows` (candidate rows collected so far) feeds the date-triple
+    corroboration check -- see _looks_like_date_triple."""
     stripped = line.strip()
     if not stripped:
         return None
@@ -160,7 +173,7 @@ def try_parse_data_row(line):
     if len(nums) < 2:
         return None
 
-    if _looks_like_date_triple(nums):
+    if _looks_like_date_triple(rows, nums):
         return None
 
     freq, spl = nums[0], nums[1]
@@ -195,13 +208,17 @@ def parse_curve_file(path):
     delimiter, or surrounding metadata. Returns a list of
     (freq, spl, phase_or_None) tuples sorted ascending by frequency with
     duplicate frequencies collapsed.
-    """
-    rows = []
+    L-8: date-triple detection needs to see whether the file holds any
+    REAL sweep rows before dropping a candidate; rows are therefore
+    collected first and the date filter runs on the collected set."""
+    candidates = []
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         for line in f:
-            row = try_parse_data_row(line)
+            row = try_parse_data_row(line, rows=candidates)
             if row is not None:
-                rows.append(row)
+                candidates.append(row)
+    rows = [r for r in candidates
+            if not _looks_like_date_triple(candidates, r)]
     return _sort_and_dedupe_rows(rows)
 
 
@@ -291,9 +308,13 @@ def average_group(file_rows_list):
 
 
 def write_output(path, freq_spl_rows):
-    with open(path, "w", encoding="utf-8") as f:
-        for freq, spl in freq_spl_rows:
-            f.write("{:.6f}\t{:.3f}\n".format(freq, spl))
+    """Write the standardized two-column format atomically (L-2): a
+    conversion interrupted mid-write can never leave a half-written
+    measurement file for the linker to pick up."""
+    import db_logic as L
+    lines = ["{:.6f}\t{:.3f}\n".format(freq, spl)
+             for freq, spl in freq_spl_rows]
+    L.write_text_atomic(path, "".join(lines))
 
 
 # --------------------------------------------------------------------------

@@ -65,17 +65,10 @@ def compress_to_gz(entries=None, external_path=None, dest_dir=None):
     gz_path = os.path.join(dest_dir, GZ_NAME)
 
     payload = gzip.compress(raw, compresslevel=9)
-    tmp_path = gz_path + ".tmp"
-    try:
-        with open(tmp_path, "wb") as f:
-            f.write(payload)
-        os.replace(tmp_path, gz_path)
-    except Exception:
-        try:
-            os.remove(tmp_path)
-        except OSError:
-            pass
-        raise
+    # M-8: atomic + durable (fsync before replace) so a compression run
+    # interrupted at the worst moment can never leave a truncated .gz
+    # for the IEM Tool to download.
+    L.write_bytes_atomic(gz_path, payload)
     return gz_path, len(raw), len(payload)
 
 
@@ -155,10 +148,12 @@ def split_into_chunks(entries=None, external_path=None,
         # it needs 2 extra spaces.
         def _indent_item(s):
             return "\n".join(("  " + line) if line else line for line in s.split("\n"))
-        with open(out_path, "w", encoding="utf-8") as f:
-            f.write("[\n")
-            f.write(",\n".join(_indent_item(j) for j in current_chunk_jsons))
-            f.write("\n]\n")
+        # M-8: write chunks atomically too -- an interrupted split run
+        # used to leave a truncated chunk that a later AI audit batch
+        # would happily ingest.
+        text = "[\n" + ",\n".join(
+            _indent_item(j) for j in current_chunk_jsons) + "\n]\n"
+        L.write_text_atomic(out_path, text)
         log("  Created: {}  ({} entries, ~{} tokens)".format(
             out_name, len(current_chunk), current_tokens))
         chunks_created += 1

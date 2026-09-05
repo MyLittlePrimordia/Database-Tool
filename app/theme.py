@@ -210,10 +210,15 @@ def _load_settings():
 
 
 def _save_settings():
+    # L-3: atomic write so an interrupted theme switch can never corrupt
+    # settings.json into an unparseable file (a corrupt file would just
+    # fall back to defaults, but a HALF-written one that still parses
+    # would silently persist a torn palette id).
     try:
+        import db_logic as _L
         os.makedirs(os.path.dirname(SETTINGS_PATH), exist_ok=True)
-        with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
-            json.dump(_settings, f, indent=2)
+        _L.write_text_atomic(
+            SETTINGS_PATH, json.dumps(_settings, indent=2) + "\n")
     except Exception:
         pass
 

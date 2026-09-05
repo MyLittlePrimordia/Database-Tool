@@ -9,12 +9,45 @@ name: Build Database Tool
 on:
   workflow_dispatch: {}
   push:
+    branches:
+      - "**"
     tags:
       - "v*"
+  pull_request:
+    paths:
+      - "app/**"
+      - ".github/workflows/build.yml"
 
 jobs:
+  # F2 -- automated schema-validation & regression suite. Pure-logic
+  # tests (no display needed); runs on all three OSes before any build
+  # so a broken patch can never ship an artifact.
+  tests:
+    name: Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install pytest
+        run: python -m pip install --upgrade pip pytest
+
+      - name: Run test suite
+        run: python -m pytest tests -q
+
   windows:
     name: Windows (.exe)
+    needs: tests
     runs-on: windows-latest
     defaults:
       run:
@@ -32,13 +65,18 @@ jobs:
       - name: Build .exe
         run: python -m PyInstaller --onefile --windowed --name "Database Tool" --icon "assets/icon.ico" --add-data "assets;assets" main.py
 
+      - name: Rename to Database-Tool.exe
+        run: Move-Item -LiteralPath "dist\Database Tool.exe" -Destination "dist\Database-Tool.exe" -Force
+
       - uses: actions/upload-artifact@v4
         with:
           name: Database-Tool-windows
-          path: app/dist/Database Tool.exe
+          path: app/dist/Database-Tool.exe
+          if-no-files-found: error
 
   macos:
     name: macOS (.dmg)
+    needs: tests
     runs-on: macos-latest
     defaults:
       run:
@@ -65,13 +103,21 @@ jobs:
           chmod +x build_macos.sh
           PYTHON=python3.12 ./build_macos.sh
 
+      - name: Rename to Database-Tool.dmg (only file kept)
+        run: |
+          mv -f "dist/Database_Tool.dmg" "dist/Database-Tool.dmg"
+          rm -rf build "Database Tool.spec" "dist/Database Tool.app"
+          ls -l dist
+
       - uses: actions/upload-artifact@v4
         with:
           name: Database-Tool-macos
-          path: app/dist/*.dmg
+          path: app/dist/Database-Tool.dmg
+          if-no-files-found: error
 
   linux:
     name: Linux (.AppImage)
+    needs: tests
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -96,7 +142,14 @@ jobs:
           chmod +x build_linux_appimage.sh
           ./build_linux_appimage.sh
 
+      - name: Rename to Database-Tool.appimage (only file kept)
+        run: |
+          mv -f "dist/Database_Tool.AppImage" "dist/Database-Tool.appimage"
+          rm -rf build AppDir Database_Tool.spec appimagetool.AppImage "dist/Database_Tool"
+          ls -l dist
+
       - uses: actions/upload-artifact@v4
         with:
           name: Database-Tool-linux
-          path: app/dist/*.AppImage
+          path: app/dist/Database-Tool.appimage
+          if-no-files-found: error

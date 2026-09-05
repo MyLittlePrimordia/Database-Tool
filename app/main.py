@@ -24,6 +24,7 @@ import sys
 import time
 import datetime
 import threading
+import unicodedata
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
@@ -710,7 +711,17 @@ class AutocompleteEntry(ttk.Frame):
         x = self.entry.winfo_rootx()
         y = self.entry.winfo_rooty() + self.entry.winfo_height()
         w = max(self.entry.winfo_width(), 160)
-        self.popup.geometry("{}x{}+{}+{}".format(w, min(8, len(items)) * 20, x, y))
+        # L-6: derive the row height from the ACTUAL listbox font instead
+        # of a fixed 20 px guess -- a taller OS/bundled font made the last
+        # suggestion row clip out of the popup window.
+        try:
+            import tkinter.font as tkfont
+            fnt = tkfont.Font(font=self.listbox.cget("font"))
+            row_px = max(18, fnt.metrics("linespace") + 4)
+        except Exception:
+            row_px = 20
+        self.popup.geometry("{}x{}+{}+{}".format(
+            w, row_px * min(8, len(items)), x, y))
         self.popup.deiconify()
 
     def _hide_popup(self):
@@ -833,15 +844,39 @@ def entry_matches_query(entry, query):
 # ---------------------------------------------------------------------------
 # TEXT OVERFLOW HELPERS (ellipsization + delayed hover tooltip)
 # ---------------------------------------------------------------------------
+def _display_width(text):
+    """L-5: display-cell width of `text`. Characters rendered double-wide
+    (CJK ideographs, kana, full-width forms -- exactly the characters
+    international brand/model names are made of) count as two cells, so
+    len()-based ellipsize budgets stop clipping them."""
+    extra = 0
+    for ch in text:
+        if unicodedata.east_asian_width(ch) in ("W", "F"):
+            extra += 1
+    return len(text) + extra
+
+
 def ellipsize(text, max_chars):
-    """Truncate `text` to `max_chars` display cells with a trailing ellipsis."""
+    """Truncate `text` to `max_chars` display cells with a trailing
+    ellipsis. Budgets are display cells (CJK-aware), not len() -- see
+    _display_width."""
     if not text:
         return text
-    if max_chars is None or len(text) <= max_chars:
+    if max_chars is None or _display_width(text) <= max_chars:
         return text
     if max_chars < 2:
         return text[:1]
-    return text[:max_chars - 1].rstrip() + "\u2026"
+    # walk from the front accumulating display cells until the ellipsis
+    # would overflow; wide chars consume two cells.
+    used = 0
+    cut = len(text)
+    for i, ch in enumerate(text):
+        w = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+        if used + w > max_chars - 1:
+            cut = i
+            break
+        used += w
+    return text[:cut].rstrip() + "\u2026"
 
 
 def ellipsize_path(text, max_chars):
@@ -849,14 +884,26 @@ def ellipsize_path(text, max_chars):
     intact (...\u2026/ADEN/AB123_measurement.txt). Measurement paths
     mostly share the same leading "data/..." folder, so tail-ellipsizing
     (the general ellipsize() above) hid the one part -- the filename --
-    that actually tells rows apart."""
+    that actually tells rows apart. CJK-aware like ellipsize()."""
     if not text:
         return text
-    if max_chars is None or len(text) <= max_chars:
+    if max_chars is None or _display_width(text) <= max_chars:
         return text
     if max_chars < 4:
         return ellipsize(text, max_chars)
-    return "\u2026" + text[-(max_chars - 1):]
+    # walk from the back accumulating display cells (keep the tail, which
+    # holds the filename, intact)
+    used = 1            # the leading ellipsis cell
+    cut = 0
+    for i in range(len(text) - 1, -1, -1):
+        ch = text[i]
+        w = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+        if used + w > max_chars - 1:
+            cut = i + 1
+            break
+        used += w
+        cut = i
+    return "\u2026" + text[cut:] if cut > 0 else text[:max_chars - 1] + "\u2026"
 
 
 class HoverTooltip:
@@ -928,7 +975,7 @@ class HoverTooltip:
 class DriverConfigPanel(ttk.Frame):
     def __init__(self, parent, on_change=None):
         # borderless card surface: the make_card() wrapper supplies the
-        # 1px border + offset shadow (Card.TFrame here would double it)
+        # 1px border + offset shadow (CardFlat.TFrame here would double it)
         super().__init__(parent, style="CardFlat.TFrame")
         self.on_change = on_change
         self.counts = {}          # tech -> StringVar("0".."16"); 0 = unused
@@ -936,6 +983,13 @@ class DriverConfigPanel(ttk.Frame):
         self.labels = {}          # tech -> clickable icon+name label
         self._tech_frames = {}
         self._cols = 2            # current grid columns (responsive)
+        # M-6: raw pass-through. When an entry's driver_config contains
+        # unknown token(s) (external/AI data like "1DD+2microPE"), the
+        # steppers cannot represent them -- recomputing the config on load
+        # used to silently DELETE the unknown part on the next unrelated
+        # Save Entry. The raw string is preserved untouched until the user
+        # actually bumps a count (their edit is then explicit).
+        self._raw_config = ""
 
         ttk.Label(self, text="DRIVER CONFIGURATION", style="CardHeader.TLabel").grid(
             row=0, column=0, columnspan=4, sticky="w", padx=8, pady=(8, 4))
@@ -1014,12 +1068,14 @@ class DriverConfigPanel(ttk.Frame):
         c = max(0, min(16, self._count(tech) + delta))
         self.counts[tech].set(str(c))
         self._refresh_row(tech)
+        self._raw_config = ""     # user acted: recomputed config is intentional
         self._recompute()
 
     def _toggle(self, tech):
         # click the name: 0 <-> 1
         self.counts[tech].set("0" if self._count(tech) > 0 else "1")
         self._refresh_row(tech)
+        self._raw_config = ""     # user acted: recomputed config is intentional
         self._recompute()
 
     def _recompute(self):
@@ -1033,18 +1089,32 @@ class DriverConfigPanel(ttk.Frame):
             self.on_change(dtype, dconfig)
 
     def get(self):
+        # M-6: untouched panel + loaded config with unknown tokens ->
+        # pass the ORIGINAL string through verbatim (no silent data
+        # loss). Any user interaction with the steppers clears the raw
+        # string and recomputes as before.
+        if self._raw_config:
+            parsed = L.parse_driver_config(self._raw_config)
+            dtype, _dconfig = L.classify_driver(parsed) if parsed \
+                else ("", "")
+            return dtype, self._raw_config
         components = {t: self._count(t) for t in self.counts
                       if self._count(t) > 0}
         return L.classify_driver(components)
 
     def set(self, driver_type, driver_config):
-        parsed = L.parse_driver_config(driver_config)
+        raw = str(driver_config or "")
+        unknown = L.driver_config_unknown_tokens(raw) if raw else []
+        # preserve unknown-token configs verbatim until the user edits
+        self._raw_config = raw if unknown else ""
+        parsed = L.parse_driver_config(raw)
         for tech in self.counts:
             self.counts[tech].set(str(parsed.get(tech, 0)))
             self._refresh_row(tech)
         self._recompute()
 
     def clear(self):
+        self._raw_config = ""
         self.set("", "")
 
 
@@ -3960,7 +4030,9 @@ class MainApp(tk.Tk):
             return
         if len(dbs) == 1:
             if messagebox.askyesno(APP_TITLE,
-                                   "Open the dropped database?\n\n{}".format(dbs[0])):
+                                    "Open the dropped database?\n\n{}".format(dbs[0])):
+                # _load_from_path re-checks unsaved work (DL-1); the drop
+                # itself only asks whether the file was meant for us.
                 self._load_from_path(dbs[0])
             return
         if dbs:
@@ -4406,7 +4478,9 @@ class MainApp(tk.Tk):
         vsb.grid(row=0, column=1, sticky="ns")
         attach_touch_scroll(self.tree)
         self._full_labels = {}
+        self._disp_cache = {}        # iid -> last display text (M-3)
         self._ellipsis_after = None
+        self._ellipsis_fp = None     # (width, char_px) of the last pass
         self.tree.bind("<Configure>", self._schedule_ellipsis, add="+")
         HoverTooltip(self.tree, self._tree_full_text_at)
         self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
@@ -4573,12 +4647,29 @@ class MainApp(tk.Tk):
             "Use Save As... to save to a different file/location "
             "instead.".format(APP_TITLE, APP_VERSION))
 
+    def _flush_pending_autosave(self):
+        """True when the coalescing autosave has a snapshot that was
+        scheduled but not yet written at exit (DL-5): those bytes are the
+        only copy of committed-but-unsaved work, so they must reach disk
+        before the window goes away. A session that is clean (or was just
+        saved through the exit prompt) has nothing pending -- writing a
+        fresh snapshot anyway used to fabricate a phantom 'recovery'
+        prompt on every next launch."""
+        after = getattr(self, "_as_after", None)
+        return after is not None
+
     def _autosave_flush_sync(self):
         """Synchronous flush used on exit: capture any pending coalesced
         snapshot and write it immediately on the UI thread so it cannot be
-        lost when the daemon thread is killed at destroy()."""
+        lost when the daemon thread is killed at destroy(). Only runs when
+        there IS something to flush (dirty session or a pending coalesced
+        snapshot) -- a clean exit must not mint a new autosave file, or
+        the next launch greets the user with a bogus recovery prompt for
+        content identical to database.json."""
         self._as_after = None
         if not self.entries or not self.db_path:
+            return
+        if not self.dirty and not self._flush_pending_autosave():
             return
         # Ensure structures exist even if no prior autosave was scheduled
         if "_as_lock" not in self.__dict__:
@@ -4602,14 +4693,62 @@ class MainApp(tk.Tk):
         try:
             with _autosave_lock:
                 L.write_autosave(db_path, snapshot)
+            # The snapshot content is now the same as what the next launch
+            # would compare against the (saved or unchanged) database --
+            # mark it seen so it is never offered as "recovery".
+            L.mark_autosave_seen(db_path)
         except Exception as e:
             L.log("Autosave (sync) failed: {}".format(e))
 
-    def _on_close(self):
+    def _confirm_discard_unsaved(self, action_desc):
+        """Shared dirty-state gate (DL-1 / DL-2). Returns True when it is
+        OK to proceed with `action_desc` (which would discard unsaved
+        work); False when the user refused. Covers BOTH layers of unsaved
+        work: committed-but-unsaved entries (self.dirty) and edits sitting
+        in the editor form that were never committed at all."""
+        blocks = False
         if self.dirty:
+            blocks = True
+        else:
+            try:
+                if self.editor.form_is_dirty():
+                    blocks = True
+            except Exception:
+                pass
+        if not blocks:
+            return True
+        detail = ""
+        if self.dirty:
+            detail += "\n\u2022 {} unsaved database change(s) (Save covers these).".format(
+                "There are" if self.dirty else "")
+        try:
+            if self.editor.form_is_dirty():
+                detail += "\n\u2022 unsaved changes in the entry form (never " \
+                          "committed -- Save Entry covers these)."
+        except Exception:
+            pass
+        return messagebox.askyesno(
+            APP_TITLE,
+            "You have unsaved work.{}\n\n{} will discard it. Continue?".format(
+                detail, action_desc))
+
+    def _on_close(self):
+        # DL-2: guard BOTH layers of unsaved work. self.dirty covers
+        # committed-but-unsaved entries; the form may additionally hold
+        # uncommitted edits that no autosave has ever captured.
+        form_dirty = False
+        try:
+            form_dirty = self.editor.form_is_dirty()
+        except Exception:
+            pass
+        if self.dirty or form_dirty:
             resp = messagebox.askyesnocancel(
                 APP_TITLE,
-                "You have unsaved changes. Save before exiting?\n\nYes = Save, No = Exit without saving, Cancel = Stay.")
+                "You have unsaved changes. Save before exiting?\n\n"
+                "Yes = Save, No = Exit without saving, Cancel = Stay."
+                + ("\n\n(The entry form also has uncommitted edits -- Yes "
+                   "saves the database, those form edits are lost.)"
+                   if form_dirty and not self.dirty else ""))
             if resp is None:
                 return
             if resp:
@@ -4656,7 +4795,13 @@ class MainApp(tk.Tk):
             return
         self._load_from_path(path)
 
-    def _load_from_path(self, path):
+    def _load_from_path(self, path, _guard_dirty=True):
+        # DL-1: opening another database replaces every entry in memory.
+        # Without this guard, uncommitted work (entries not yet Saved plus
+        # edits sitting in the form) was silently destroyed.
+        if _guard_dirty and not self._confirm_discard_unsaved(
+                "Opening a different database"):
+            return
         # crash-recovery: offer the newest unseen autosave snapshot first
         load_from = path
         restored = False
@@ -4692,8 +4837,15 @@ class MainApp(tk.Tk):
         # the user opened (or auto-load found only) the .gz archive: the
         # .gz is a compiled export artifact the app regenerates on every
         # save, never something it edits/overwrites/backs-up in place.
-        if path.lower().endswith(".gz") and path.lower().endswith(".json.gz"):
-            self.db_path = path[:-3]  # "database.json.gz" -> "database.json"
+        # L-9: ONLY a trailing ".json.gz" is stripped to its .json twin --
+        # a plain ".gz" (e.g. "backup.gz") is NOT a database.json sibling,
+        # and writing raw JSON under a .gz name would hand the IEM Tool a
+        # file it tries to gunzip. Force Save As for anything else.
+        lower = path.lower()
+        if lower.endswith(".json.gz"):
+            self.db_path = path[:-3]      # "database.json.gz" -> "database.json"
+        elif lower.endswith(".gz"):
+            self.db_path = None            # unknown archive: pick a real target on save
         else:
             self.db_path = path
         self.data_root = os.path.dirname(os.path.abspath(path))
@@ -4846,16 +4998,43 @@ class MainApp(tk.Tk):
         database.json.gz right alongside it. Returns (ordered_entries,
         backup_path_or_None, gz_path_or_None). Raises on the primary
         save failing; a gzip failure is logged but never blocks the save
-        that already succeeded."""
+        that already succeeded.
+        M-1: the primary JSON write stays on the UI thread (it must be
+        durable before anything else believes the save happened, and the
+        exit path joins it), but the .gz refresh now runs on a worker
+        thread so a 10k-entry catalog does not freeze the window for the
+        duration of a level-9 gzip pass."""
         snap = L.write_database_backup(path)
-        ordered = L.save_database(path, self.entries)
-        gz_path = None
+        # M-1: immediate feedback before the (potentially long) write.
+        self.status_var.set("Saving {} entries to {}...".format(
+            len(self.entries), path))
         try:
-            gz_path, _raw, _gz = EX.compress_to_gz(
-                entries=ordered, dest_dir=os.path.dirname(os.path.abspath(path)))
+            self.update_idletasks()
+        except Exception:
+            pass
+        ordered = L.save_database(path, self.entries)
+        # Independent snapshot: the worker thread serializes these while
+        # the UI thread may keep committing edits (same isolation the
+        # Export tab uses).
+        gz_snapshot = [L.build_clean_entry(e) for e in ordered]
+        gz_dest = os.path.dirname(os.path.abspath(path))
+        th = threading.Thread(target=self._refresh_gz_background,
+                              args=(gz_snapshot, gz_dest), daemon=True,
+                              name="gz-refresh")
+        th.start()
+        return ordered, snap, None
+
+    def _refresh_gz_background(self, snapshot, dest_dir):
+        """Worker: rebuild database.json.gz from an independent snapshot.
+        Failures are logged only -- the save that triggered this already
+        succeeded, and _after_save/status will note the result."""
+        try:
+            with _autosave_lock:
+                gz_path, _raw, _gz = EX.compress_to_gz(
+                    entries=snapshot, dest_dir=dest_dir)
+            L.log("Auto database.json.gz refresh OK ({})".format(gz_path))
         except Exception as e:  # noqa: BLE001 - never let gzip block a save
             L.log("Auto database.json.gz refresh failed: {}".format(e))
-        return ordered, snap, gz_path
 
     def _after_save(self, path, ordered, snap, gz_path, extra_note=""):
         self.entries = ordered
@@ -4883,6 +5062,8 @@ class MainApp(tk.Tk):
         if self.editing_index is not None:
             iid = "entry:{}".format(self.editing_index)
             try:
+                # F-8: mount the row's (virtualized) brand page first
+                self._ensure_entry_visible(iid)
                 self.tree.selection_set(iid)
                 self.tree.see(iid)
             except Exception:
@@ -4891,8 +5072,9 @@ class MainApp(tk.Tk):
         if snap:
             note += "  (previous version backed up to {})".format(
                 os.path.relpath(snap, os.path.dirname(path)))
-        if gz_path:
-            note += "  \u2022 {} refreshed".format(os.path.basename(gz_path))
+        # the .gz refresh runs on a background thread (M-1) and reports
+        # through the log; the status line no longer waits for it.
+        note += "  \u2022 database.json.gz refreshing in background"
         self.status_var.set("Saved {} entries to {}{}".format(
             len(ordered), path, note))
         self._notify_db_changed()
@@ -4908,6 +5090,16 @@ class MainApp(tk.Tk):
             return
         try:
             ordered, snap, gz_path = self._write_database_to(self.db_path)
+        except L.FileBusyError as e:
+            # DL-4: another process (IEM Tool, editor, second instance)
+            # holds database.json open. The database on disk is untouched;
+            # nothing was lost.
+            self.status_var.set("Save blocked: database.json is open in another program.")
+            messagebox.showerror(APP_TITLE, "Could not save:\n\n{}\n\n"
+                                 "Your changes are still here in the editor "
+                                 "-- close the other program and press Save "
+                                 "again.".format(e))
+            return
         except OSError as e:
             messagebox.showerror(APP_TITLE, "Failed to save:\n{}".format(e))
             return
@@ -4933,6 +5125,13 @@ class MainApp(tk.Tk):
             os.path.normcase(os.path.abspath(self.db_path))
         try:
             ordered, snap, gz_path = self._write_database_to(path)
+        except L.FileBusyError as e:
+            self.status_var.set("Save blocked: the target file is open in another program.")
+            messagebox.showerror(APP_TITLE, "Could not save:\n\n{}\n\n"
+                                 "Your changes are still here in the editor "
+                                 "-- close the other program and try "
+                                 "again.".format(e))
+            return
         except OSError as e:
             messagebox.showerror(APP_TITLE, "Failed to save:\n{}".format(e))
             return
@@ -4982,33 +5181,45 @@ class MainApp(tk.Tk):
                 prev_sel_id = None
         self.tree.delete(*self.tree.get_children())
         self._full_labels = {}
+        self._disp_cache = {}        # labels all changed: reset display cache
+        self._ellipsis_fp = None
         query = self.search_var.get().strip().lower()
         by_brand = {}
         for idx, e in enumerate(self.entries):
             if query and not entry_matches_query(e, query):
                 continue
             by_brand.setdefault(e.get("brand", "(no brand)"), []).append(idx)
+        # F-8 virtualized rendering: brands are inserted WITHOUT their
+        # (potentially hundreds of) entry rows; a brand's children are
+        # materialized on demand the first time it is expanded (see
+        # _on_brand_expand). This keeps a 50k-entry catalog's rebuild cost
+        # proportional to the number of BRANDS (~hundreds), not entries,
+        # while remaining a plain Treeview to every other consumer (iids,
+        # selection, tooltips and the marquee work unchanged). Search mode
+        # materializes everything up front so hits are visible immediately.
+        self._all_brand_nodes = {}    # brand iid -> [entry idx]
+        self._materialized = set()   # brand iids whose children exist
         for brand in sorted(by_brand.keys(), key=str.lower):
             idxs = by_brand[brand]
             brand_text = "{}  ({})".format(brand, len(idxs))
             node = self.tree.insert("", "end", iid="brand:{}".format(brand),
-                                     text=brand_text, open=bool(query))
+                                     text=brand_text,
+                                     # search mode must show hits directly:
+                                     # materialize everything up front so an
+                                     # open brand reveals its children
+                                     open=bool(query))
             self._full_labels[node] = brand_text
-            for idx in sorted(idxs, key=lambda i: L.sort_key(self.entries[i])):
-                e = self.entries[idx]
-                # Model [Variant] only -- the internal id stays out of the
-                # row text (cleaner tree); it is still one lookup away and
-                # is shown in the hover tooltip instead.
-                label = e.get("model", "")
-                if e.get("variant"):
-                    label += "  [{}]".format(e["variant"])
-                iid = "entry:{}".format(idx)
-                self._full_labels[iid] = label
-                self.tree.insert(node, "end", iid=iid, text=label)
+            self._all_brand_nodes[node] = idxs
+            if query:
+                self._materialize_brand(node, idxs)
         # restore what we captured (only where still valid after rebuild)
         for iid in self.tree.get_children(""):
             if iid in prev_open:
                 self.tree.item(iid, open=True)
+                # F-8: a previously expanded brand needs its (virtual)
+                # children mounted again after the rebuild
+                if iid in self._all_brand_nodes and iid not in self._materialized:
+                    self._materialize_brand(iid, self._all_brand_nodes[iid])
         if 0.0 < prev_scroll < 1.0:
             try:
                 self.tree.yview_moveto(prev_scroll)
@@ -5024,13 +5235,79 @@ class MainApp(tk.Tk):
                     same = self.entries[
                         int(prev_sel_iid.split(":", 1)[1])].get("id") == prev_sel_id
                     if same:
+                        self._ensure_entry_visible(prev_sel_iid)
                         self.tree.selection_set(prev_sel_iid)
                         sel_ok = True
                 except Exception:
                     sel_ok = False
             if not sel_ok and prev_sel_iid.startswith("entry:"):
                 pass    # row moved/gone: caller decides what to highlight
+        # F-8: lazy-expansion hook (idempotent rebinding)
+        self.tree.bind("<<TreeviewOpen>>", self._on_brand_expand)
         self._apply_ellipsis()
+
+    # ------------------------------------------------------------------
+    # F-8: virtualized brand nodes
+    # ------------------------------------------------------------------
+    def _materialize_brand(self, brand_iid, idxs):
+        """Insert the entry rows under one brand node (its virtual page).
+        Idempotent: skipped for brands that are already materialized."""
+        if brand_iid in self._materialized:
+            return
+        self._materialized.add(brand_iid)
+        for idx in sorted(idxs, key=lambda i: L.sort_key(self.entries[i])):
+            e = self.entries[idx]
+            # Model [Variant] only -- the internal id stays out of the
+            # row text (cleaner tree); it is still one lookup away and
+            # is shown in the hover tooltip instead.
+            label = e.get("model", "")
+            if e.get("variant"):
+                label += "  [{}]".format(e["variant"])
+            iid = "entry:{}".format(idx)
+            self._full_labels[iid] = label
+            self.tree.insert(brand_iid, "end", iid=iid, text=label)
+
+    def _on_brand_expand(self, _event=None):
+        """<<TreeviewOpen>>: mount the opened brand's entry rows on demand."""
+        try:
+            focus = self.tree.focus()
+        except Exception:
+            return
+        if not focus or not focus.startswith("brand:"):
+            return
+        idxs = self._all_brand_nodes.get(focus)
+        if idxs is None:
+            return
+        self._materialize_brand(focus, idxs)
+        self._apply_ellipsis()
+
+    def _ensure_entry_visible(self, entry_iid):
+        """F-8 helper: make sure an entry row actually exists in the
+        (possibly virtualized) tree before a caller selects/reveals it.
+        Materializes its brand page first if needed. Safe no-op when the
+        row is already mounted or the iid is unknown."""
+        if not entry_iid or not entry_iid.startswith("entry:"):
+            return
+        if self.tree.exists(entry_iid):
+            return
+        try:
+            idx = int(entry_iid.split(":", 1)[1])
+        except (ValueError, IndexError):
+            return
+        if not (0 <= idx < len(self.entries)):
+            return
+        brand = self.entries[idx].get("brand", "(no brand)")
+        # a search filter may hide the brand entirely; that is fine --
+        # callers lift the filter first (see reveal_entry).
+        brand_iid = "brand:{}".format(brand)
+        idxs = self._all_brand_nodes.get(brand_iid)
+        if idxs is None:
+            return
+        self._materialize_brand(brand_iid, idxs)
+        try:
+            self.tree.item(brand_iid, open=True)
+        except Exception:
+            pass
 
     # -- overflow handling for the database tree ---------------------------
     def _schedule_ellipsis(self, _event=None):
@@ -5043,7 +5320,13 @@ class MainApp(tk.Tk):
 
     def _apply_ellipsis(self):
         """Rewrite visible row text truncated to the current widget width.
-        Full labels stay in self._full_labels (tooltips / re-widen)."""
+        Full labels stay in self._full_labels (tooltips / re-widen).
+        M-3: skipped entirely when neither the widget width nor the font
+        changed since the last pass -- the previous version made 1-2 Tcl
+        round-trips per row (10-20k calls at 10k entries) on EVERY resize
+        and repopulate. A Python-side map of the last display text keeps
+        the per-row cost at one item() write only when the text actually
+        changed."""
         self._ellipsis_after = None
         wpx = self.tree.winfo_width()
         if wpx < 60 or not self._full_labels:
@@ -5059,12 +5342,22 @@ class MainApp(tk.Tk):
         budget_base = int((wpx - 36) // cw)
         if budget_base < 8:
             return
+        fingerprint = (wpx, cw)
+        if getattr(self, "_ellipsis_fp", None) == fingerprint:
+            # same geometry as the last pass: every row already holds the
+            # right text (populate_tree reset _disp_cache when labels
+            # changed); nothing to do.
+            self._start_tree_marquee()
+            return
+        self._ellipsis_fp = fingerprint
         for iid, full in list(self._full_labels.items()):
             depth = 1 if iid.startswith("brand:") else 2
             disp = ellipsize(full, budget_base - depth * 2)
+            if self._disp_cache.get(iid) == disp:
+                continue
             try:
-                if self.tree.item(iid, "text") != disp:
-                    self.tree.item(iid, text=disp)
+                self.tree.item(iid, text=disp)
+                self._disp_cache[iid] = disp
             except Exception:
                 pass
         self._start_tree_marquee()
@@ -5227,6 +5520,9 @@ class MainApp(tk.Tk):
                 self._search_debounce_id = None
             self.populate_tree()
         iid = "entry:{}".format(idx)
+        # F-8: the row may not be mounted yet under its (virtualized)
+        # brand node -- materialize the page and open the brand first.
+        self._ensure_entry_visible(iid)
         parent = self.tree.parent(iid)
         if parent:
             self.tree.item(parent, open=True)
@@ -5406,7 +5702,18 @@ class MainApp(tk.Tk):
             try:
                 # iterate a snapshot: the UI thread may add/delete entries
                 # while this audit runs (deleting from the live list under
-                # an index-based loop would raise and abort the audit)
+                # an index-based loop would raise and abort the audit).
+                # M-7 (audit-note): deliberately a SHALLOW copy, not deep
+                # copies -- audit-fix closures capture entry objects by
+                # identity and resolve them against the LIVE list at
+                # apply time (identity first, unique id second), which is
+                # what keeps Fix All working after one fix rewrites an
+                # entry's id. The UI thread never mutates a loaded entry
+                # dict in place (it replaces whole list slots / dicts --
+                # validate_and_commit, merge, find_replace, ai_import all
+                # assign clean new dicts), so a shallow copy cannot expose
+                # torn reads either; deep-copying here made every
+                # subsequent fix on an id-renamed entry resolve "stale".
                 return L.run_full_audit(list(self.entries), self.data_root), None
             except Exception as e:
                 return [], e
@@ -5480,21 +5787,46 @@ class MainApp(tk.Tk):
         fixable = [i for i in issues if i.fix]
         if not fixable:
             return
-        before_snapshot = [self._deepcopy(e) for e in self.entries]
+        # M-2: snapshot ONLY the entries the fixes can touch (each issue
+        # carries its position). Fix closures mutate dict CONTENTS and never
+        # change the list length (verified: every mutator writes into a
+        # located entry), so a shallow list copy + per-target deepcopies is
+        # sufficient -- the old full-database deepcopy stalled the UI and
+        # allocated 30-80 MB on every Fix All over a 10k-entry catalog.
+        touched_positions = set()
+        for i in fixable:
+            idx = getattr(i, "entry_index", None)
+            if isinstance(idx, int) and 0 <= idx < len(self.entries):
+                touched_positions.add(idx)
+        before_snapshot = [None] * len(self.entries)   # deepcopy only where touched
+        for idx in touched_positions:
+            before_snapshot[idx] = self._deepcopy(self.entries[idx])
+        shallow_before = list(self.entries)
         applied = failed = stale = 0
         for issue in fixable:
             try:
                 pos = issue.fix(self.entries)
                 if isinstance(pos, int) and 0 <= pos < len(self.entries):
                     applied += 1
+                    if before_snapshot[pos] is None:
+                        # fix resolved to a position outside the predicted
+                        # set (defensive): capture the pre-image now from
+                        # the shallow snapshot, before later fixes land.
+                        before_snapshot[pos] = self._deepcopy(shallow_before[pos])
                 else:
                     stale += 1
             except Exception as e:
                 failed += 1
                 L.log("Fix '{}' failed: {}".format(issue.category, e))
+        # grow the before-snapshot bookkeeping if a fix moved past the end
+        if len(before_snapshot) < len(self.entries):
+            before_snapshot.extend(
+                [None] * (len(self.entries) - len(before_snapshot)))
 
         changes = []
         for i, (before_e, after_e) in enumerate(zip(before_snapshot, self.entries)):
+            if before_e is None:
+                continue            # untouched position: no fix landed here
             if before_e != after_e:
                 obj = self.entries[i]
                 changes.append({

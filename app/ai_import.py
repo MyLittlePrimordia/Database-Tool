@@ -747,6 +747,9 @@ class ImportDialog(tk.Toplevel):
                 if parent:
                     app.tree.item(parent, open=True)
                 try:
+                    # F-8: the row's brand page may not be materialized
+                    # yet in the virtualized tree -- mount it first.
+                    app._ensure_entry_visible(iid)
                     app.tree.see(iid)
                     app.tree.selection_set(iid)
                 except Exception:

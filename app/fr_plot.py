@@ -149,8 +149,14 @@ def dim(color, t=0.55):
 # ---------------------------------------------------------------------------
 def ref_db(points):
     """Reference level at ~1 kHz: median of the 900-1100 Hz band, falling
-    back to the overall median so odd files still render."""
+    back to 700-1300 Hz (same widening the analyzer uses), then to the
+    overall median so odd files still render. L-10: plot and analysis now
+    agree on when a 1 kHz reference exists; a file with neither band
+    still plots (overall median) rather than rendering empty, but the
+    widening step keeps the two paths in sync for every realistic file."""
     vals = sorted(d for f, d in points if 900 <= f <= 1100)
+    if not vals:
+        vals = sorted(d for f, d in points if 700 <= f <= 1300)
     if not vals:
         vals = sorted(d for _, d in points)
     if not vals:
