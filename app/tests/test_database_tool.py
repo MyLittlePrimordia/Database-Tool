@@ -277,6 +277,41 @@ class TestHistoryV2:
             f.write("{ not json")
         assert L.load_history(tmpdb) == ([], [])
 
+    def test_cross_session_edit_replay_is_marked_partial(self, tmpdb):
+        """C-1 regression: a v2 'edit' change only carries the fields that
+        changed (+ id) -- it must be flagged 'partial' so the in-memory
+        replay path (main._apply_history_changes) merges those fields onto
+        the live entry instead of replacing the whole entry with a husk
+        that has lost brand/tags/files/etc."""
+        raw_ch = {"action": "edit", "id": "moondrop_chu",
+                  "old": {"price_usd": 20}, "new": {"price_usd": 25}}
+        ch = L._change_from_v2(raw_ch)
+        assert ch["partial"] is True
+        assert set(ch["copy_before"].keys()) == {"price_usd", "id"}
+        assert set(ch["copy_after"].keys()) == {"price_usd", "id"}
+        # Simulate the merge that _apply_history_changes now performs for
+        # partial changes (see main.py) and confirm the full entry survives.
+        live_entry = L.build_clean_entry(make_entry())
+        assert live_entry["price_usd"] == 20
+        live_entry.update(copy.deepcopy(ch["copy_after"]))   # simulate redo
+        assert live_entry["price_usd"] == 25
+        assert live_entry["brand"] == "Moondrop"              # not dropped
+        assert live_entry["tags"] == ["Budget", "Warm", "Smooth", "Relaxed"]
+        assert live_entry["files"] == ["data/MOONDROP/CHU.txt"]
+        live_entry.update(copy.deepcopy(ch["copy_before"]))  # simulate undo
+        assert live_entry["price_usd"] == 20
+        assert live_entry["brand"] == "Moondrop"
+
+    def test_add_delete_changes_are_not_partial(self, tmpdb):
+        """add/delete v2 changes already carry the full entry -- they must
+        NOT be marked partial (that would incorrectly merge instead of
+        insert/remove)."""
+        e = L.build_clean_entry(make_entry())
+        add_ch = L._change_from_v2({"action": "add", "after": e})
+        del_ch = L._change_from_v2({"action": "delete", "before": e})
+        assert not add_ch.get("partial")
+        assert not del_ch.get("partial")
+
 
 # ===========================================================================
 # M-5: duplicate-pair emission cap
@@ -506,6 +541,46 @@ class TestAiImportParsing:
         props = AI.classify_against(existing, parsed)
         kinds = sorted(p["action"] for p in props)
         assert kinds == ["changed", "new"]
+
+    def test_apply_rename_collisions_are_rejected_not_duplicated(self):
+        """C-2 regression: two CHANGED proposals renamed to the same new id
+        must not both be staged. This is a faithful copy of
+        ImportDialog._apply's staging loop (ai_import.py) -- it must keep
+        live_ids in sync as changed entries are renamed, the same way
+        find_replace.py's bulk-edit apply already does."""
+        live_ids = {"a_1", "a_2"}
+
+        def renamed_entry():
+            return make_entry(brand="Common", model="Same",
+                               price_usd=10, tags=["Budget", "Warm",
+                                                     "Smooth", "Relaxed"])
+
+        included = [
+            {"action": "changed", "old": {"id": "a_1"}, "new": renamed_entry()},
+            {"action": "changed", "old": {"id": "a_2"}, "new": renamed_entry()},
+        ]
+        staged, problems = [], []
+        for p in included:
+            src = p["new"]
+            candidate = dict(src)
+            candidate.setdefault("id", p["old"].get("id"))
+            candidate["id"] = L.build_id(
+                str(candidate.get("brand") or ""),
+                str(candidate.get("model") or ""),
+                str(candidate.get("variant") or "")) or candidate.get("id")
+            exclude = p["old"].get("id")
+            errors = L.validate_entry(candidate, existing_ids=live_ids,
+                                      exclude_id=exclude)
+            if errors:
+                problems.append(candidate.get("id"))
+                continue
+            if candidate.get("id") != exclude:
+                live_ids.discard(exclude)
+                live_ids.add(candidate["id"])
+            staged.append(candidate["id"])
+        assert len(staged) == 1                 # second one caught, not duplicated
+        assert len(problems) == 1
+        assert len(staged) == len(set(staged))  # no duplicate ids ever staged
 
 
 # ===========================================================================

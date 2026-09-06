@@ -223,7 +223,14 @@ def parse_curve_file(path):
 
 
 def interp_spl(freqs, spls, target_freqs):
-    """Linear-interpolate SPL values onto `target_freqs`."""
+    """Linear-interpolate SPL values onto `target_freqs`.
+
+    Precondition: `freqs`/`spls` must be non-empty (every current call
+    site already guards this). Returns [] for an empty input rather than
+    raising IndexError, so a future caller that forgets the guard fails
+    soft instead of crashing (L-2)."""
+    if not freqs or not spls:
+        return []
     out = []
     n = len(freqs)
     for tf in target_freqs:

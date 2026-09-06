@@ -38,6 +38,7 @@ import datetime
 import hashlib
 import threading
 import unicodedata
+from collections import Counter
 
 CURRENT_YEAR = datetime.datetime.now().year
 
@@ -73,11 +74,16 @@ LOG_DIR = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
 # Short-lived memo for data-folder walks: audit + file panel often ask
 # for the same directory within seconds of each other. Re-walking 11k
 # files twice is pure wasted I/O.
-# L-7: stored as a tuple and swapped in ONE assignment (slice-assign on
-# the cache list) so a concurrent reader on another thread can never
-# observe a torn mix of old and new fields (the previous dict.update of
-# 4 keys was 4 separate stores).
-_SCAN_CACHE = [None, 0.0, None, None]     # [root, time, on_disk, data_dir]
+# L-1: the whole (root, time, files, dir) record lives in ONE list slot
+# as a single immutable tuple. Both write (`_SCAN_CACHE[0] = new_tuple`)
+# and the initial read (`cached = _SCAN_CACHE[0]`) are one atomic
+# subscript op each; unpacking the tuple afterward reads a local,
+# already-immutable object, so a concurrent reader can never observe a
+# torn mix of old and new fields. (A previous fix made the WRITE atomic
+# via slice-assign on a 4-element list, but readers still did four
+# separate indexed loads from that same live list -- a writer's
+# slice-assign could still land in the middle of those four reads.)
+_SCAN_CACHE = [(None, 0.0, None, None)]     # [0] = (root, time, on_disk, data_dir)
 
 
 def scan_data_files(data_root):
@@ -85,7 +91,7 @@ def scan_data_files(data_root):
     ~2 s so concurrent callers (audit + file linker) share one walk."""
     import time
     now = time.time()
-    cached_root, cached_time, cached_files, cached_dir = _SCAN_CACHE
+    cached_root, cached_time, cached_files, cached_dir = _SCAN_CACHE[0]
     if cached_root == data_root and (now - cached_time) < 2.0 \
             and cached_files is not None:
         return list(cached_files), cached_dir
@@ -122,7 +128,7 @@ def scan_data_files(data_root):
     else:
         data_dir = None
         on_disk = []
-    _SCAN_CACHE[:] = (data_root, now, list(on_disk), data_dir)
+    _SCAN_CACHE[0] = (data_root, now, list(on_disk), data_dir)
     return on_disk, data_dir
 
 
@@ -258,14 +264,6 @@ def write_bytes_atomic(path, payload):
         except OSError:
             pass
         raise
-
-
-def snapshot_entries(entries):
-    """M-7: independent, schema-clean copies of the entry list for handoff
-    to a worker thread (audit / export). build_clean_entry returns a fresh
-    dict with fresh tags/files lists, so the worker can never observe a
-    half-applied UI-thread mutation."""
-    return [build_clean_entry(e) for e in entries]
 
 
 # --------------------------------------------------------------------------
@@ -683,6 +681,7 @@ def validate_entry(entry, existing_ids=None, exclude_id=None):
         )
 
     price_raw = entry.get("price_usd", 0)
+    price_already_flagged = False
     if isinstance(price_raw, float) and not math.isfinite(price_raw):
         errors.append("Price must be a finite number.")
         price = -1
@@ -692,7 +691,14 @@ def validate_entry(entry, existing_ids=None, exclude_id=None):
             price = -1
         elif isinstance(price_raw, str) and "." in price_raw:
             errors.append("Price must be a whole number (got '{}').".format(price_raw))
+            # L-6: coerce_int rounds "498.5" to 499 so the $5-rounding
+            # check downstream still has a number to sanity-check other
+            # fields against, but that rounded value is not what the user
+            # typed -- don't also report a second, ${499}-flavored
+            # "round to the nearest $5" error for a value they never
+            # entered; the message above already covers this price.
             price = coerce_int(price_raw, -1)
+            price_already_flagged = True
         elif isinstance(price_raw, str):
             try:
                 price = int(price_raw.strip())
@@ -702,7 +708,7 @@ def validate_entry(entry, existing_ids=None, exclude_id=None):
         else:
             price = coerce_int(price_raw, -1)
     if 0 <= price <= PRICE_MAX:
-        if price % 5 != 0:
+        if price % 5 != 0 and not price_already_flagged:
             errors.append(
                 "Price must be rounded to the nearest $5 (got ${}).".format(price)
             )
@@ -783,7 +789,10 @@ def validate_entry(entry, existing_ids=None, exclude_id=None):
 
     tags = entry.get("tags", []) or []
     if len(tags) != len(set(map(str, tags))):
-        dup = sorted({str(t) for t in tags if list(map(str, tags)).count(str(t)) > 1})
+        # L-4: O(n) via Counter instead of an O(n^2) count() per tag
+        # (n is tiny here -- <=12 -- so this was harmless, just needless).
+        counts = Counter(map(str, tags))
+        dup = sorted(t for t, c in counts.items() if c > 1)
         errors.append("Duplicate tag(s): {}".format(", ".join(dup)))
     unapproved = [t for t in tags if t not in APPROVED_TAGS]
     if unapproved:
@@ -924,7 +933,7 @@ def describe_entry_change(before, after, max_fields=3):
     if after is None:
         return "removed"
     parts = []
-    for f in SCHEMA_FIELDS:
+    for i, f in enumerate(SCHEMA_FIELDS):
         if f == "id":
             continue
         b, a = before.get(f), after.get(f)
@@ -943,10 +952,12 @@ def describe_entry_change(before, after, max_fields=3):
         else:
             parts.append("{}: '{}' -> '{}'".format(f.capitalize(), b, a))
         if len(parts) >= max_fields:
+            # L-4: SCHEMA_FIELDS[i + 1:] instead of an index() lookup per
+            # field (O(n) each) inside this generator -- we already know
+            # our own position `i` from enumerate() above.
             remaining = sum(
-                1 for g in SCHEMA_FIELDS
-                if g != "id" and SCHEMA_FIELDS.index(g) > SCHEMA_FIELDS.index(f)
-                and before.get(g) != after.get(g))
+                1 for g in SCHEMA_FIELDS[i + 1:]
+                if g != "id" and before.get(g) != after.get(g))
             if remaining:
                 parts.append("(+{} more)".format(remaining))
             break
@@ -1324,7 +1335,13 @@ def _change_from_v2(raw_ch):
             before[f] = v
         return {"pos_hint": pos_hint,
                 "ref_before": before, "copy_before": before,
-                "ref_after": after, "copy_after": after}
+                "ref_after": after, "copy_after": after,
+                # copy_before/copy_after above only contain the fields that
+                # actually changed (+ id) -- NOT a full entry. Callers that
+                # replay this change must merge those fields onto the live
+                # entry rather than replacing it wholesale, or every other
+                # field on the entry is silently dropped.
+                "partial": True}
     return None
 
 
@@ -2128,15 +2145,15 @@ def run_full_audit(entries, data_root=None):
             for pos, rel in enumerate(files):
                 actual = disk_index.get(rel.lower()) if isinstance(rel, str) else None
                 if actual and actual != rel:
-                    fixed_paths.append((pos, actual))
+                    fixed_paths.append((pos, rel, actual))
                     changed_casing = True
             if changed_casing:
                 def case_mut(en, updates=tuple(fixed_paths)):
                     lst = en.get("files", [])
-                    for pos, actual in updates:
+                    for pos, _rel, actual in updates:
                         if 0 <= pos < len(lst) and str(lst[pos]).lower() == actual.lower():
                             lst[pos] = actual
-                shown = ", ".join("'{}'->'{}'".format(o, a) for o, a in fixed_paths[:2])
+                shown = ", ".join("'{}'->'{}'".format(o, a) for _pos, o, a in fixed_paths[:2])
                 issues.append(AuditIssue(
                     "Path Casing", idx, eid,
                     "File path casing differs from disk: {}. Auto-fix restores the on-disk spelling.".format(shown),
@@ -2285,7 +2302,9 @@ def run_full_audit(entries, data_root=None):
                 "{} tags present (maximum {}).".format(len(tags), MAX_TAGS), severity="error"))
 
         if len(tags) != len(set(map(str, tags))):
-            dup = sorted({str(t) for t in tags if list(map(str, tags)).count(str(t)) > 1})
+            # L-4: O(n) via Counter instead of an O(n^2) count() per tag.
+            counts = Counter(map(str, tags))
+            dup = sorted(t for t, c in counts.items() if c > 1)
             issues.append(AuditIssue(
                 "Duplicate Tag", idx, eid,
                 "Duplicate tag(s): {}".format(", ".join(dup)), severity="error"))
@@ -2385,7 +2404,12 @@ def run_full_audit(entries, data_root=None):
 
     if on_disk_set is not None:
         for rel, idxs in referenced_map.items():
-            if rel not in on_disk_set:
+            # Case-insensitive existence check: a rel path that only differs
+            # from disk by case (e.g. Windows) already gets a fixable "Path
+            # Casing" warning above -- it must not ALSO be reported as a
+            # hard "Missing File" error, which inflates the error count,
+            # forces the save-block gate, and can't be waived.
+            if rel not in on_disk_set and not (disk_index and rel.lower() in disk_index):
                 for idx in idxs:
                     eid = entries[idx].get("id", "") or "(no id) #{}".format(idx)
                     issues.append(AuditIssue(

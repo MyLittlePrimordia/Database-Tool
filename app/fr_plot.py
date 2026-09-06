@@ -213,6 +213,11 @@ def get_curve_points(path, max_points=20000):
 
 
 def _interp_at(freqs, dbs, f):
+    """Precondition: `freqs`/`dbs` must be non-empty (every current call
+    site already guards this). Returns None for an empty input rather
+    than raising IndexError (L-2)."""
+    if not freqs or not dbs:
+        return None
     j = bisect.bisect_left(freqs, f)
     if j <= 0:
         return dbs[0]

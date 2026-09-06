@@ -215,7 +215,16 @@ def analyze_points(points):
         # band covers <25% of 6-15 kHz: report but do not feed scoring
         m["treble_avg_partial"] = round(treb_avg - ref, 1)
     if treb_peak is not None:
-        m["treble_peak"] = round(treb_peak - ref, 1)
+        if treble_coverage >= 0.25:
+            m["treble_peak"] = round(treb_peak - ref, 1)
+        else:
+            # M-2: same coverage gate as treble_avg above -- a peak found
+            # in a sliver of the 6-15 kHz band (e.g. a file truncated at
+            # 6.5 kHz) must not feed the brightness score or trigger
+            # Bright/Treblehead, exactly what the gate exists to prevent.
+            # Still reported (informational) under a distinct key so scoring
+            # (which reads "treble_peak") never sees it.
+            m["treble_peak_partial"] = round(treb_peak - ref, 1)
 
     sugg = []
 

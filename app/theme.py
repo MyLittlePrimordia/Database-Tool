@@ -26,6 +26,7 @@ would freeze the value at import time.
 
 import json
 import os
+import sys
 
 import tkinter as tk
 import tkinter.font as tkfont
@@ -174,12 +175,6 @@ def contrast_text(hex_color):
     r, g, b = _rgb(hex_color)
     return "#000000" if (0.299 * r + 0.587 * g + 0.114 * b) / 255 > 0.6 \
         else "#ffffff"
-
-
-def grid_line_color():
-    """Subtle blueprint-grid line color for the header strip: the panel
-    tone lifted a few percent toward the text color."""
-    return blend(BG_PANEL, TEXT_MAIN, 0.055)
 
 
 # ===========================================================================
@@ -353,11 +348,6 @@ def small_font():
 
 def title_font():
     return font(FONT_TITLE_PX, "bold")
-
-
-def mono_font():
-    """Legacy helper (kept for compatibility): base-size font."""
-    return font(FONT_BASE_PX)
 
 
 def pick_emoji_font():
@@ -1050,6 +1040,72 @@ def style_menu(menu):
                    borderwidth=1, relief="flat",
                    disabledforeground=TEXT_DIM, font=font(FONT_BASE_PX))
     return menu
+
+
+def style_titlebar(root):
+    """Windows only: recolor the native window-chrome title bar (the strip
+    holding the app name/icon and window controls) to match the current
+    theme's header color (BG_PANEL -- the same tone already used for the
+    toolbar/status rails), instead of leaving it stuck on the OS's
+    default light chrome while everything else is dark.
+
+    Uses the public DWM APIs added in Windows 10 20H1+ / 11
+    (DWMWA_CAPTION_COLOR for an exact custom color, plus
+    DWMWA_USE_IMMERSIVE_DARK_MODE so the window control glyphs pick a
+    readable light-or-dark variant to match).
+
+    This does NOT touch the File/Edit/.../Help menu strip -- that's a
+    separate native Windows control, and neither Menu.configure(bg=...)
+    nor the DWM APIs above can recolor it. It also isn't reliably
+    recolorable via undocumented means either (SetPreferredAppMode /
+    FlushMenuThemes, the technique Microsoft's own "win32-darkmode"
+    sample and libraries like sv_ttk/pywinstyles use, did not visibly
+    affect the top-level bar in testing here even though it's documented
+    to on some Windows builds) -- which is why the menu bar is a custom
+    Tk-drawn Frame (see MainApp._build_custom_menu_bar) instead of a
+    native menu at all. SetPreferredAppMode is still set below as a
+    harmless bonus for whatever OTHER native chrome the app touches
+    (right-click context menus, common Open/Save dialogs), even though
+    it no longer needs to fix the (now nonexistent) native menu bar.
+
+    No-ops silently everywhere else (wrong OS, older Windows build, no
+    window handle yet) -- this is cosmetic, never load-bearing."""
+    if not sys.platform.startswith("win"):
+        return
+    try:
+        import ctypes
+        root.update_idletasks()
+        hwnd = ctypes.windll.user32.GetParent(root.winfo_id())
+        if not hwnd:
+            return
+        is_dark = contrast_text(BG_PANEL) == "#ffffff"
+
+        try:
+            uxtheme = ctypes.WinDLL("uxtheme", use_last_error=True)
+            set_pref_mode = uxtheme[135]          # SetPreferredAppMode
+            set_pref_mode.restype = ctypes.c_int
+            set_pref_mode.argtypes = [ctypes.c_int]
+            set_pref_mode(2 if is_dark else 3)    # 2=ForceDark, 3=ForceLight
+            flush_menu_themes = uxtheme[136]      # FlushMenuThemes
+            flush_menu_themes.restype = None
+            flush_menu_themes.argtypes = []
+            flush_menu_themes()
+        except Exception:
+            pass  # older Windows build without these ordinals -- harmless to skip
+
+        dwmapi = ctypes.windll.dwmapi
+        r, g, b = _rgb(BG_PANEL)
+        # COLORREF is 0x00BBGGRR -- byte order is reversed from our #RRGGBB.
+        colorref = ctypes.c_int(b << 16 | g << 8 | r)
+        dwmapi.DwmSetWindowAttribute(
+            hwnd, 35, ctypes.byref(colorref), ctypes.sizeof(colorref))  # DWMWA_CAPTION_COLOR
+        dark_flag = ctypes.c_int(1 if is_dark else 0)
+        for attr in (20, 19):  # DWMWA_USE_IMMERSIVE_DARK_MODE: 20 (new), 19 (older builds)
+            if dwmapi.DwmSetWindowAttribute(
+                    hwnd, attr, ctypes.byref(dark_flag), ctypes.sizeof(dark_flag)) == 0:
+                break
+    except Exception:
+        pass  # cosmetic only -- never let a chrome-color tweak break the app
 
 
 # ---------------------------------------------------------------------------

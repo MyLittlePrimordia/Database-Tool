@@ -75,14 +75,6 @@ def compress_to_gz(entries=None, external_path=None, dest_dir=None):
 # --------------------------------------------------------------------------
 # Split
 # --------------------------------------------------------------------------
-def count_tokens(item, indent=None):
-    """Rough dependency-free token estimate (~4 chars/token). Pass the same
-    `indent` used when writing so the estimate reflects the actual bytes on
-    disk (chunks are written with indent=2; compact JSON underestimates by
-    ~30-40%)."""
-    return max(1, len(json.dumps(item, ensure_ascii=False, indent=indent)) // 4)
-
-
 def split_into_chunks(entries=None, external_path=None,
                       output_dir=None, max_tokens=DEFAULT_MAX_TOKENS, log=print):
     """Split into <output_dir>/<base>_chunk_N.json files under a token

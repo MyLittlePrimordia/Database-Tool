@@ -444,13 +444,14 @@ def restyle_app(root):
     (some Linux window managers) the calls quietly no-op and the switch
     still applies, just without the anti-flicker step.
 
-    The reveal itself is deferred a couple of scheduler turns: the menubar
-    is recolored LAST (menus are restyled by a retheme hook), and its
-    redraw lands on a later event-loop pass than update_idletasks().
-    Restoring alpha immediately used to show that straggler menubar
-    repaint as a visible flash across File/Edit/Audit/Tools/View/Help.
-    Waiting ~2 frames lets every queued repaint -- menubar included --
-    finish into the hidden buffer before the window comes back."""
+    The reveal itself is deferred a couple of scheduler turns: the custom
+    menu-bar strip is recolored LAST (menus are restyled by a retheme
+    hook), and its redraw lands on a later event-loop pass than
+    update_idletasks(). Restoring alpha immediately used to show that
+    straggler menu-bar repaint as a visible flash across
+    File/Edit/Audit/Tools/View/Help. Waiting ~2 frames lets every queued
+    repaint -- menu bar included -- finish into the hidden buffer before
+    the window comes back."""
     def _reveal():
         try:
             root.attributes("-alpha", 1.0)
@@ -465,9 +466,10 @@ def restyle_app(root):
         theme.apply_styles(root)
         theme.retint(root)
         theme.run_retheme_hooks()
+        theme.style_titlebar(root)   # Windows: recolor the OS title bar to match
         root.update_idletasks()
         # give Tk two idle turns to drain every pending repaint (widgets,
-        # canvases AND the native menubar) while nothing is visible
+        # canvases AND the custom menu-bar strip) while nothing is visible
         root.after(16, lambda: root.after(16, _reveal))
         return True
     except Exception:
@@ -577,19 +579,23 @@ class AutocompleteEntry(ttk.Frame):
             self._flags = []
         self._draw_underlines()
 
-    def _char_metrics(self):
-        """(char_width_px, leftmost_visible_index) for the monospace font."""
-        import tkinter.font as tkfont
+    def _char_x(self, idx):
+        """Real on-screen x (canvas/entry-relative, px) of character index
+        `idx`, using the entry's actual per-character bbox -- accurate for
+        any font (the OS's native proportional UI font, not just a
+        monospace one)."""
+        text_len = len(self.var.get())
         try:
-            f = tkfont.Font(font=self.entry.cget("font"))
-            cw = max(1, f.measure("n"))
+            if text_len == 0:
+                bx, _by, _bw, _bh = self.entry.bbox(0)
+                return bx
+            if idx >= text_len:
+                bx, _by, bw, _bh = self.entry.bbox(text_len - 1)
+                return bx + bw
+            bx, _by, _bw, _bh = self.entry.bbox(max(0, idx))
+            return bx
         except Exception:
-            cw = 9
-        try:
-            left_idx = self.entry.index("@0")
-        except Exception:
-            left_idx = 0
-        return cw, left_idx
+            return None
 
     def _draw_underlines(self):
         canvas = self.underline
@@ -599,10 +605,11 @@ class AutocompleteEntry(ttk.Frame):
         width = self.entry.winfo_width()
         if width <= 1:
             return
-        cw, left_idx = self._char_metrics()
         for start, end, _word in self._flags:
-            x1 = ENTRY_TEXT_PAD_X + (start - left_idx) * cw
-            x2 = ENTRY_TEXT_PAD_X + (end - left_idx) * cw
+            x1 = self._char_x(start)
+            x2 = self._char_x(end)
+            if x1 is None or x2 is None:
+                continue
             if x2 <= 0 or x1 >= width:
                 continue  # scrolled off-screen
             canvas.create_rectangle(max(0, x1), 0, min(width - 1, x2), 2,
@@ -640,18 +647,30 @@ class AutocompleteEntry(ttk.Frame):
         sc = self.spell_checker
         if not sc or not sc.ready or not self._flags:
             return
-        cw, left_idx = self._char_metrics()
-        col = left_idx + int(round((event.x - ENTRY_TEXT_PAD_X) / float(cw)))
+        # M-3: ask Tk directly which character sits under this pixel --
+        # real per-character metrics, correct for the native proportional
+        # UI font (the old cw-multiplication math assumed a monospace font
+        # and drifted on long values, sometimes resolving/replacing the
+        # wrong word).
+        try:
+            col = self.entry.index("@%d" % event.x)
+        except Exception:
+            return
         hit = self._flag_at_column(col)
         if not hit:
-            # small slop so clicking just beside a flagged word still resolves
+            # small pixel slop so clicking just beside a flagged word still
+            # resolves, using the same real bbox metrics as the underline.
             for start, end, word in self._flags:
-                if col < start and (start - col) * cw <= 14:
-                    hit = (start, end, word)
-                    break
-                if col >= end and (col - end) * cw <= 14:
-                    hit = (start, end, word)
-                    break
+                if col < start:
+                    bx = self._char_x(start)
+                    if bx is not None and bx - event.x <= 14:
+                        hit = (start, end, word)
+                        break
+                elif col >= end:
+                    bx = self._char_x(end)
+                    if bx is not None and event.x - bx <= 14:
+                        hit = (start, end, word)
+                        break
         if not hit:
             return
         start, end, word = hit
@@ -1372,7 +1391,12 @@ class TagSelectorPanel(ttk.Frame):
 
     def update_price(self, price_usd):
         self.current_price = price_usd
-        tier = L.price_tier_for(price_usd)
+        # Use the same rounded basis as validate_entry/the audit engine
+        # (price_tier_basis rounds to the nearest $5 first) so all three
+        # tier consumers agree -- otherwise a legacy/imported entry whose
+        # price isn't a $5 multiple (e.g. 498) gets an auto-tier tag here
+        # that Save then rejects as mismatched.
+        tier = L.price_tier_for(L.price_tier_basis(price_usd))
         self._auto_tier_tag = tier
         ranges = {"Budget": "$0-99", "Mid-Tier": "$100-499",
                   "Premium": "$500-1499", "Flagship": "$1500+"}
@@ -2849,8 +2873,16 @@ class EntryEditor(ttk.Frame):
         }
         if current["files"] != base["files"]:
             return True
-        current["files"] = base["files"] = None
-        return current != base
+        # M-1: compare the remaining fields via a projection -- do NOT
+        # write into base (self._baseline) here. The old code did
+        # `current["files"] = base["files"] = None`, which poisoned the
+        # stored baseline: the next call's fresh `current["files"]` (a
+        # real list, even []) would never equal that stored None, so
+        # form_is_dirty() started returning True forever on an unchanged
+        # form once this line ran once.
+        other_fields = {k: v for k, v in current.items() if k != "files"}
+        base_fields = {k: v for k, v in base.items() if k != "files"}
+        return other_fields != base_fields
 
     def _capture_baseline(self):
         try:
@@ -3038,10 +3070,12 @@ class MergeDialog(tk.Toplevel):
             lb = len(vb) if isinstance(vb, list) else 0
             return "A" if la >= lb else "B"
         if key in ("year", "price_usd", "impedance", "sensitivity"):
-            try:
-                na, nb = int(str(va or 0)), int(str(vb or 0))
-            except (TypeError, ValueError):
-                na, nb = 0, 0
+            # L-6: int(str(va or 0)) raises on float-ish strings like
+            # "239.5" (int() doesn't accept a decimal point), silently
+            # falling back to treating BOTH sides as 0 and defaulting to
+            # A regardless of the real values. L.coerce_int handles this
+            # (and bools/None/garbage) without raising.
+            na, nb = L.coerce_int(va, 0), L.coerce_int(vb, 0)
             if na == 0 and nb != 0:
                 return "B"
             return "A"
@@ -3922,9 +3956,12 @@ class StatusMarquee(tk.Canvas):
         self._measure()
 
     def _measure(self):
-        import tkinter.font as tkfont
+        # L-4: self._font (from theme.font()) is already a live tkfont.Font
+        # object -- measure directly on it instead of wrapping it in a
+        # brand new tkfont.Font every call. This ran every tick (50ms)
+        # while the marquee was actively scrolling.
         try:
-            self._text_w = tkfont.Font(font=self._font).measure(self.var.get())
+            self._text_w = self._font.measure(self.var.get())
         except Exception:
             self._text_w = None
 
@@ -4003,6 +4040,7 @@ class MainApp(tk.Tk):
         self.update_idletasks()
         self.drop_enabled = win_drop.enable_native_file_drop(self,
                                                              self._on_native_drop)
+        theme.style_titlebar(self)   # Windows: dark title-bar chrome to match the app
 
     def destroy(self):
         # Remove the native drop subclass while Tcl is still fully alive;
@@ -4223,7 +4261,15 @@ class MainApp(tk.Tk):
                 # content replacement
                 pos = self._find_slot(out_of, ch["copy_before" if redo else "copy_after"])
                 if pos >= 0:
-                    self.entries[pos] = self._deepcopy(insert_copy)
+                    if ch.get("partial"):
+                        # v2 edit changes only carry the fields that actually
+                        # changed (+ id), not a full entry -- merge them onto
+                        # the live entry in place instead of replacing it
+                        # wholesale, or every untouched field (brand, tags,
+                        # files, ...) is silently dropped.
+                        self.entries[pos].update(self._deepcopy(insert_copy))
+                    else:
+                        self.entries[pos] = self._deepcopy(insert_copy)
                     affected.add(pos)
         return affected
 
@@ -4306,10 +4352,25 @@ class MainApp(tk.Tk):
 
     # ------------------------------------------------------------------
     def _build_menu(self):
-        menubar = tk.Menu(self)
-        self._menus = [menubar]
+        """Build the File/Edit/Audit/Tools/View/Help menu structure.
 
-        filemenu = tk.Menu(menubar, tearoff=0)
+        This is deliberately NOT attached as a native OS menu bar
+        (self.config(menu=...)) anymore. The native Win32 menu bar strip
+        is drawn entirely by Windows itself -- Menu.configure(bg=...)
+        only ever reaches the dropdown flyouts, never the top bar, and
+        even the undocumented dark-mode APIs (SetPreferredAppMode /
+        FlushMenuThemes) proved unreliable at actually recoloring that
+        bar. A plain Frame of Labels that we build and post the SAME
+        Menu objects from gives full, guaranteed control over the
+        strip's colors on every Windows version (and every other
+        platform), at no loss of functionality: none of the app's
+        keyboard shortcuts (Ctrl+S etc.) or menu commands depend on the
+        native menu bar -- shortcuts are bound directly to the window
+        elsewhere, and no menu here uses `accelerator=`/`underline=`.
+        """
+        self._menus = []
+
+        filemenu = tk.Menu(self, tearoff=0)
         filemenu.add_command(label="Open Database...", command=self.open_database)
         filemenu.add_command(label="Set Data Folder...", command=self.set_data_folder)
         filemenu.add_separator()
@@ -4317,24 +4378,21 @@ class MainApp(tk.Tk):
         filemenu.add_command(label="Save As...", command=self.save_as)
         filemenu.add_separator()
         filemenu.add_command(label="Exit", command=self._on_close)
-        menubar.add_cascade(label="File", menu=filemenu)
         self._menus.append(filemenu)
 
-        editmenu = tk.Menu(menubar, tearoff=0)
+        editmenu = tk.Menu(self, tearoff=0)
         editmenu.add_command(label="Add New Entry", command=self.add_entry)
         editmenu.add_command(label="Delete Selected Entry", command=self.delete_entry)
         editmenu.add_separator()
         editmenu.add_command(label="Undo Last Action", command=self.undo_last)
         editmenu.add_command(label="Redo Last Undone Action", command=self.redo_last)
-        menubar.add_cascade(label="Edit", menu=editmenu)
         self._menus.append(editmenu)
 
-        auditmenu = tk.Menu(menubar, tearoff=0)
+        auditmenu = tk.Menu(self, tearoff=0)
         auditmenu.add_command(label="Run Full Audit", command=self.run_audit)
-        menubar.add_cascade(label="Audit", menu=auditmenu)
         self._menus.append(auditmenu)
 
-        toolmenu = tk.Menu(menubar, tearoff=0)
+        toolmenu = tk.Menu(self, tearoff=0)
         toolmenu.add_command(
             label="Convert Measurement Curves...",
             command=lambda: self.notebook.select(self.curve_panel))
@@ -4351,14 +4409,13 @@ class MainApp(tk.Tk):
         toolmenu.add_command(
             label="Split into AI Chunks",
             command=self._open_export_tab)
-        menubar.add_cascade(label="Tools", menu=toolmenu)
         self._menus.append(toolmenu)
 
         # View menu -- the home of appearance controls: theme only. The app
         # always renders in the OS's own default UI font (no bundled font
         # files to pick between, no per-platform registration -- see
         # theme.py's font section).
-        viewmenu = tk.Menu(menubar, tearoff=0)
+        viewmenu = tk.Menu(self, tearoff=0)
         self._theme_var = tk.StringVar(value=theme.current_theme_id)
         thememenu = tk.Menu(viewmenu, tearoff=0)
         for t in theme.THEMES:
@@ -4370,23 +4427,80 @@ class MainApp(tk.Tk):
                 kwargs.update(image=img, compound="left")
             thememenu.add_radiobutton(**kwargs)
         viewmenu.add_cascade(label="Theme", menu=thememenu)
-        menubar.add_cascade(label="View", menu=viewmenu)
         self._menus.extend([viewmenu, thememenu])
 
-        helpmenu = tk.Menu(menubar, tearoff=0)
+        helpmenu = tk.Menu(self, tearoff=0)
         helpmenu.add_command(label="About", command=self._show_about)
-        menubar.add_cascade(label="Help", menu=helpmenu)
         self._menus.append(helpmenu)
-        self.config(menu=menubar)
+
+        self._menu_bar_items = [
+            ("File", filemenu), ("Edit", editmenu), ("Audit", auditmenu),
+            ("Tools", toolmenu), ("View", viewmenu), ("Help", helpmenu),
+        ]
+        self._build_custom_menu_bar()
         self._sync_menu_colors()
 
+    def _build_custom_menu_bar(self):
+        """Pack the custom dark-themeable strip (see _build_menu's
+        docstring for why this replaced the native OS menu bar)."""
+        bar = tk.Frame(self, background=theme.BG_PANEL)
+        bar.pack(side="top", fill="x")
+        self._menu_bar_frame = bar
+        self._menu_bar_labels = []
+
+        def make_opener(label_widget, menu):
+            def opener(_event=None):
+                x = label_widget.winfo_rootx()
+                y = label_widget.winfo_rooty() + label_widget.winfo_height()
+                try:
+                    menu.tk_popup(x, y)
+                finally:
+                    try:
+                        menu.grab_release()
+                    except Exception:
+                        pass
+            return opener
+
+        def make_enter(label_widget):
+            def _enter(_event=None):
+                label_widget.configure(background=theme.ACCENT_BLUE,
+                                       foreground=theme.contrast_text(theme.ACCENT_BLUE))
+            return _enter
+
+        def make_leave(label_widget):
+            def _leave(_event=None):
+                label_widget.configure(background=theme.BG_PANEL,
+                                       foreground=theme.TEXT_MAIN)
+            return _leave
+
+        for label_text, menu in self._menu_bar_items:
+            lbl = tk.Label(bar, text="  {}  ".format(label_text),
+                           background=theme.BG_PANEL, foreground=theme.TEXT_MAIN,
+                           font=theme.font(theme.FONT_BASE_PX), padx=2, pady=4,
+                           cursor="hand2")
+            lbl.pack(side="left")
+            lbl.bind("<Button-1>", make_opener(lbl, menu))
+            lbl.bind("<Enter>", make_enter(lbl))
+            lbl.bind("<Leave>", make_leave(lbl))
+            self._menu_bar_labels.append(lbl)
+
     def _sync_menu_colors(self):
-        """Re-palette every tk.Menu (ttk can't style native menus)."""
+        """Re-palette every dropdown tk.Menu plus the custom menu-bar
+        strip (ttk can't style native menu widgets, and the strip itself
+        is plain tk, not ttk)."""
         for m in getattr(self, "_menus", []):
             try:
                 theme.style_menu(m)
             except Exception:
                 pass
+        try:
+            if getattr(self, "_menu_bar_frame", None) is not None:
+                self._menu_bar_frame.configure(background=theme.BG_PANEL)
+                for lbl in getattr(self, "_menu_bar_labels", []):
+                    lbl.configure(background=theme.BG_PANEL, foreground=theme.TEXT_MAIN,
+                                 font=theme.font(theme.FONT_BASE_PX))
+        except Exception:
+            pass
 
     def _open_export_tab(self):
         self.notebook.select(self.tools_panel)
@@ -4691,8 +4805,23 @@ class MainApp(tk.Tk):
             except Exception:
                 pass
         try:
-            with _autosave_lock:
+            # L-6: bound the wait on the shared lock too. Joining the
+            # in-flight daemon for 2s and then unconditionally blocking on
+            # `with _autosave_lock:` regardless of that timeout defeats the
+            # point of it -- a slow-fsyncing daemon still holding the lock
+            # after 2s would hang the close path on the UI thread for as
+            # long as that write takes. If we can't get the lock promptly,
+            # skip this write rather than freeze the window: the daemon's
+            # own in-flight write still lands with largely the same
+            # content, and autosave is a safety net, not the primary save.
+            got_lock = _autosave_lock.acquire(timeout=3.0)
+            if not got_lock:
+                L.log("Autosave (sync) skipped: autosave lock busy at exit.")
+                return
+            try:
                 L.write_autosave(db_path, snapshot)
+            finally:
+                _autosave_lock.release()
             # The snapshot content is now the same as what the next launch
             # would compare against the (saved or unchanged) database --
             # mark it seen so it is never offered as "recovery".
@@ -4876,11 +5005,6 @@ class MainApp(tk.Tk):
         # Post-load audit runs WITHOUT yanking the user off the Editor tab;
         # results surface via the Audit tab's live issue-count badge.
         self.run_audit(switch_tab=False)
-
-    def _audit_done_popup(self, issue_count):
-        # Kept for backward compatibility with external callers; the badge
-        # on the Audit tab replaced the post-load modal.
-        pass
 
     def set_data_folder(self):
         path = filedialog.askdirectory(title="Select the folder that contains the 'data' subfolder")
@@ -5236,6 +5360,15 @@ class MainApp(tk.Tk):
                         int(prev_sel_iid.split(":", 1)[1])].get("id") == prev_sel_id
                     if same:
                         self._ensure_entry_visible(prev_sel_iid)
+                        # This re-selection is internal (post-rebuild restore,
+                        # not a user click). Tk still fires <<TreeviewSelect>>
+                        # synchronously for programmatic selection_set, which
+                        # would reload the entry into the editor and yank the
+                        # user to that tab (H-3) -- suppress just the
+                        # tab-switch for this one event. _on_tree_select
+                        # consumes (clears) this flag itself, the same way it
+                        # already consumes _sel_guard.
+                        self._quiet_select = True
                         self.tree.selection_set(prev_sel_iid)
                         sel_ok = True
                 except Exception:
@@ -5483,8 +5616,12 @@ class MainApp(tk.Tk):
         # long names auto-scroll (marquee) while the row stays selected
         self._start_tree_marquee()
         # Internal re-selections (e.g. post-commit re-highlight) must NOT
-        # yank the user out of whichever tab they're reading.
-        if not getattr(self, "_quiet_select", False):
+        # yank the user out of whichever tab they're reading. Consume the
+        # flag like _sel_guard above so it never leaks into the next, real
+        # user click.
+        quiet = getattr(self, "_quiet_select", False)
+        self._quiet_select = False
+        if not quiet:
             self.notebook.select(self.editor)
 
     def reveal_entry(self, issue):
@@ -5698,6 +5835,15 @@ class MainApp(tk.Tk):
             messagebox.showinfo(APP_TITLE, "No database loaded.")
             return
 
+        # L-3: tag this request so an older, still-running audit can never
+        # overwrite a newer one's results. Without this, two overlapping
+        # audits (e.g. a mutation fires _mark_audit_dirty while a big
+        # audit from a moment ago is still threaded) each call
+        # show_issues() when they finish -- "last thread to finish wins",
+        # which can display a stale result over a fresher one.
+        self._audit_run_id = getattr(self, "_audit_run_id", 0) + 1
+        my_run_id = self._audit_run_id
+
         def _compute():
             try:
                 # iterate a snapshot: the UI thread may add/delete entries
@@ -5718,11 +5864,17 @@ class MainApp(tk.Tk):
             except Exception as e:
                 return [], e
 
-        # Small databases audit in well under a second even with a data
-        # folder walk; doing it synchronously avoids the tab switch and
-        # status flicker entirely. Large ones go to the worker thread.
-        if len(self.entries) <= 2000:
+        # M-4: benchmarked at ~0.7-1.7s for 2000 entries (worse for a
+        # single-brand-heavy database, since the within-brand duplicate
+        # scan is quadratic per brand) -- well over the "under a second"
+        # this threshold assumed, and it runs synchronously at startup and
+        # on every mutation while the Audit tab is visible. Lowered so the
+        # UI only blocks for databases small enough that it's actually
+        # imperceptible; anything larger goes to the worker thread.
+        if len(self.entries) <= 300:
             issues, err = _compute()
+            if my_run_id != self._audit_run_id:
+                return   # a newer audit was requested while this one ran
             if err:
                 messagebox.showwarning(APP_TITLE, "Audit failed:\n{}".format(err))
             else:
@@ -5746,6 +5898,12 @@ class MainApp(tk.Tk):
         def poll():
             if th.is_alive():
                 self.after(60, poll)
+                return
+            if my_run_id != self._audit_run_id:
+                # A newer run_audit() call superseded this one while it was
+                # threaded (its own poll loop, or the sync path, owns
+                # display duties now) -- applying this stale result would
+                # show issues that don't match the current entries.
                 return
             err = result.get("err")
             if err:
@@ -5801,7 +5959,6 @@ class MainApp(tk.Tk):
         before_snapshot = [None] * len(self.entries)   # deepcopy only where touched
         for idx in touched_positions:
             before_snapshot[idx] = self._deepcopy(self.entries[idx])
-        shallow_before = list(self.entries)
         applied = failed = stale = 0
         for issue in fixable:
             try:
@@ -5809,10 +5966,25 @@ class MainApp(tk.Tk):
                 if isinstance(pos, int) and 0 <= pos < len(self.entries):
                     applied += 1
                     if before_snapshot[pos] is None:
-                        # fix resolved to a position outside the predicted
-                        # set (defensive): capture the pre-image now from
-                        # the shallow snapshot, before later fixes land.
-                        before_snapshot[pos] = self._deepcopy(shallow_before[pos])
+                        # M-5: `issue.fix()` already mutated entries[pos] IN
+                        # PLACE as a side effect of resolving it (it both
+                        # locates and applies in one call) -- by the time we
+                        # get here the mutation has already happened, so a
+                        # snapshot taken now (from a shallow list of the
+                        # same objects) would capture the POST-fix state,
+                        # corrupting undo fidelity, not the true pre-fix
+                        # state the old code's comment claimed. This only
+                        # happens when a fix resolves to a position outside
+                        # every fixable issue's own predicted entry_index
+                        # (list reordered between the audit run and Fix
+                        # All) -- rare enough, and undo is convenience
+                        # rather than a ledger, that skipping the history
+                        # record for just this one position is safer than
+                        # recording a wrong one.
+                        L.log("apply_fixes: '{}' resolved to unpredicted "
+                              "position {} -- pre-image unavailable, "
+                              "skipping its history record.".format(
+                                  issue.category, pos))
                 else:
                     stale += 1
             except Exception as e:

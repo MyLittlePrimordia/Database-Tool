@@ -638,6 +638,13 @@ class ImportDialog(tk.Toplevel):
                 continue
             if p["action"] == "new":
                 live_ids.add(candidate["id"])
+            elif p["action"] == "changed" and candidate.get("id") != exclude:
+                # id was renamed -- update live_ids so a later proposal in
+                # this same batch can't validate a collision against a slot
+                # this one just vacated, or land on the id this one just
+                # took (see find_replace._apply for the same pattern).
+                live_ids.discard(exclude)
+                live_ids.add(candidate["id"])
             staged.append((p, candidate))
         if problems:
             if not messagebox.askyesno(

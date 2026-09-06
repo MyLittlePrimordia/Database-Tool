@@ -781,6 +781,15 @@ class CurveImportPanel(ttk.Frame):
             problems.append("set the data folder first")
         if self._duplicate_names():
             problems.append("fix duplicate output names")
+        # L-6: an included row whose planned target can't be resolved (e.g.
+        # data folder missing at this instant) would otherwise be silently
+        # dropped from the job list in _run_convert (`if target:`) with no
+        # visible reason -- surface it here instead.
+        if data_dir_ok and getattr(self, "_include_vars", None):
+            for (inc_var, _plan), name_var in zip(self._include_vars, self._name_vars):
+                if inc_var.get() and not self._planned_target(name_var.get()):
+                    problems.append("fix an unresolvable output name")
+                    break
         self.convert_btn.state(["disabled"] if problems else ["!disabled"])
         self.convert_status.set("" if not problems else
                                 "Cannot convert: " + "; ".join(problems))
@@ -1020,6 +1029,12 @@ class CurveImportPanel(ttk.Frame):
             app.dirty = True
             app._mark_audit_dirty()
             app.populate_tree()
+            # H-3: this mutates saved entries directly (bypassing the
+            # editor). If one of them is the entry currently open in the
+            # Editor, the form is now stale -- without this the form keeps
+            # showing the pre-link file list, and a later Save Entry
+            # silently reverts the auto-link that was just applied.
+            app._reload_editor_if_affected({c["pos_hint"] for c in changes})
             app._autosave()
             app._notify_db_changed()
         return n_linked, touched
