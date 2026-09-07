@@ -35,6 +35,7 @@ Built entirely with Python and standard `tkinter`. It requires zero third-party 
 ### Database Audit & Repair
 - Checks database structure, IDs, fields, years, tags, and specs.
 - Finds missing, unlinked, and incorrectly-cased measurement paths.
+- Flags measurement files linked to multiple entries (non-auto-fixable), including case-only path differences (e.g. `data/ADEN/7HZ ZERO.txt` vs `data/aden/7hz zero.txt`, the same file on Windows/macOS).
 - Batch-fixes common database issues.
 - Limits large unlinked-file lists to 200 entries.
 

@@ -163,10 +163,13 @@ def log(msg):
 # ATOMIC WRITE HELPERS (DL-3 / DL-4 / L-1 / L-2 / L-3)
 # --------------------------------------------------------------------------
 # Every persistence writer in this module (and the exporters) goes through
-# replace_atomic: write to <path>.tmp, flush + fsync so the DATA blocks are
-# durable before the rename (os.replace only guarantees the rename itself
-# is atomic -- without fsync a power cut right after a "successful" save
-# can still leave a zero-length or garbage target on NTFS), then replace.
+# replace_atomic: write to a UNIQUE <path>.<pid>.<seq>.tmp (see _unique_tmp),
+# flush + fsync so the DATA blocks are durable before the rename
+# (os.replace only guarantees the rename itself is atomic -- without fsync a
+# power cut right after a "successful" save can still leave a zero-length
+# or garbage target on NTFS), then replace. The unique tmp name means two
+# concurrent writers of the same target (two app instances, overlapping
+# threads) stage in SEPARATE files instead of corrupting one shared tmp.
 #
 # On Windows, os.replace raises PermissionError when another process holds
 # the target open without FILE_SHARE_DELETE (the IEM Tool app reading
@@ -181,6 +184,23 @@ REPLACE_RETRY_DELAY_S = 0.3
 class FileBusyError(OSError):
     """The target file is held open by another process -- the caller can
     present this message verbatim instead of a raw WinError string."""
+
+
+# F3: unique tmp-name suffix for every atomic write. A FIXED "<path>.tmp"
+# let two concurrent writers of the SAME target (two app instances saving
+# one database.json, or overlapping in-process writes) interleave their
+# writes into one shared staging file, so BOTH saves could fail (or a
+# torn file could be renamed into place). PID isolates separate processes;
+# the monotonic counter isolates concurrent writers within this process.
+_tmp_seq = 0
+
+
+def _unique_tmp(path):
+    """Staging path for one atomic write of `path`
+    (<name>.<pid>.<seq>.tmp), unique per call."""
+    global _tmp_seq
+    _tmp_seq += 1
+    return "{}.{}.{}.tmp".format(path, os.getpid(), _tmp_seq)
 
 
 def _fsync_path(path):
@@ -234,7 +254,7 @@ def replace_atomic(tmp_path, path):
 def write_text_atomic(path, text):
     """Write UTF-8 text to `path` atomically and durably (tmp + fsync +
     retrying replace). Cleans up its tmp file on any failure."""
-    tmp_path = path + ".tmp"
+    tmp_path = _unique_tmp(path)
     try:
         with open(tmp_path, "w", encoding="utf-8", newline="\n") as f:
             f.write(text)
@@ -251,7 +271,7 @@ def write_text_atomic(path, text):
 
 def write_bytes_atomic(path, payload):
     """Binary twin of write_text_atomic (gzip exports)."""
-    tmp_path = path + ".tmp"
+    tmp_path = _unique_tmp(path)
     try:
         with open(tmp_path, "wb") as f:
             f.write(payload)
@@ -1049,7 +1069,7 @@ def save_database(path, entries):
     if parent and not os.path.isdir(parent):
         os.makedirs(parent, exist_ok=True)
     ordered = [build_clean_entry(e) for e in entries]
-    tmp_path = "{}.tmp".format(path)
+    tmp_path = _unique_tmp(path)
     try:
         # newline="\n": keep the canonical serialization byte-stable (LF)
         # on every platform -- Windows text mode would otherwise translate
@@ -1103,10 +1123,11 @@ def write_database_backup(db_path):
     if not db_path or not os.path.isfile(db_path):
         return None
     bdir = backup_dir_for(db_path)
+    tmp = None
     try:
         os.makedirs(bdir, exist_ok=True)
         dest = os.path.join(bdir, BACKUP_FILE_NAME)
-        tmp = dest + ".tmp"
+        tmp = _unique_tmp(dest)
         with open(db_path, "rb") as src, open(tmp, "wb") as out:
             shutil.copyfileobj(src, out, length=1024 * 1024)
             out.flush()
@@ -1115,10 +1136,11 @@ def write_database_backup(db_path):
         return dest
     except OSError as e:
         log("Database backup failed: {}".format(e))
-        try:
-            os.remove(os.path.join(bdir, BACKUP_FILE_NAME + ".tmp"))
-        except OSError:
-            pass
+        if tmp is not None:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
         return None
 
 
@@ -1477,6 +1499,8 @@ def load_waivers(db_path):
     beside-the-database file exists but the new one doesn't yet, read the
     old file and adopt it (the old file is left in place untouched -- only
     copied forward -- so nothing is destroyed if something goes wrong)."""
+    if not db_path:
+        return set()
     path = waivers_path_for(db_path)
     if not os.path.isfile(path):
         legacy = _legacy_waivers_path_for(db_path)
@@ -2401,6 +2425,43 @@ def run_full_audit(entries, data_root=None):
                     # Scoped per entry so ignoring one row does not hide
                     # the same finding on every other linked entry.
                     subject="{}@{}".format(rel, idx)))
+
+    # ---- case-insensitive duplicate links -------------------------------
+    # Windows (and macOS) resolve paths case-insensitively, so
+    # "data/ADEN/7HZ ZERO.txt" and "data/aden/7hz zero.txt" are ONE file on
+    # disk -- yet the exact-match pass above would treat them as two
+    # distinct paths and miss the conflict. Group all referenced paths by
+    # lowercase folding; any fold shared by 2+ DIFFERENT exact spellings
+    # across 2+ entries is a duplicate link the user must resolve manually
+    # (unlink from all but the correct entry), so it is never auto-fixed.
+    # A fold collision inside ONE entry (e.g. the same entry listing both
+    # spellings) is left to the dedupe/repair rules, not reported here.
+    fold_map = {}
+    for rel in referenced_map:
+        fold_map.setdefault(rel.lower(), []).append(rel)
+    for fold, variants in fold_map.items():
+        if len(variants) < 2:
+            continue
+        # entries sharing this fold, keyed by the exact spelling they use
+        variant_idx = {rel: referenced_map[rel] for rel in variants}
+        all_idx = sorted({i for idxs in variant_idx.values() for i in idxs})
+        if len(all_idx) < 2:
+            continue
+        for idx in all_idx:
+            eid = entries[idx].get("id", "") or "(no id) #{}".format(idx)
+            own = sorted(rel for rel, idxs in variant_idx.items()
+                         if idx in idxs)
+            others = [rel for rel in variants if rel not in own]
+            parts = ["same-file spelling(s) here: '{}'".format(", ".join(own))]
+            if others:
+                parts.append("elsewhere: '{}'".format(", ".join(others)))
+            msg = ("Entries share one file spelled differently (case-"
+                   "insensitive match '{}'): {}. Manually unlink the wrong "
+                   "entry(es) from that file.".format(fold, "; ".join(parts)))
+            issues.append(AuditIssue(
+                "Duplicate File Link", idx, eid, msg,
+                severity="warning", code="duplicate-file-ci",
+                subject="{}@{}".format(fold, idx)))
 
     if on_disk_set is not None:
         for rel, idxs in referenced_map.items():

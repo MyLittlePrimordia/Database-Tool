@@ -128,6 +128,58 @@ class TestPriceMath:
 
 
 # ===========================================================================
+# F2 regression: the three price-tier consumers must agree. A tier tag
+# appended from the RAW price (instead of the $5-rounded price_tier_basis
+# that validate_entry uses) made merging any duplicate pair with an
+# unrounded winning price (e.g. 498) fail validation with a spurious
+# "Price-tier tag ... does not match price" error.
+# ===========================================================================
+class TestTierConsumerAgreement:
+    @staticmethod
+    def _entry_with_tier(price, tier):
+        return make_entry(price_usd=price,
+                          tags=["Warm", "Smooth", "Relaxed", "Fun", tier])
+
+    def test_basis_tier_never_conflicts_with_validator(self):
+        """A tier computed through price_tier_basis (what validate_entry,
+        MergeDialog and TagSelectorPanel must all use) can never produce a
+        tier-mismatch error -- including just-below-boundary prices where
+        the rounding crosses a tier edge (98->100, 498->500, 1498->1500)."""
+        for p in (0, 20, 98, 99, 100, 103, 497, 498, 499, 500, 1497,
+                  1498, 1499, 1500, 10000):
+            tier = L.price_tier_for(L.price_tier_basis(p))
+            errs = L.validate_entry(self._entry_with_tier(p, tier))
+            tier_errs = [e for e in errs if "Price-tier tag" in e]
+            assert not tier_errs, "price %s -> tier %s: %s" % (p, tier, tier_errs)
+
+    def test_raw_tier_conflicts_for_unrounded_prices(self):
+        """Documents the old bug: skipping price_tier_basis gives prices
+        just under a tier boundary the WRONG tier, which the validator
+        rejects. If this ever fails, tier boundaries moved and BOTH tier
+        consumers need re-checking -- do not just delete this test."""
+        for p in (98, 99, 498, 499, 1498, 1499):
+            raw_tier = L.price_tier_for(p)          # basis step deliberately skipped
+            errs = L.validate_entry(self._entry_with_tier(p, raw_tier))
+            assert any("Price-tier tag" in e for e in errs), \
+                "price %s: raw tier %s no longer conflicts (rules changed?)" % (p, raw_tier)
+
+    def test_main_py_tier_sites_route_through_basis(self):
+        """Static pin on the UI side: every price_tier_for() call in
+        main.py must derive its argument from price_tier_basis, so the
+        merge dialog and the tag picker can never drift away from what
+        validate_entry expects."""
+        import re as _re
+        import main as MAIN
+        with open(MAIN.__file__, encoding="utf-8") as f:
+            src = f.read()
+        args = _re.findall(r"price_tier_for\s*\(\s*([^)]+)", src)
+        assert args, "no price_tier_for() calls found in main.py"
+        for arg in args:
+            assert "price_tier_basis" in arg, \
+                "main.py calls price_tier_for(%s) without price_tier_basis" % arg
+
+
+# ===========================================================================
 # DL-3 / L-1 / L-2 / M-8: atomic persistence
 # ===========================================================================
 class TestAtomicPersistence:
@@ -358,6 +410,92 @@ class TestIdNonLatinAudit:
 
 
 # ===========================================================================
+# Duplicate File Link audit findings (exact + case-insensitive passes)
+# ===========================================================================
+class TestDuplicateFileLinkAudit:
+    @staticmethod
+    def _dup_rows(issues):
+        return [i for i in issues
+                if i.category == "Duplicate File Link"
+                and i.code != "duplicate-file-ci"]
+
+    @staticmethod
+    def _ci_rows(issues):
+        return [i for i in issues if i.code == "duplicate-file-ci"]
+
+    def test_exact_duplicate_link_warns_per_entry(self):
+        es = [L.build_clean_entry(make_entry(
+                  id="7hz_zero", brand="7Hz", model="Zero",
+                  files=["data/ADEN/7HZ ZERO.txt"])),
+              L.build_clean_entry(make_entry(
+                  id="moondrop_chu",
+                  files=["data/ADEN/7HZ ZERO.txt"]))]
+        issues = L.run_full_audit(es)
+        rows = self._dup_rows(issues)
+        assert len(rows) == 2                       # one row per entry
+        assert all(r.severity == "warning" for r in rows)
+        assert all(not r.fix for r in rows)         # never auto-fixed
+        # no case-insensitive extras: exact pass already covered it
+        assert self._ci_rows(issues) == []
+
+    def test_case_variant_duplicate_link_flagged(self):
+        # same file on a case-insensitive disk (Windows/macOS), different
+        # exact spellings per entry -- must be flagged, not missed
+        es = [L.build_clean_entry(make_entry(
+                  id="7hz_zero", brand="7Hz", model="Zero",
+                  files=["data/ADEN/7HZ ZERO.txt"])),
+              L.build_clean_entry(make_entry(
+                  id="moondrop_chu",
+                  files=["data/aden/7hz zero.txt"]))]
+        issues = L.run_full_audit(es)
+        rows = self._ci_rows(issues)
+        assert len(rows) == 2
+        assert all(r.severity == "warning" for r in rows)
+        assert all(not r.fix for r in rows)         # non-auto-fixable
+        # message names both spellings so the user knows what to unlink
+        assert all("7HZ ZERO.txt" in r.message
+                   and "7hz zero.txt" in r.message for r in rows)
+        # waivers stay per-entry: subject scoped to fold + entry index
+        assert len({r.subject for r in rows}) == 2
+
+    def test_unique_files_across_entries_are_clean(self):
+        es = [L.build_clean_entry(make_entry(files=["data/ADEN/7HZ ZERO.txt"])),
+              L.build_clean_entry(make_entry(
+                  id="moondrop_chu",
+                  files=["data/MOONDROP/CHU.txt"]))]
+        issues = L.run_full_audit(es)
+        assert not [i for i in issues if i.category == "Duplicate File Link"]
+
+    def test_no_ci_row_when_only_one_entry_uses_both_spellings(self):
+        # fold collision inside a single entry is a repair/dedupe problem,
+        # not a cross-entry duplicate link
+        es = [L.build_clean_entry(make_entry(
+                  files=["data/ADEN/7HZ ZERO.txt",
+                         "data/aden/7hz zero.txt"])),
+              L.build_clean_entry(make_entry(
+                  id="moondrop_chu",
+                  files=["data/MOONDROP/CHU.txt"]))]
+        issues = L.run_full_audit(es)
+        assert self._ci_rows(issues) == []
+
+    def test_ci_row_fires_when_same_fold_spans_three_entries(self):
+        es = [L.build_clean_entry(make_entry(
+                  id="a_one", brand="A", model="One",
+                  files=["data/SRC/A.TXT"])),
+              L.build_clean_entry(make_entry(
+                  id="b_two", brand="B", model="Two",
+                  files=["data/SRC/a.txt"])),
+              L.build_clean_entry(make_entry(
+                  id="c_three", brand="C", model="Three",
+                  files=["Data/src/A.txt"]))]
+        issues = L.run_full_audit(es)
+        rows = self._ci_rows(issues)
+        assert len(rows) == 3                       # one row per entry
+        # folded path normalization (backslash, //, ./) feeds the fold too
+        assert all("data/src/a.txt" in r.message for r in rows)
+
+
+# ===========================================================================
 # Schema robustness: load_database edge cases
 # ===========================================================================
 class TestLoadDatabase:
@@ -422,7 +560,8 @@ class TestScanCache:
         def reset_memo():
             # the memo deliberately coalesces audit + file-panel walks
             # within ~2 s; the test needs each sub-case to actually walk.
-            L._SCAN_CACHE[:] = (None, 0.0, None, None)
+            # L-1: the record lives in ONE list slot as a single tuple.
+            L._SCAN_CACHE[:] = [(None, 0.0, None, None)]
         reset_memo()
         files, data_dir = L.scan_data_files(str(tmp_path))
         assert files == [] and data_dir is None

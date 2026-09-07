@@ -3093,10 +3093,15 @@ class MergeDialog(tk.Toplevel):
                 else self.a.get(key)
         # tags: the chosen side's set, with the price-tier tag stripped
         # and re-added to match the WINNING price (unioning two tag sets
-        # could create forbidden conflicts or double tiers)
+        # could create forbidden conflicts or double tiers). The tier is
+        # computed from the same $5-rounded basis validate_entry uses
+        # (price_tier_basis), so an unrounded winning price (e.g. 498)
+        # gets the tier the merge itself will be validated against
+        # instead of one that always fails validation.
         chosen_tags = list(merged.get("tags") or [])
         merged["tags"] = [t for t in chosen_tags if t not in L.PRICE_TIER_TAGS]
-        merged["tags"].append(L.price_tier_for(merged.get("price_usd", 0)))
+        merged["tags"].append(
+            L.price_tier_for(L.price_tier_basis(merged.get("price_usd", 0))))
         merged["files"] = list(self.files_union)
         merged["id"] = L.build_id(str(merged.get("brand") or ""),
                                   str(merged.get("model") or ""),
@@ -5162,9 +5167,15 @@ class MainApp(tk.Tk):
 
     def _after_save(self, path, ordered, snap, gz_path, extra_note=""):
         self.entries = ordered
-        current_id = None
-        if self.editing_index is not None and 0 <= self.editing_index < len(self.entries):
-            current_id = self.entries[self.editing_index].get("id")
+        # F1: resolve the editor's entry by ID, never by list position.
+        # save_database() sorted self.entries IN PLACE, so any index captured
+        # after it (like self.editing_index, which predates the sort) now
+        # points at whatever entry slid into that slot -- re-highlighting
+        # (and silently reloading into the form) the WRONG entry after any
+        # save that reordered the list. editor.original_id is the plain
+        # string id of the entry the form is actually holding; it is
+        # maintained by every editor flow and unaffected by the sort.
+        current_id = getattr(self.editor, "original_id", None) or None
         self.db_path = path
         self.dirty = False
         try:
@@ -5172,8 +5183,27 @@ class MainApp(tk.Tk):
         except OSError:
             pass
         self._persist_history()
-        # everything is committed to disk now -- do not offer the pre-save
-        # autosave as "recovery" on the next launch.
+        # F5: everything is committed to disk now, so any pending/stale
+        # autosave snapshot is redundant. Kill the coalesced timer and drop
+        # any queued snapshot BEFORE writing the seen-marker: a timer armed
+        # by a pre-save commit used to survive the save, fire afterwards,
+        # and mint a newer-than-database but content-identical autosave
+        # that the next launch offered as a bogus "recovery" file. A worker
+        # already mid-write is joined (bounded, same pattern as the exit
+        # path) so its result lands BEFORE the marker below and is covered
+        # by it instead of becoming a phantom.
+        self._autosave_cancel()
+        if "_as_lock" in self.__dict__:
+            with self._as_lock:
+                self._as_pending = None
+            th = getattr(self, "_as_thread", None)
+            if th is not None and th.is_alive():
+                try:
+                    th.join(timeout=2.0)
+                except Exception:
+                    pass
+        # do not offer any of this session's autosaves as "recovery" on
+        # the next launch.
         L.mark_autosave_seen(self.db_path)
         if current_id:
             for i, e in enumerate(self.entries):
@@ -5182,6 +5212,11 @@ class MainApp(tk.Tk):
                     break
             else:
                 self.editing_index = None
+        else:
+            # no id (new/id-less entry in the form): a positional editing
+            # index is meaningless after the sort -- leave it cleared rather
+            # than keep one that may point at a different entry now.
+            self.editing_index = None
         self.populate_tree()
         if self.editing_index is not None:
             iid = "entry:{}".format(self.editing_index)
