@@ -721,6 +721,66 @@ class TestAiImportParsing:
         assert len(problems) == 1
         assert len(staged) == len(set(staged))  # no duplicate ids ever staged
 
+    # -- brand spelling normalization (Import Entries) ----------------------
+    def test_canonical_spellings_majority_wins(self):
+        entries = [make_entry(brand="7HZ", id="7hz_sal_notes"),
+                   make_entry(brand="7HZ", model="Timeless",
+                              id="7hz_timeless"),
+                   make_entry(brand="7Hz", model="Zero",
+                              id="7hz_zero")]
+        canon = L.brand_canonical_spellings(entries)
+        assert canon[L._brand_fold("7HZ")] == "7HZ"
+
+    def test_canonical_spellings_tie_breaks_alphabetically(self):
+        entries = [make_entry(brand="Moondrop", id="moondrop_a"),
+                   make_entry(brand="MoonDrop", model="Aria",
+                              id="moondrop_aria")]
+        canon = L.brand_canonical_spellings(entries)
+        assert canon[L._brand_fold("moondrop")] == "MoonDrop"
+
+    def test_canonical_spellings_different_names_never_merge(self):
+        entries = [make_entry(brand="ISN", id="isn_hype"),
+                   make_entry(brand="ISN Audio", model="Hype 2",
+                              id="isn_audio_hype_2")]
+        canon = L.brand_canonical_spellings(entries)
+        assert canon.get(L._brand_fold("ISN")) == "ISN"
+        assert canon.get(L._brand_fold("ISN Audio")) == "ISN Audio"
+        assert L._brand_fold("ISN") != L._brand_fold("ISN Audio")
+
+    def test_normalize_then_classify_folds_case_only_brand(self):
+        """The Import flow normalizes brands BEFORE classify_against, so a
+        case-only brand difference stops showing up as a spurious CHANGED
+        row and the entry lands under the database's spelling."""
+        existing = [make_entry(brand="7HZ", model="Zero", id="7hz_zero")]
+        incoming = make_entry(brand="7Hz", model="Zero", id="7hz_zero",
+                               price_usd=45)
+        parsed = {"objects": [incoming], "replacements": []}
+        # the dialog's _normalize_brands step (mirrored inline here: no Tk)
+        canon = L.brand_canonical_spellings(existing)
+        for obj in parsed["objects"]:
+            want = canon.get(L._brand_fold(obj.get("brand") or ""))
+            if want and want != (obj.get("brand") or "").strip():
+                obj["brand"] = want
+        assert incoming["brand"] == "7HZ"
+        props = AI.classify_against(existing, parsed)
+        assert len(props) == 1
+        assert props[0]["action"] == "changed"
+        assert all(f != "brand" for f, _o, _n in props[0]["changes"])
+
+    def test_normalize_never_rewrites_unrelated_brands(self):
+        """An AI reply for a brand the database doesn't spell at all, or a
+        NEARBY but differently-folded name, must pass through untouched."""
+        existing = [make_entry(brand="ISN Audio", id="isn_audio_hype")]
+        parsed = {"objects": [make_entry(brand="ISN", model="Hype 2",
+                                         id="isn_hype_2")],
+                  "replacements": []}
+        canon = L.brand_canonical_spellings(existing)
+        for obj in parsed["objects"]:
+            want = canon.get(L._brand_fold(obj.get("brand") or ""))
+            if want and want != (obj.get("brand") or "").strip():
+                obj["brand"] = want
+        assert parsed["objects"][0]["brand"] == "ISN"
+
 
 # ===========================================================================
 # L-5: CJK-aware ellipsization

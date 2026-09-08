@@ -510,6 +510,35 @@ def brand_spelling_fixes(entries):
     return fixes
 
 
+def brand_canonical_spellings(entries):
+    """Map fold -> the canonical spelling for that brand, derived the same
+    way brand_spelling_fixes picks its majority (most entries; ties broken
+    alphabetically). Used by the Import Entries flow to rewrite an AI
+    reply's brand casing ("7Hz" -> "7HZ") to however the user's database
+    already spells it. Only exact-fold matches count ("ISN" vs "ISN
+    Audio" fold differently and are never touched) -- no online lookup,
+    no fuzzy matching."""
+    canonical = {}
+    for e in entries:
+        brand = (e.get("brand") or "").strip()
+        if not brand:
+            continue
+        fold = _brand_fold(brand)
+        if not fold:
+            continue
+        canonical.setdefault(fold, {}).setdefault(brand, 0)
+        canonical[fold][brand] += 1
+    return {fold: sorted(spellings.items(),
+                         key=lambda kv: (-kv[1], kv[0]))[0][0]
+            for fold, spellings in canonical.items()}
+
+
+def brand_fold_of(brand):
+    """Public face of _brand_fold for cross-module callers (ai_import):
+    fold key under which brand_canonical_spellings is keyed."""
+    return _brand_fold(brand)
+
+
 def price_tier_for(price_usd):
     try:
         p = float(price_usd)

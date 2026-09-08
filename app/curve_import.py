@@ -448,11 +448,6 @@ class CurveImportPanel(ttk.Frame):
             sub, text="Open output folder after converting",
             variable=self.openfolder_var, style="Card.TCheckbutton"
         ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 2))
-        self.remove_source_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            sub, text="Remove source files after conversion",
-            variable=self.remove_source_var, style="Card.TCheckbutton"
-        ).grid(row=2, column=2, columnspan=2, sticky="e", pady=(6, 2))
 
         hint = ("\u26a0 Set the data folder first (File \u25b8 Set Data Folder...)"
                 if not self.app.get_data_root() else "")
@@ -904,21 +899,50 @@ class CurveImportPanel(ttk.Frame):
                 other_targets.setdefault(link_id, []).extend(out_paths)
 
         notes = []
-        n_linked_current = self._link_written(current_written) if current_written else 0
-        if n_linked_current:
-            target = self.app.editor.original_id or "(new unsaved entry)"
-            notes.append("{} linked to {} (current entry) -- click Save Entry "
-                        "to keep them".format(n_linked_current, target))
+        n_linked_current = 0
+        if current_written:
+            # Route current-entry links through the SAME direct-commit path
+            # as explicit "Link to ..." targets whenever the form cleanly
+            # mirrors a saved entry -- the old form-only linking left the
+            # changes invisible until the user switched tabs and clicked
+            # Save Entry. Only a dirty form, or a brand-new unsaved entry,
+            # still uses form-state linking (a reload would wipe the
+            # user's edits / there is no database entry to commit to yet).
+            editor = self.app.editor
+            eid = getattr(editor, "original_id", None)
+            form_clean = (eid and not editor.form_is_dirty())
+            target = None
+            if form_clean:
+                idx = next((i for i, e in enumerate(self.app.entries)
+                            if e.get("id") == eid), None)
+                if idx is not None:
+                    target = {eid: current_written}
+            if target is not None:
+                n_linked, touched_ids = self._link_to_other_entries(target)
+                if n_linked and touched_ids:
+                    notes.append("{} linked to {} -- saved, undoable".format(
+                        n_linked, touched_ids[0]))
+                    n_linked_current = n_linked
+            else:
+                n_linked_current = self._link_written(current_written)
+                if n_linked_current:
+                    tgt = eid or "(new unsaved entry)"
+                    notes.append("{} linked to {} (unsaved entry form) -- "
+                                 "click Save Entry to keep them".format(
+                                     n_linked_current, tgt))
 
         n_linked_other, other_ids = self._link_to_other_entries(other_targets)
         if n_linked_other:
             notes.append("{} linked to {} other entr{}".format(
                 n_linked_other, len(other_ids), "y" if len(other_ids) == 1 else "ies"))
 
-        if self.remove_source_var.get() and converted_sources:
-            removed = self._remove_converted_sources(converted_sources)
-            if removed:
-                notes.append("{} source file(s) removed from the queue".format(removed))
+        # Converted sources leave the queue automatically -- the queue is a
+        # staging area; once a file has been converted it is done. (Rows can
+        # only ever convert once, and their targets now commit directly, so
+        # leaving them behind just forced a manual X-out.)
+        removed = self._remove_converted_sources(converted_sources)
+        if removed:
+            notes.append("{} source file(s) removed from the queue".format(removed))
 
         linked_note = ("  \u2022 " + "; ".join(notes)) if notes else ""
         dest = os.path.dirname(written[0])
@@ -934,9 +958,9 @@ class CurveImportPanel(ttk.Frame):
 
     def _remove_converted_sources(self, source_paths):
         """Drop the queued source files that fed a successful conversion
-        (opt-in via 'Remove source files after conversion'). Only removes
-        entries still present in the queue -- never touches files a plan
-        didn't actually convert."""
+        (automatic: converted rows are done and leave the queue right
+        away). Only removes entries still present in the queue -- never
+        touches files a plan didn't actually convert."""
         norm_sources = {os.path.normcase(os.path.abspath(p)) for p in source_paths}
         before = len(self.files)
         self.files = [p for p in self.files if p not in norm_sources]
@@ -987,7 +1011,10 @@ class CurveImportPanel(ttk.Frame):
         touched in the same conversion batch -- this is what lets paired/
         averaged measurement files be linked to DIFFERENT entries in a
         single Convert & Save click, not just the entry open in the
-        Editor. Returns (n_files_linked, [entry_ids_touched])."""
+        Editor. Also used for "Current Entry" links whenever the form
+        cleanly mirrors a saved entry (see _finish_convert), so they
+        commit immediately instead of waiting for a manual Save Entry.
+        Returns (n_files_linked, [entry_ids_touched])."""
         if not other_targets:
             return 0, []
         app = self.app

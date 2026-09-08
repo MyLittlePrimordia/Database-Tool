@@ -485,6 +485,7 @@ class ImportDialog(tk.Toplevel):
                                           "load an AI reply first.")
             return
         parsed = parse_ai_output(raw)
+        n_normalized = self._normalize_brands(parsed)
         self.proposals = classify_against(self.app.entries, parsed)
         self._render()
 
@@ -501,12 +502,40 @@ class ImportDialog(tk.Toplevel):
             bits.append("{} deletion(s) proposed".format(n_del))
         if n_bad:
             bits.append("{} unusable".format(n_bad))
+        if n_normalized:
+            bits.append("{} brand spelling{} normalized to the database's".format(
+                n_normalized, "s were" if n_normalized != 1 else " was"))
         self.parse_lbl.configure(
             text=", ".join(bits) if bits else
             "No changes found (the AI output matches the current database).")
         for err in parsed.get("errors", [])[:2]:
             self.parse_lbl.configure(
                 text=self.parse_lbl.cget("text") + "  |  " + err[:80])
+
+    def _normalize_brands(self, parsed):
+        """Rewrite each proposal object's brand to the database's majority
+        spelling for that exact brand fold ("7Hz" -> "7HZ" when the db
+        spells it "7HZ"). Case/spacing/punctuation variants fold together;
+        genuinely different spellings ("ISN" vs "ISN Audio") fold apart
+        and are never touched -- no online lookup, no fuzzy matching.
+        Runs BEFORE classification so a case-only brand difference is no
+        longer reported as a CHANGED row (the identity match sees the
+        normalized brand), and the review rows show the database
+        spelling. Mutates parsed in place; returns the rewrite count."""
+        canon = L.brand_canonical_spellings(self.app.entries)
+        n = 0
+        for bucket in (parsed.get("objects", []),
+                       [r[1] for r in parsed.get("replacements", [])
+                        if isinstance(r[1], dict)]):
+            for obj in bucket:
+                raw_brand = str(obj.get("brand") or "").strip()
+                if not raw_brand:
+                    continue
+                want = canon.get(L.brand_fold_of(raw_brand))
+                if want and want != raw_brand:
+                    obj["brand"] = want
+                    n += 1
+        return n
 
     def _render(self):
         self.tree.delete(*self.tree.get_children())
