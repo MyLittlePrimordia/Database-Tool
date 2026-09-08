@@ -5371,6 +5371,16 @@ class MainApp(tk.Tk):
             self._all_brand_nodes[node] = idxs
             if query:
                 self._materialize_brand(node, idxs)
+            else:
+                # F-8 virtualization keeps closed brands childless for
+                # speed -- but a childless item renders NO disclosure
+                # arrow, so the brand could never be expanded at all and
+                # its entries were unreachable (this stranded the whole
+                # tree one click deep). One placeholder child restores
+                # the arrow; it is swapped for the real rows on first
+                # expansion (see _materialize_brand).
+                self.tree.insert(node, "end",
+                                 iid="placeholder:{}".format(brand), text="")
         # restore what we captured (only where still valid after rebuild)
         for iid in self.tree.get_children(""):
             if iid in prev_open:
@@ -5417,36 +5427,84 @@ class MainApp(tk.Tk):
     # ------------------------------------------------------------------
     # F-8: virtualized brand nodes
     # ------------------------------------------------------------------
+    def _safe_sort_key(self, i):
+        """sort_key that can never raise (stale index, non-dict entry):
+        a bad value sorts first instead of nuking the brand page."""
+        try:
+            return L.sort_key(self.entries[i])
+        except Exception:
+            return ("", "", "")
+
     def _materialize_brand(self, brand_iid, idxs):
         """Insert the entry rows under one brand node (its virtual page).
         Idempotent: skipped for brands that are already materialized."""
         if brand_iid in self._materialized:
             return
         self._materialized.add(brand_iid)
-        for idx in sorted(idxs, key=lambda i: L.sort_key(self.entries[i])):
-            e = self.entries[idx]
-            # Model [Variant] only -- the internal id stays out of the
-            # row text (cleaner tree); it is still one lookup away and
-            # is shown in the hover tooltip instead.
-            label = e.get("model", "")
-            if e.get("variant"):
-                label += "  [{}]".format(e["variant"])
-            iid = "entry:{}".format(idx)
-            self._full_labels[iid] = label
-            self.tree.insert(brand_iid, "end", iid=iid, text=label)
+        # swap the expansion placeholder (see populate_tree) for the real
+        # rows -- a leftover placeholder would sit beside them as a blank
+        # phantom row.
+        for child in self.tree.get_children(brand_iid):
+            if child.startswith("placeholder:"):
+                self.tree.delete(child)
+        # Per-row isolation: real-world databases can hold non-string
+        # scalars (model: 2, variant: null) that used to abort the whole
+        # page mid-loop -- the brand then expanded to zero rows forever
+        # (placeholder already gone, idempotency guard already set). One
+        # malformed entry must never hide its healthy siblings; the
+        # audit tab is where malformed values get flagged and fixed.
+        for idx in sorted(idxs, key=self._safe_sort_key):
+            try:
+                e = self.entries[idx]
+                label = str(e.get("model") or "")
+                if e.get("variant"):
+                    label += "  [{}]".format(e["variant"])
+                iid = "entry:{}".format(idx)
+                self._full_labels[iid] = label
+                self.tree.insert(brand_iid, "end", iid=iid, text=label)
+            except Exception:
+                continue
 
     def _on_brand_expand(self, _event=None):
-        """<<TreeviewOpen>>: mount the opened brand's entry rows on demand."""
+        """<<TreeviewOpen>>: mount the opened brand's entry rows on demand.
+        Two complementary triggers, because Tk fires this event BEFORE it
+        flips the node's -open flag on real clicks (verified empirically:
+        at event time focus is already the clicked brand but -open still
+        reads false -- a scan for open nodes sees nothing yet), while a
+        programmatic item(..., open=True) fires no event at all:
+          1. the focused row -- a real click/keypress moves focus onto
+             the toggled brand before the event fires;
+          2. any node already reading open-but-unmaterialized (a
+             genuinely open page missed by an earlier pass).
+        Programmatic openers (_ensure_entry_visible, the populate_tree
+        restore loop) also materialize directly, so every path is
+        covered. Each mount is isolated so one bad brand page never
+        blocks the rest."""
+        focus = ""
         try:
             focus = self.tree.focus()
         except Exception:
-            return
-        if not focus or not focus.startswith("brand:"):
-            return
-        idxs = self._all_brand_nodes.get(focus)
-        if idxs is None:
-            return
-        self._materialize_brand(focus, idxs)
+            pass
+        if focus and focus.startswith("brand:"):
+            idxs = getattr(self, "_all_brand_nodes", {}).get(focus)
+            if idxs is not None:
+                try:
+                    self._materialize_brand(focus, idxs)
+                except Exception:
+                    pass
+        for brand_iid, idxs in list(
+                getattr(self, "_all_brand_nodes", {}).items()):
+            if brand_iid in self._materialized:
+                continue
+            try:
+                opened = self.tree.item(brand_iid, "open")
+            except Exception:
+                continue            # node gone (tree rebuilt under us)
+            if opened:
+                try:
+                    self._materialize_brand(brand_iid, idxs)
+                except Exception:
+                    continue        # one bad page must not block the rest
         self._apply_ellipsis()
 
     def _ensure_entry_visible(self, entry_iid):

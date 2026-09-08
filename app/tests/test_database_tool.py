@@ -30,6 +30,7 @@ import curve_logic as CL                  # noqa: E402
 import export_tools as EX                 # noqa: E402
 import fr_analysis as FA                  # noqa: E402
 import ai_import as AI                    # noqa: E402
+import main as MAIN                       # noqa: E402
 from main import ellipsize, ellipsize_path, entry_matches_query  # noqa: E402
 
 
@@ -878,3 +879,213 @@ class TestTagRules:
     def test_tier_must_match_price(self):
         errs = L.validate_entry(make_entry(tags=["Flagship", "Warm", "Smooth", "Relaxed"]))
         assert any("Price-tier tag" in e for e in errs)
+
+# ===========================================================================
+# Tree virtualization + import jump (needs a display; skipped headless).
+# The F-8 virtualized tree inserts brand nodes WITHOUT entry rows: brands
+# need a placeholder child or ttk shows no disclosure arrow (unexpandable
+# tree), and ImportDialog._apply must mount the row BEFORE touching it
+# (tree.parent/see/selection_set raise TclError on unknown iids -- the
+# old order aborted _apply, so the dialog never closed and no jump
+# happened even though the import itself had landed).
+# ===========================================================================
+class _StubEditor:
+    def __init__(self):
+        self.loaded = []
+        self.original_id = None
+
+    def form_is_dirty(self):
+        return False
+
+    def load_entry(self, entry):
+        self.loaded.append(dict(entry))
+
+
+class _StubNotebook:
+    def __init__(self):
+        self.selected = []
+
+    def select(self, tab):
+        self.selected.append(tab)
+
+
+@pytest.fixture()
+def tk_tree_app():
+    """Minimal stand-in exposing what MainApp.populate_tree /
+    _ensure_entry_visible / ImportDialog._apply touch, with a REAL
+    ttk.Treeview so virtualization + selection behave for real."""
+    import tkinter as tk
+    from tkinter import ttk
+    import types
+    try:
+        root = tk.Tk()
+    except Exception:
+        pytest.skip("no display for Tk integration tests")
+    root.withdraw()
+    try:
+        app = types.SimpleNamespace()
+        app.entries = []
+        app.tree = ttk.Treeview(root, show="tree")
+        app.tree.pack()
+        app.search_var = tk.StringVar(value="")
+        app.status_var = tk.StringVar(value="")
+        app.entries_header_var = tk.StringVar(value="")
+        app._search_debounce_id = None
+        app._full_labels = {}
+        app._disp_cache = {}
+        app._ellipsis_fp = None
+        app._ellipsis_after = None
+        app._all_brand_nodes = {}
+        app._materialized = set()
+        app._marquee_after = None
+        app._marquee = None
+        app.editing_index = None
+        app._selected_iid = None
+        app.dirty = False
+        app.editor = _StubEditor()
+        app.notebook = _StubNotebook()
+        app.ops = []
+        app._stop_tree_marquee = lambda: MAIN.MainApp._stop_tree_marquee(app)
+        app._apply_ellipsis = lambda: MAIN.MainApp._apply_ellipsis(app)
+        app._on_brand_expand = lambda e=None: MAIN.MainApp._on_brand_expand(
+            app, e)
+        app._materialize_brand = lambda brand_iid, idxs: \
+            MAIN.MainApp._materialize_brand(app, brand_iid, idxs)
+        app._safe_sort_key = lambda i: MAIN.MainApp._safe_sort_key(app, i)
+        app._ensure_entry_visible = lambda iid: \
+            MAIN.MainApp._ensure_entry_visible(app, iid)
+        app.populate_tree = lambda restore_selection=True: \
+            MAIN.MainApp.populate_tree(app, restore_selection)
+        app._deepcopy = MAIN.MainApp._deepcopy
+        app._record_op = lambda k, d, c: app.ops.append((k, d, c))
+        app._mark_audit_dirty = lambda: None
+        app.refresh_spell_vocab = lambda: None
+        app._autosave = lambda: None
+        app._notify_db_changed = lambda: None
+        yield app
+    finally:
+        try:
+            root.destroy()
+        except Exception:
+            pass
+
+
+class TestVirtualizedTree:
+    def test_brand_nodes_carry_placeholder_for_arrow(self, tk_tree_app):
+        app = tk_tree_app
+        app.entries = [make_entry(brand="Moondrop", model="Chu",
+                                  id="moondrop_chu")]
+        app.populate_tree()
+        brands = app.tree.get_children("")
+        assert brands == ("brand:Moondrop",)
+        kids = app.tree.get_children(brands[0])
+        # exactly one placeholder child -> ttk renders the disclosure
+        # arrow; no entry rows mounted yet (lazy)
+        assert len(kids) == 1 and kids[0].startswith("placeholder:")
+        assert not app.tree.exists("entry:0")
+
+    def test_brand_expansion_mounts_rows(self, tk_tree_app):
+        app = tk_tree_app
+        app.entries = [make_entry(brand="Moondrop", model="Chu",
+                                  id="moondrop_chu"),
+                       make_entry(brand="Moondrop", model="Aria",
+                                  id="moondrop_aria")]
+        app.populate_tree()
+        node = app.tree.get_children("")[0]
+        app.tree.item(node, open=True)
+        app._on_brand_expand()
+        kids = set(app.tree.get_children(node))
+        assert kids == {"entry:0", "entry:1"}
+        assert app.tree.exists("entry:0")
+
+    def test_expand_event_mounts_before_open_flag_flips(self, tk_tree_app):
+        """Tk fires <<TreeviewOpen>> BEFORE flipping the node's -open
+        flag on real clicks (focus is already on the clicked brand, but
+        -open still reads false). The handler must mount via focus: a
+        scan for open nodes sees nothing and the brand expands empty
+        (only rendering when some LATER expansion re-runs the handler).
+        This replicates the exact event-time state of an arrow click."""
+        app = tk_tree_app
+        app.entries = [make_entry(brand="Moondrop", model="Chu",
+                                  id="moondrop_chu"),
+                       make_entry(brand="7HZ", model="Zero",
+                                  id="7hz_zero")]
+        app.populate_tree()
+        moondrop = "brand:Moondrop"
+        seven = "brand:7HZ"
+        assert set(app.tree.get_children("")) == {moondrop, seven}
+        # arrow-click state: focus moved, -open NOT yet flipped
+        app.tree.focus(moondrop)
+        assert not app.tree.item(moondrop, "open")
+        app.tree.event_generate("<<TreeviewOpen>>")
+        app._on_brand_expand()
+        assert set(app.tree.get_children(moondrop)) == {"entry:0"}
+        # the untouched brand stays lazy (placeholder only)
+        assert not app.tree.exists("entry:1")
+        assert list(app.tree.get_children(seven))[0].startswith(
+            "placeholder:")
+
+    def test_brand_with_malformed_values_still_mounts(self, tk_tree_app):
+        """Real-world databases carry non-string scalars (model: 2,
+        variant: null from hand edits / AI output). Pre-fix these raised
+        inside _materialize_brand AFTER the placeholder was deleted, so
+        the brand expanded to zero rows forever."""
+        app = tk_tree_app
+        app.entries = [make_entry(brand="Weird", model=2, id="weird_2"),
+                       make_entry(brand="Weird", model="Ok", variant=3,
+                                  id="weird_ok"),
+                       make_entry(brand="Weird", model=None, variant="X",
+                                  id="weird_x"),
+                       make_entry(brand="Weird", model=None, id="weird_noname")]
+        app.populate_tree()
+        node = app.tree.get_children("")[0]
+        app.tree.item(node, open=True)
+        app._on_brand_expand()
+        kids = set(app.tree.get_children(node))
+        assert kids == {"entry:0", "entry:1", "entry:2", "entry:3"}
+
+    def test_sort_key_survives_non_string_values(self):
+        assert L.sort_key({"brand": "B", "model": 2,
+                           "variant": None}) == ("b", "2", "")
+        assert L.sort_key({"brand": ["X"], "model": None}) == \
+            ("['x']", "", "")
+        assert L.format_entry_label({"brand": "B", "model": 2,
+                                     "variant": None,
+                                     "id": "x"}) == "B 2"
+
+    def test_import_apply_closes_dialog_and_selects_new_entry(
+            self, tk_tree_app, monkeypatch):
+        """End-to-end of the reported flaw: a NEW entry under a brand
+        whose rows were never mounted. Pre-fix, tree.parent() raised
+        TclError here, so the import landed but the dialog stayed open
+        and nothing was selected."""
+        import tkinter as tk
+        app = tk_tree_app
+        app.entries = [make_entry(brand="Moondrop", model="Chu",
+                                  id="moondrop_chu")]
+        monkeypatch.setattr(AI.win_drop, "enable_native_file_drop",
+                            lambda self, cb: False)
+        root = app.tree.winfo_toplevel()
+        dlg = AI.ImportDialog.__new__(AI.ImportDialog)
+        tk.Toplevel.__init__(dlg, root)
+        dlg.app = app
+        new_entry = make_entry(brand="7HZ", model="Zero", variant="",
+                               id="7hz_zero", price_usd=45)
+        dlg.proposals = [{"action": "new", "entry": new_entry}]
+        dlg.include = {"p0": True}
+        closed = []
+        dlg.destroy = lambda: closed.append(True)
+        # the 7HZ brand exists in the db after staging but its page was
+        # never mounted -- the exact shape that used to crash parent()
+        dlg._apply()
+        assert closed, "dialog must close after a successful apply"
+        assert app.tree.selection() == ("entry:1",)
+        assert app.editor.loaded and \
+            app.editor.loaded[-1]["id"] == "7hz_zero"
+        assert app.notebook.selected and \
+            app.notebook.selected[-1] is app.editor
+        try:
+            root.update_idletasks()
+            dlg.destroy()
+        except Exception:
+            pass

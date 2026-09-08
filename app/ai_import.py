@@ -779,13 +779,18 @@ class ImportDialog(tk.Toplevel):
                         app._search_debounce_id = None
                     app.populate_tree()
                 iid = "entry:{}".format(idx)
-                parent = app.tree.parent(iid)
-                if parent:
-                    app.tree.item(parent, open=True)
+                # F-8: the row's brand page may not be materialized yet in
+                # the virtualized tree -- mount it FIRST. parent()/see()/
+                # selection_set() all raise TclError on unknown iids, and
+                # the old order (parent before ensure-visible) aborted
+                # _apply right here whenever the row wasn't mounted yet:
+                # the import landed but the dialog never closed and no
+                # jump happened. Same safe order as reveal_entry().
+                app._ensure_entry_visible(iid)
                 try:
-                    # F-8: the row's brand page may not be materialized
-                    # yet in the virtualized tree -- mount it first.
-                    app._ensure_entry_visible(iid)
+                    parent = app.tree.parent(iid)
+                    if parent:
+                        app.tree.item(parent, open=True)
                     app.tree.see(iid)
                     app.tree.selection_set(iid)
                 except Exception:

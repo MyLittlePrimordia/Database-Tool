@@ -955,10 +955,16 @@ def build_clean_entry(source, notes=None, where=""):
 
 
 def sort_key(entry):
+    # str() coercion: real-world databases occasionally carry non-string
+    # scalars (model: 2, variant: ["X"], brand: null from hand edits or
+    # AI output) -- without it .lower() raised, and the one shared call
+    # site that sorts whole brand pages (MainApp._materialize_brand)
+    # mounted ZERO rows for the brand. Sorting is byte-identical for
+    # well-formed string data.
     return (
-        (entry.get("brand") or "").lower(),
-        (entry.get("model") or "").lower(),
-        (entry.get("variant") or "").lower(),
+        str(entry.get("brand") or "").lower(),
+        str(entry.get("model") or "").lower(),
+        str(entry.get("variant") or "").lower(),
     )
 
 
@@ -966,12 +972,12 @@ def format_entry_label(entry):
     """Human-readable 'Brand Model [Variant]' display string (as opposed to
     the underscored id), used anywhere entries are listed for the user to
     pick from (e.g. the Import tab's link-to-entry dropdown)."""
-    parts = [entry.get("brand") or "", entry.get("model") or ""]
+    parts = [str(entry.get("brand") or ""), str(entry.get("model") or "")]
     label = " ".join(p for p in parts if p).strip()
-    variant = (entry.get("variant") or "").strip()
+    variant = str(entry.get("variant") or "").strip()
     if variant:
         label = "{}  [{}]".format(label, variant) if label else variant
-    return label or (entry.get("id") or "(unnamed entry)")
+    return label or str(entry.get("id") or "(unnamed entry)")
 
 
 def describe_entry_change(before, after, max_fields=3):
