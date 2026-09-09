@@ -30,9 +30,43 @@ import theme
 
 def _sanitize_folder(name):
     cleaned = CL.sanitize_filename(name)
-    if cleaned == "curve.txt" or cleaned in (".", ".."):
+    if cleaned.lower() == "curve.txt" or cleaned in (".", ".."):
         return ""
     return cleaned
+
+
+def _uppercase_var_live(var, widget=None):
+    """Attach a live UPPERCASE enforcer to a StringVar.
+
+    Whatever the user types (caps-lock on or off, paste, etc.) is
+    immediately converted to UPPERCASE so the widget always shows
+    uppercase. Re-entrant safe: the second trace firing sees
+    value == upper and no-ops. Cursor position is preserved when the
+    widget is supplied.
+    """
+    def _cb(*_args):
+        val = var.get()
+        up = val.upper()
+        if val != up:
+            pos = None
+            if widget is not None:
+                try:
+                    pos = widget.index(tk.INSERT)
+                except Exception:
+                    pos = None
+            var.set(up)
+            if widget is not None and pos is not None:
+                try:
+                    widget.icursor(pos)
+                except Exception:
+                    pass
+    try:
+        var.trace_add("write", _cb)
+    except Exception:
+        pass
+    # normalize any preset value immediately
+    if var.get() != var.get().upper():
+        var.set(var.get().upper())
 
 
 class CurveImportPanel(ttk.Frame):
@@ -510,12 +544,14 @@ class CurveImportPanel(ttk.Frame):
             parent=self)
         if not name:
             return
-        name = _sanitize_folder(name.strip())
+        # Always UPPERCASE: no matter what case the user typed (caps-lock
+        # on or off), the source folder is created/entered as uppercase.
+        name = _sanitize_folder(name.strip()).upper()
         if not name:
             messagebox.showwarning("Database Tool", "That folder name is not usable.")
             return
         path = os.path.join(data_dir, *[
-            seg for seg in (_sanitize_folder(s) for s in name.split("/")) if seg])
+            seg for seg in (_sanitize_folder(s).upper() for s in name.split("/")) if seg])
         try:
             os.makedirs(path, exist_ok=True)
         except OSError as e:
@@ -642,7 +678,7 @@ class CurveImportPanel(ttk.Frame):
             if count:
                 final = "{} ({}){}".format(stem, count + 1, ext.lower())
             taken[final.lower()] = count + 1
-            display_name = os.path.splitext(final)[0]
+            display_name = os.path.splitext(final)[0].upper()
 
             row_bg = theme.BG_CARD if i % 2 == 0 else \
                 theme.blend(theme.BG_CARD, theme.TEXT_MAIN, 0.04)
@@ -668,6 +704,9 @@ class CurveImportPanel(ttk.Frame):
                               insertbackground=theme.TEXT_MAIN, relief="flat",
                               font=self._font, width=22)
             entry.pack(side="left", padx=(0, 2), pady=3, ipady=2)
+            # Always UPPERCASE: whatever the user types into the rename
+            # box shows/stays uppercase regardless of caps-lock.
+            _uppercase_var_live(name_var, entry)
             entry.bind("<FocusOut>", lambda e, v=name_var: self._on_name_edit(v))
             entry.bind("<Return>", lambda e, v=name_var: self._on_name_edit(v))
 
@@ -716,7 +755,10 @@ class CurveImportPanel(ttk.Frame):
         raw_sub = self.subfolder_var.get().strip()
         parts = [ _sanitize_folder(s) for s in raw_sub.split("/") if s.strip() ]
         parts = [p for p in parts if p]
-        stem = os.path.splitext(CL.sanitize_filename(name_value.strip()))[0]
+        # Always UPPERCASE the measurement filename regardless of how it
+        # was typed (backend guarantee even if live-typing was bypassed).
+        stem = os.path.splitext(
+            CL.sanitize_filename((name_value or "").strip()))[0].upper()
         clean_name = "{}.txt".format(stem)
         return os.path.join(data_dir, *parts, clean_name) if parts else \
             os.path.join(data_dir, clean_name)
@@ -743,7 +785,8 @@ class CurveImportPanel(ttk.Frame):
                 text="\u26a0 exists" if target and os.path.exists(target) else "")
 
     def _on_name_edit(self, name_var):
-        clean = os.path.splitext(CL.sanitize_filename(name_var.get().strip()))[0]
+        clean = os.path.splitext(
+            CL.sanitize_filename(name_var.get().strip()))[0].upper()
         if clean != name_var.get():
             name_var.set(clean)
         self._refresh_exists_markers()
