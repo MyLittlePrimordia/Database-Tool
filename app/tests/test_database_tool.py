@@ -784,6 +784,83 @@ class TestAiImportParsing:
 
 
 # ===========================================================================
+# Import auto-fix (price rounding + tier) + per-field merge
+# ===========================================================================
+class TestImportAutoFix:
+    def test_price_rounding_fixed(self):
+        assert AI._normalize_price_value(799) == 800
+        assert AI._normalize_price_value(498) == 500
+        assert AI._normalize_price_value("799") == 800
+
+    def test_price_leaves_non_roundable_for_validator(self):
+        assert AI._normalize_price_value(800) is None
+        assert AI._normalize_price_value(0) is None
+        assert AI._normalize_price_value(-5) is None
+        assert AI._normalize_price_value("799.99") is None
+        assert AI._normalize_price_value("7_99") is None
+        assert AI._normalize_price_value(float("nan")) is None
+        assert AI._normalize_price_value(True) is None
+
+    def test_tier_fixed_to_rounded_price(self):
+        tags, changed, _note = AI._fix_tier_tags(
+            ["Mid-Tier", "Warm", "Smooth", "Relaxed"], 799)
+        assert changed and "Premium" in tags and "Mid-Tier" not in tags
+        # position preserved, extras dropped
+        tags, changed, _note = AI._fix_tier_tags(
+            ["Budget", "Premium", "Warm"], 800)
+        assert changed and tags.count("Premium") == 1
+        tags, changed, _note = AI._fix_tier_tags(["Warm"], 20)
+        assert changed and "Budget" in tags
+        _tags, changed, _note = AI._fix_tier_tags(
+            ["Premium", "Warm"], 800)
+        assert not changed
+
+    def test_799_entry_imports_without_price_errors(self):
+        src = make_entry(price_usd=799,
+                         tags=["Mid-Tier", "Warm", "Smooth", "Relaxed"])
+        cand, notes = AI.normalize_import_entry(src)
+        assert cand["price_usd"] == 800
+        assert "Premium" in cand["tags"]
+        assert notes
+        cand["id"] = L.build_id(cand["brand"], cand["model"],
+                                cand["variant"])
+        errs = L.validate_entry(cand, existing_ids=set())
+        assert not [e for e in errs
+                    if "nearest $5" in e or "Price-tier tag" in e]
+
+    def test_normalize_is_idempotent_and_field_aware(self):
+        src = make_entry(price_usd=799,
+                         tags=["Mid-Tier", "Warm", "Smooth", "Relaxed"])
+        cand, _notes = AI.normalize_import_entry(src)
+        cand2, notes2 = AI.normalize_import_entry(cand)
+        assert cand2 == cand and notes2 == []
+        untouched, _n = AI.normalize_import_entry(
+            src, only_fields={"brand"})
+        assert untouched["price_usd"] == 799
+
+    def test_normalize_parsed_bucket_mutates_before_classify(self):
+        parsed = {"objects": [make_entry(price_usd=799)],
+                  "replacements": []}
+        n, _notes = AI._normalize_import_prices(parsed)
+        assert n == 1
+        assert parsed["objects"][0]["price_usd"] == 800
+
+    def test_field_merge_changed_and_new(self):
+        old = make_entry()
+        new = make_entry(price_usd=25)
+        p = {"action": "changed", "pos": 0, "old": old, "new": new,
+             "changes": [("price_usd", 20, 25)]}
+        merged = AI.build_field_merged_candidate(p, {"price_usd"})
+        assert merged["price_usd"] == 25
+        assert AI.build_field_merged_candidate(p, set()) is None
+        pn = {"action": "new", "entry": new}
+        part = AI.build_field_merged_candidate(pn, {"price_usd"})
+        assert part["price_usd"] == 25
+        assert part["tags"] == []  # deselected fields fall back to blank
+        assert AI.build_field_merged_candidate(pn, set()) is None
+
+
+# ===========================================================================
 # L-5: CJK-aware ellipsization
 # ===========================================================================
 class TestEllipsize:

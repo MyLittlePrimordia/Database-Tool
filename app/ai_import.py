@@ -18,6 +18,7 @@ schema validation. The database is never touched before Apply.
 Offline, stdlib-only.
 """
 
+import copy
 import json
 import re
 import sys
@@ -337,6 +338,171 @@ def _fmt_val(value):
 
 
 # ---------------------------------------------------------------------------
+# IMPORT NORMALIZATION (pure functions -- unit-testable without Tk)
+# ---------------------------------------------------------------------------
+# The editor (main.py) auto-rounds prices on edit and the audit engine
+# auto-fixes price rounding + tier tags. The importer used to reject the
+# same AI output outright ("Price must be rounded to the nearest $5"),
+# forcing the user to hand-fix $799-style values. These helpers apply the
+# SAME rules at import time so valid entries import cleanly. Anything that
+# is not an unambiguous numeric round (negatives, zero, non-numeric
+# strings, inf/nan, over the sanity max) is left untouched for the
+# validator to report as before -- normalization never hides real errors.
+def _normalize_price_value(raw):
+    """Rounded $5 price for `raw`, or None when it must NOT be auto-fixed
+    (left for validate_entry to flag). Only finite, positive, plain
+    numeric values are touched; numeric strings like "799" are accepted,
+    but "799.99"/underscores/garbage are not."""
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        p = raw
+    elif isinstance(raw, float):
+        import math
+        if not math.isfinite(raw):
+            return None
+        p = raw
+    elif isinstance(raw, str):
+        s = raw.strip()
+        if not s or "_" in s or "." in s:
+            return None
+        try:
+            p = int(s)
+        except ValueError:
+            return None
+    else:
+        try:
+            p = L.coerce_int(raw, None)
+        except Exception:  # noqa: BLE001
+            return None
+        if p is None:
+            return None
+    try:
+        rounded = L.round_price_to_5(p)
+    except Exception:  # noqa: BLE001
+        return None
+    if rounded == p:
+        return None
+    if rounded <= 0 or rounded > L.PRICE_MAX:
+        return None
+    if p <= 0 or p > L.PRICE_MAX:
+        return None
+    return rounded
+
+
+def _fix_tier_tags(tags, price):
+    """Rewrite `tags` to carry the single expected tier for `price`,
+    preserving the original tier position (same rule as the audit's
+    tier fix). Returns (new_tags, changed, note). Non-list tags or an
+    already-correct single tier are returned unchanged."""
+    if not isinstance(tags, list):
+        return tags, False, ""
+    expected = L.price_tier_for(L.price_tier_basis(price))
+    present = [t for t in tags if t in L.PRICE_TIER_TAGS]
+    if present == [expected]:
+        return tags, False, ""
+    out = []
+    placed = False
+    for t in tags:
+        if t in L.PRICE_TIER_TAGS:
+            if not placed:
+                out.append(expected)
+                placed = True
+            # extra tier tags are dropped, like the audit fix
+        else:
+            out.append(t)
+    if not placed:
+        out.append(expected)
+    label = "+".join(present) if present else "(none)"
+    return out, True, "tier {}->{}".format(label, expected)
+
+
+def normalize_import_entry(src, only_fields=None):
+    """Copy `src` with price rounding + tier auto-fixes applied. Returns
+    (candidate, notes). `only_fields` (a set/None) makes the fix
+    field-aware for per-field imports: price is only touched when
+    "price_usd" is selected and tiers only when "tags" is selected.
+    Idempotent -- running it twice changes nothing the second time."""
+    candidate = dict(src)
+    notes = []
+    if only_fields is None or "price_usd" in only_fields:
+        old_price = candidate.get("price_usd", 0)
+        new_price = _normalize_price_value(old_price)
+        if new_price is not None:
+            notes.append("price ${}->${}".format(old_price, new_price))
+            candidate["price_usd"] = new_price
+    if only_fields is None or "tags" in only_fields:
+        new_tags, changed, note = _fix_tier_tags(
+            candidate.get("tags", []), candidate.get("price_usd", 0))
+        if changed:
+            candidate["tags"] = new_tags
+            notes.append(note)
+    return candidate, notes
+
+
+def _normalize_import_prices(parsed, only_fields=None):
+    """Run normalize_import_entry over every incoming object in `parsed`
+    (standalone + REPLACE sides). Mutates in place so classification and
+    the review rows show exactly what Apply will validate. Returns
+    (n_fixed, {id(obj): notes})."""
+    notes_by_obj = {}
+    n_fixed = 0
+    buckets = [parsed.get("objects", []) if isinstance(
+        parsed.get("objects", []), list) else []]
+    reps = parsed.get("replacements", []) or []
+    buckets.append([r[1] for r in reps if len(r) > 1 and isinstance(r[1], dict)])
+    for bucket in buckets:
+        for obj in bucket:
+            if not isinstance(obj, dict):
+                continue
+            _cand, notes = normalize_import_entry(obj, only_fields)
+            if notes:
+                obj["price_usd"] = _cand["price_usd"]
+                obj["tags"] = _cand["tags"]
+                notes_by_obj[id(obj)] = notes
+                n_fixed += 1
+    return n_fixed, notes_by_obj
+
+
+def build_field_merged_candidate(proposal, selected_fields):
+    """Merge per-field selection onto a full entry dict (pure, no Tk).
+    `selected_fields` is the set of field names the user kept ON for
+    this proposal. Returns a full candidate dict, or None when nothing
+    is selected (caller treats it as excluded).
+
+    - changed: start from a copy of old, overlay only selected CHANGED
+      fields from new (untouched fields keep the database value).
+    - new: start from BLANK_ENTRY, overlay only selected fields from the
+      incoming entry (deselected fields fall back to schema defaults).
+    Unknown field names in `selected_fields` are ignored."""
+    action = proposal.get("action")
+    if action == "changed":
+        valid = {f for f, _o, _n in proposal.get("changes", [])}
+        keep = set(selected_fields or set()) & valid
+        if not keep:
+            return None
+        base = copy.deepcopy(proposal.get("old", {}))
+        new = proposal.get("new", {}) or {}
+        for f in keep:
+            base[f] = copy.deepcopy(new.get(f))
+        return base
+    if action == "new":
+        src = proposal.get("entry", {}) or {}
+        keep = {f for f in (selected_fields or set())
+                if f in SCHEMA_FIELDS and f != "id"}
+        if not keep:
+            return None
+        base = dict(L.BLANK_ENTRY)
+        for f in keep:
+            base[f] = copy.deepcopy(src.get(f, L.BLANK_ENTRY[f]))
+        for f in ("brand", "model", "variant"):
+            if f not in base:
+                base[f] = src.get(f, "")
+        return base
+    return None
+
+
+# ---------------------------------------------------------------------------
 # DIALOG
 # ---------------------------------------------------------------------------
 class ImportDialog(tk.Toplevel):
@@ -348,6 +514,8 @@ class ImportDialog(tk.Toplevel):
         self.app = app
         self.proposals = []
         self.include = {}          # tree item id -> bool (parent rows only)
+        self.autofix = {}          # id(obj) -> [notes] from price/tier normalize
+        self.field_include = {}    # (parent iid, field) -> bool (child rows)
         self.title("Import Entries")
         self.configure(background=theme.BG_MAIN)
         self.transient(app)
@@ -409,7 +577,7 @@ class ImportDialog(tk.Toplevel):
         self.tree.heading("include", text="Include")
         self.tree.heading("detail", text="Detail")
         self.tree.column("#0", width=330, stretch=True)
-        self.tree.column("include", width=70, anchor="center", stretch=False)
+        self.tree.column("include", width=80, anchor="center", stretch=False)
         self.tree.column("detail", width=420, stretch=True)
         vsb = ttk.Scrollbar(tree_frame, orient="vertical",
                             command=self.tree.yview)
@@ -422,6 +590,15 @@ class ImportDialog(tk.Toplevel):
         self.tree.tag_configure("changed", foreground=theme.ACCENT_BLUE)
         self.tree.tag_configure("delete", foreground=theme.ACCENT_RED)
         self.tree.tag_configure("invalid", foreground=theme.TEXT_DIM)
+        # Include-state colors: green = will import on Apply, red/dim =
+        # skipped. Kept as dedicated tags (never combined with the action
+        # tags above) so toggling never depends on tag priority order.
+        self.tree.tag_configure("state_on", foreground=theme.ACCENT_GREEN)
+        self.tree.tag_configure("state_off", foreground=theme.ACCENT_RED)
+        self.tree.tag_configure("delete_on", foreground=theme.ACCENT_RED)
+        self.tree.tag_configure("delete_off", foreground=theme.TEXT_DIM)
+        self.tree.tag_configure("field_on", foreground=theme.ACCENT_GREEN)
+        self.tree.tag_configure("field_off", foreground=theme.ACCENT_RED)
         self.tree.bind("<Button-1>", self._on_click)
         self.tree.bind("<space>", self._on_space)
         self.tree.bind("<Return>", self._on_space)
@@ -432,6 +609,12 @@ class ImportDialog(tk.Toplevel):
                                     style="Accent.TButton",
                                     command=self._apply, state="disabled")
         self.apply_btn.pack(side="left")
+        ttk.Button(action_row, text="All",
+                   command=lambda: self._select_all(True)).pack(side="left",
+                                                                padx=(8, 0))
+        ttk.Button(action_row, text="None",
+                   command=lambda: self._select_all(False)).pack(side="left",
+                                                                 padx=(4, 0))
         ttk.Button(action_row, text="Close",
                    command=self.destroy).pack(side="left", padx=8)
         self.apply_lbl = ttk.Label(action_row, text="", style="Card.TLabel",
@@ -486,6 +669,7 @@ class ImportDialog(tk.Toplevel):
             return
         parsed = parse_ai_output(raw)
         n_normalized = self._normalize_brands(parsed)
+        n_fixed, self.autofix = _normalize_import_prices(parsed)
         self.proposals = classify_against(self.app.entries, parsed)
         self._render()
 
@@ -505,6 +689,9 @@ class ImportDialog(tk.Toplevel):
         if n_normalized:
             bits.append("{} brand spelling{} normalized to the database's".format(
                 n_normalized, "s were" if n_normalized != 1 else " was"))
+        if n_fixed:
+            bits.append("{} price/tier auto-fixed to $5 + matching tier".format(
+                n_fixed))
         self.parse_lbl.configure(
             text=", ".join(bits) if bits else
             "No changes found (the AI output matches the current database).")
@@ -537,51 +724,66 @@ class ImportDialog(tk.Toplevel):
                     n += 1
         return n
 
+    def _autofix_notes_for(self, p):
+        action = p.get("action")
+        obj = p.get("entry") if action == "new" else p.get("new")
+        if obj is None:
+            return []
+        return getattr(self, "autofix", {}).get(id(obj), [])
+
+    def _state_tag(self, action, on):
+        if action == "invalid":
+            return "invalid"
+        if action == "delete":
+            return "delete_on" if on else "delete_off"
+        return "state_on" if on else "state_off"
+
+    def _base_label_detail(self, p):
+        """(label, detail) for a proposal with everything selected."""
+        action = p["action"]
+        auto = self._autofix_notes_for(p)
+        suffix = "  • auto: {}".format(", ".join(auto)) if auto else ""
+        if action == "new":
+            entry = p["entry"]
+            eid = entry.get("id") or "(no id)"
+            label = "NEW:  {}".format(eid)
+            detail = "{} / {} / {}".format(
+                entry.get("brand") or "?", entry.get("model") or "?",
+                entry.get("variant") or "") + suffix
+            return label, detail
+        if action == "changed":
+            eid = p["old"].get("id") or "(no id)"
+            label = "CHANGED:  {}  ({} field{})".format(
+                eid, len(p["changes"]),
+                "s" if len(p["changes"]) != 1 else "")
+            detail = "; ".join("{}: {} -> {}".format(
+                f, _fmt_val(ov)[:40], _fmt_val(nv)[:40])
+                for f, ov, nv in p["changes"][:3])
+            if len(p["changes"]) > 3:
+                detail += ", ..."
+            return label, detail + suffix
+        if action == "delete":
+            eid = p["old"].get("id") or "(no id)"
+            return ("DELETE:  {}".format(eid),
+                    "AI output removed this entry -- opt in explicitly")
+        eid = (p.get("entry") or {}).get("id") or "(unparseable)"
+        return "SKIP:  {}".format(eid), p.get("error", "unusable")
+
     def _render(self):
         self.tree.delete(*self.tree.get_children())
         self.include.clear()
+        getattr(self, "field_include", {}).clear()
         n_ok = 0
         for idx, p in enumerate(self.proposals):
             action = p["action"]
-            if action == "new":
-                entry = p["entry"]
-                eid = entry.get("id") or "(no id)"
-                label = "NEW:  {}".format(eid)
-                detail = "{} / {} / {}".format(
-                    entry.get("brand") or "?", entry.get("model") or "?",
-                    entry.get("variant") or "")
-                tag = "new"
-                default = True
-            elif action == "changed":
-                eid = p["old"].get("id") or "(no id)"
-                label = "CHANGED:  {}  ({} field{})".format(
-                    eid, len(p["changes"]),
-                    "s" if len(p["changes"]) != 1 else "")
-                detail = "; ".join("{}: {} -> {}".format(
-                    f, _fmt_val(ov)[:40], _fmt_val(nv)[:40])
-                    for f, ov, nv in p["changes"][:3])
-                if len(p["changes"]) > 3:
-                    detail += ", ..."
-                tag = "changed"
-                default = True
-            elif action == "delete":
-                eid = p["old"].get("id") or "(no id)"
-                label = "DELETE:  {}".format(eid)
-                detail = "AI output removed this entry -- opt in explicitly"
-                tag = "delete"
-                default = False
-            else:
-                eid = (p.get("entry") or {}).get("id") or "(unparseable)"
-                label = "SKIP:  {}".format(eid)
-                detail = p.get("error", "unusable")
-                tag = "invalid"
-                default = False
+            default = action in ("new", "changed")
             pid = "p{}".format(idx)
-            include_txt = "Yes" if default else "No"
-            self.include[pid] = default and action in ("new", "changed")
+            label, detail = self._base_label_detail(p)
+            self.include[pid] = bool(default)
             self.tree.insert("", "end", iid=pid, open=False,
                              text=label,
-                             values=(include_txt, detail), tags=(tag,))
+                             values=("Yes" if default else "No", detail),
+                             tags=(self._state_tag(action, default),))
             if action in ("new", "changed"):
                 n_ok += 1
             if action == "new":
@@ -590,14 +792,23 @@ class ImportDialog(tk.Toplevel):
                         continue
                     v = _fmt_val(p["entry"].get(f))
                     if v != "(empty)":
-                        self.tree.insert(pid, "end", text="    " + f,
-                                         values=("", v))
+                        cid = "{}:{}".format(pid, f)
+                        self.field_include[(pid, f)] = True
+                        self.tree.insert(pid, "end", iid=cid,
+                                         text="    " + f,
+                                         values=("Yes", v),
+                                         tags=("field_on",))
             elif action == "changed":
                 for f, ov, nv in p["changes"]:
-                    self.tree.insert(pid, "end", text="    " + f,
-                                     values=("",
+                    cid = "{}:{}".format(pid, f)
+                    self.field_include[(pid, f)] = True
+                    self.tree.insert(pid, "end", iid=cid,
+                                     text="    " + f,
+                                     values=("Yes",
                                              "{}  ->  {}".format(
-                                                 _fmt_val(ov), _fmt_val(nv))))
+                                                 _fmt_val(ov),
+                                                 _fmt_val(nv))),
+                                     tags=("field_on",))
             elif action == "invalid":
                 self.tree.insert(pid, "end", text="    reason",
                                  values=("", p.get("error", "")))
@@ -607,28 +818,200 @@ class ImportDialog(tk.Toplevel):
             self.apply_btn.state(["disabled"])
         self.apply_lbl.configure(text="" if n_ok else
                                  "Nothing importable was found.")
+        self._refresh_selection_label()
+
+    def _refresh_selection_label(self):
+        try:
+            n_sel = sum(1 for iid, yes in self.include.items()
+                        if yes and self.proposals[int(iid[1:])]["action"]
+                        in ("new", "changed", "delete"))
+            n_tot = sum(1 for p in self.proposals
+                        if p["action"] in ("new", "changed", "delete"))
+        except Exception:  # noqa: BLE001
+            return
+        if not n_tot:
+            return
+        self.summary_lbl.configure(
+            text="{} of {} selected (green = will import, red = skipped). "
+                 "Click the Include cell or press Space to toggle; expand "
+                 "a row to pick individual fields.".format(n_sel, n_tot))
 
     # -- inclusion toggling -------------------------------------------------
+    # Only clicks on the Include column toggle anything (mirrors
+    # find_replace.py): clicking a row label merely selects/expands it, so
+    # inspecting an entry can never silently deselect it.
     def _on_click(self, event):
+        if self.tree.identify_region(event.x, event.y) != "cell":
+            return None
+        if self.tree.identify_column(event.x) != "#1":
+            return None
         iid = self.tree.identify_row(event.y)
-        if iid and iid in self.include:
-            # let the tree open/close children first, then toggle include
-            self.after(10, lambda: self._toggle(iid))
+        if not iid:
+            return None
+        if iid in self.include:
+            self.after(10, lambda iid=iid: self._toggle_parent(iid))
+        elif ":" in iid:
+            pid = iid.split(":", 1)[0]
+            if pid in self.include:
+                self.after(10, lambda iid=iid: self._toggle_field(iid))
         return None
 
     def _on_space(self, _event=None):
         iid = self.tree.focus()
-        if iid and iid in self.include:
-            self._toggle(iid)
+        if iid in self.include:
+            self._toggle_parent(iid)
+            return "break"
+        if iid and ":" in iid and iid.split(":", 1)[0] in self.include:
+            self._toggle_field(iid)
             return "break"
         return None
 
     def _toggle(self, iid):
-        p = self.proposals[int(iid[1:])]
+        # Backward-compatible router (older flows call _toggle directly).
+        if iid in self.include:
+            self._toggle_parent(iid)
+        elif iid and ":" in iid:
+            self._toggle_field(iid)
+
+    def _toggle_parent(self, pid):
+        try:
+            p = self.proposals[int(pid[1:])]
+        except (ValueError, IndexError):
+            return
         if p["action"] not in ("new", "changed", "delete"):
             return
-        self.include[iid] = not self.include.get(iid, False)
-        self.tree.set(iid, "include", "Yes" if self.include[iid] else "No")
+        new_state = not self.include.get(pid, False)
+        self.include[pid] = new_state
+        for (q, f) in [k for k in self.field_include if k[0] == pid]:
+            self.field_include[(q, f)] = new_state
+            cid = "{}:{}".format(q, f)
+            if self.tree.exists(cid):
+                self.tree.set(cid, "include",
+                              "Yes" if new_state else "No")
+                self.tree.item(cid, tags=("field_on" if new_state
+                                          else "field_off",))
+        self._refresh_parent_row(pid)
+        self._refresh_selection_label()
+
+    def _toggle_field(self, cid):
+        if ":" not in (cid or ""):
+            return
+        pid, f = cid.split(":", 1)
+        if pid not in self.include:
+            return
+        key = (pid, f)
+        if key not in self.field_include:
+            return
+        self.field_include[key] = not self.field_include.get(key, True)
+        on = self.field_include[key]
+        if self.tree.exists(cid):
+            self.tree.set(cid, "include", "Yes" if on else "No")
+            self.tree.item(cid, tags=("field_on" if on else "field_off",))
+        self._refresh_parent_row(pid)
+        self._refresh_selection_label()
+
+    def _refresh_parent_row(self, pid):
+        try:
+            p = self.proposals[int(pid[1:])]
+        except (ValueError, IndexError):
+            return
+        action = p["action"]
+        if action not in ("new", "changed", "delete"):
+            return
+        tracked = [k for k in self.field_include if k[0] == pid]
+        if tracked and action in ("new", "changed"):
+            total = len(tracked)
+            on = sum(1 for k in tracked if self.field_include.get(k))
+            self.include[pid] = on > 0
+            if on == total:
+                inc_txt = "Yes"
+            elif on == 0:
+                inc_txt = "No"
+            else:
+                inc_txt = "{}/{}".format(on, total)
+        else:
+            inc_txt = "Yes" if self.include.get(pid) else "No"
+        on = bool(self.include.get(pid))
+        label, detail = self._base_label_detail(p)
+        if tracked and action in ("new", "changed"):
+            total = len(tracked)
+            sel = {f for (q, f) in tracked
+                   if self.field_include.get((q, f))}
+            if action == "changed":
+                changes = [c for c in p["changes"] if c[0] in sel]
+                eid = p["old"].get("id") or "(no id)"
+                if not changes:
+                    label = "CHANGED:  {}  (0/{} fields)".format(eid, total)
+                    detail = ("all fields deselected -- entry excluded"
+                              + ("  • auto: {}".format(
+                                  ", ".join(self._autofix_notes_for(p)))
+                                 if self._autofix_notes_for(p) else ""))
+                elif len(changes) != len(p["changes"]):
+                    label = "CHANGED:  {}  ({}/{} fields)".format(
+                        eid, len(changes), len(p["changes"]))
+                    detail = "; ".join("{}: {} -> {}".format(
+                        f, _fmt_val(ov)[:40], _fmt_val(nv)[:40])
+                        for f, ov, nv in changes[:3])
+                    if len(changes) > 3:
+                        detail += ", ..."
+                    if self._autofix_notes_for(p):
+                        detail += "  • auto: {}".format(
+                            ", ".join(self._autofix_notes_for(p)))
+            elif len(sel) != total:
+                eid = (p.get("entry") or {}).get("id") or "(no id)"
+                label = "NEW:  {}  ({}/{} fields)".format(
+                    eid, len(sel), total)
+        if self.tree.exists(pid):
+            self.tree.set(pid, "include", inc_txt)
+            self.tree.item(pid, text=label,
+                           values=(inc_txt, detail),
+                           tags=(self._state_tag(action, on),))
+
+    def _select_all(self, new_state):
+        for iid in list(self.include):
+            try:
+                action = self.proposals[int(iid[1:])]["action"]
+            except (ValueError, IndexError):
+                continue
+            if action == "delete" and new_state:
+                continue  # deletions stay opt-in; "All" means all imports
+            if action not in ("new", "changed", "delete"):
+                continue
+            self.include[iid] = bool(new_state)
+            for (q, f) in [k for k in self.field_include if k[0] == iid]:
+                self.field_include[(q, f)] = bool(new_state)
+                cid = "{}:{}".format(q, f)
+                if self.tree.exists(cid):
+                    self.tree.set(cid, "include",
+                                  "Yes" if new_state else "No")
+                    self.tree.item(cid, tags=("field_on" if new_state
+                                              else "field_off",))
+            self._refresh_parent_row(iid)
+        self._refresh_selection_label()
+
+    def _selected_fields_for(self, pid, p):
+        """Selected field set for proposal `p`, or None when the whole
+        entry is selected (fast path -- identical to importing every
+        field). Returns an empty set only when tracked fields exist and
+        all are off (caller then skips the entry). Missing attributes
+        (e.g. headless test doubles) safely fall back to None."""
+        if pid is None:
+            return None
+        field_include = getattr(self, "field_include", None) or {}
+        tracked = [(q, f) for (q, f) in field_include if q == pid]
+        if not tracked:
+            return None
+        if p.get("action") == "changed":
+            valid = {f for f, _o, _n in p.get("changes", [])}
+        elif p.get("action") == "new":
+            valid = {f for f in SCHEMA_FIELDS if f != "id"}
+        else:
+            return None
+        sel = {f for (q, f) in tracked
+               if f in valid and field_include.get((q, f), True)}
+        if len(sel) == len({f for (q, f) in tracked if f in valid}):
+            return None  # everything on: whole-entry path
+        return sel
 
     # -- apply ---------------------------------------------------------------
     def _apply(self):
@@ -649,8 +1032,19 @@ class ImportDialog(tk.Toplevel):
             if p["action"] == "delete":
                 staged.append((p, None))
                 continue
-            src = p["entry"] if p["action"] == "new" else p["new"]
-            candidate = dict(src)
+            pid = next((iid for iid, pp in
+                        ((iid, self.proposals[int(iid[1:])])
+                         for iid in self.include) if pp is p), None)
+            selected = self._selected_fields_for(pid, p)
+            if selected is not None:
+                candidate = build_field_merged_candidate(p, selected)
+                if candidate is None:
+                    continue  # all fields deselected -> treat as excluded
+                only = set(selected)
+            else:
+                src = p["entry"] if p["action"] == "new" else p["new"]
+                candidate = dict(src)
+                only = None
             if p["action"] == "changed":
                 # keep AI-repaired ids, but rebuild when identity changed
                 candidate.setdefault("id", p["old"].get("id"))
@@ -658,6 +1052,11 @@ class ImportDialog(tk.Toplevel):
                                          str(candidate.get("model") or ""),
                                          str(candidate.get("variant") or "")) \
                 or candidate.get("id")
+            # Same $5 + tier auto-fix the Analyze step shows, re-applied
+            # here (idempotent) so manually-built proposals and any path
+            # that skipped _analyze get identical validation behavior.
+            # Field-aware: a deselected price/tags field is never fixed.
+            candidate, _notes = normalize_import_entry(candidate, only)
             exclude = p["old"].get("id") if p["action"] == "changed" else None
             errors = L.validate_entry(candidate, existing_ids=live_ids,
                                       exclude_id=exclude)
