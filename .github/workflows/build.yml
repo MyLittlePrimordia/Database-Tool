@@ -37,9 +37,9 @@ jobs:
       run:
         working-directory: app
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -57,9 +57,9 @@ jobs:
       run:
         working-directory: app
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -72,7 +72,7 @@ jobs:
       - name: Rename to Database-Tool.exe
         run: Move-Item -LiteralPath "dist\Database Tool.exe" -Destination "dist\Database-Tool.exe" -Force
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: Database-Tool-windows
           path: app/dist/Database-Tool.exe
@@ -86,7 +86,7 @@ jobs:
       run:
         working-directory: app
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Python with Tk via Homebrew
         run: |
@@ -113,7 +113,7 @@ jobs:
           rm -rf build "Database Tool.spec" "dist/Database Tool.app"
           ls -l dist
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: Database-Tool-macos
           path: app/dist/Database-Tool.dmg
@@ -127,9 +127,9 @@ jobs:
       run:
         working-directory: app
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -152,7 +152,7 @@ jobs:
           rm -rf build AppDir Database_Tool.spec appimagetool.AppImage "dist/Database_Tool"
           ls -l dist
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: Database-Tool-linux
           path: app/dist/Database-Tool.appimage
@@ -169,7 +169,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download all build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
@@ -180,7 +180,7 @@ jobs:
           ls -lh dist
 
       - name: Overwrite "latest" release with raw files
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: latest
           name: Latest
