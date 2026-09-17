@@ -502,6 +502,53 @@ def build_field_merged_candidate(proposal, selected_fields):
     return None
 
 
+def split_files_by_existence(files, on_disk_set, disk_index):
+    """Split an incoming `files` list into (kept, dropped) using the same
+    normalization the audit uses (backslash->slash, collapse //, strip,
+    drop leading ./ and /./). `on_disk_set` is the exact-case scan set,
+    `disk_index` maps lower->on-disk spelling for the case-insensitive
+    check (mirrors run_full_audit's Missing-File gate).
+
+    - kept preserves the ON-DISK spelling when the candidate only differs
+      by case (avoids importing a Path-Casing warning).
+    - dropped holds the original strings that match nothing on disk --
+      AI-hallucinated phantom links that must never be imported as-is.
+
+    Pure function (no Tk) so it is unit-testable."""
+    kept = []
+    dropped = []
+    for rel in files or []:
+        if not isinstance(rel, str) or not rel.strip():
+            dropped.append(rel)
+            continue
+        norm = rel.replace("\\", "/")
+        norm = re.sub(r"/+", "/", norm.strip())
+        while norm.startswith("./"):
+            norm = norm[2:]
+        norm = re.sub(r"/\./", "/", norm)
+        if not norm:
+            dropped.append(rel)
+            continue
+        if norm in on_disk_set:
+            kept.append(norm)
+        elif norm.lower() in disk_index:
+            # Exists on disk with different casing (Windows/macOS same
+            # file) -- keep the real on-disk spelling, not the AI guess.
+            kept.append(disk_index[norm.lower()])
+        else:
+            dropped.append(rel)
+    # Dedupe kept preserving order (AI sometimes repeats a path twice
+    # with different casings -- keep the first on-disk spelling only).
+    seen = set()
+    deduped = []
+    for k in kept:
+        lk = k.lower()
+        if lk not in seen:
+            seen.add(lk)
+            deduped.append(k)
+    return deduped, dropped
+
+
 # ---------------------------------------------------------------------------
 # DIALOG
 # ---------------------------------------------------------------------------
@@ -692,12 +739,58 @@ class ImportDialog(tk.Toplevel):
         if n_fixed:
             bits.append("{} price/tier auto-fixed to $5 + matching tier".format(
                 n_fixed))
+        # Phantom-file pre-warning: count incoming links that do not exist
+        # on disk so the review already tells the user they will be
+        # stripped on Apply (instead of silently importing Missing-File
+        # errors like makinaaudio_t100b did).
+        try:
+            n_phantom = self._count_phantom_files(self.proposals)
+            if n_phantom:
+                bits.append(
+                    "{} linked file(s) not on disk -- will be stripped on "
+                    "Apply".format(n_phantom))
+        except Exception:  # noqa: BLE001 - warning is advisory only
+            pass
         self.parse_lbl.configure(
             text=", ".join(bits) if bits else
             "No changes found (the AI output matches the current database).")
         for err in parsed.get("errors", [])[:2]:
             self.parse_lbl.configure(
                 text=self.parse_lbl.cget("text") + "  |  " + err[:80])
+
+    def _count_phantom_files(self, proposals):
+        """How many incoming linked files in `proposals` do not exist on
+        disk (advisory pre-warning for the Analyze line). Returns 0 when
+        no data folder is set (cannot tell phantom from not-yet-created)
+        or when everything checks out."""
+        try:
+            data_root = self.app.get_data_root() \
+                if hasattr(self.app, "get_data_root") else None
+        except Exception:  # noqa: BLE001
+            return 0
+        if not data_root:
+            return 0
+        try:
+            on_disk, data_dir = L.scan_data_files(data_root)
+        except Exception:  # noqa: BLE001
+            return 0
+        if data_dir is None:
+            return 0
+        on_disk_set = set(on_disk or [])
+        disk_index = {p.lower(): p for p in (on_disk or [])}
+        n = 0
+        for p in proposals or []:
+            action = p.get("action")
+            if action == "new":
+                files = (p.get("entry") or {}).get("files") or []
+            elif action == "changed":
+                files = (p.get("new") or {}).get("files") or []
+            else:
+                continue
+            _kept, dropped = split_files_by_existence(
+                files, on_disk_set, disk_index)
+            n += len(dropped)
+        return n
 
     def _normalize_brands(self, parsed):
         """Rewrite each proposal object's brand to the database's majority
@@ -1028,6 +1121,27 @@ class ImportDialog(tk.Toplevel):
         live_ids = {e.get("id") for e in app.entries if e.get("id")}
         staged = []          # (proposal, clean_entry)
         problems = []
+        stripped_reports = []  # ["<id>: dropped <path>", ...] for phantoms
+        n_stripped_files = 0
+        # One shared data-folder snapshot for the whole batch (the scan is
+        # memoized, so this is cheap): lets us drop AI-hallucinated file
+        # links that do not exist on disk instead of importing Missing-File
+        # errors. Only enforced when a data folder is actually set; with
+        # no data folder we cannot tell phantom from not-yet-created.
+        on_disk_set = set()
+        disk_index = {}
+        data_dir_known = False
+        try:
+            data_root = app.get_data_root() if hasattr(app, "get_data_root") \
+                else None
+            if data_root:
+                on_disk, data_dir = L.scan_data_files(data_root)
+                if data_dir is not None:
+                    data_dir_known = True
+                    on_disk_set = set(on_disk or [])
+                    disk_index = {p.lower(): p for p in (on_disk or [])}
+        except Exception:  # noqa: BLE001 - import must never fail on scan
+            on_disk_set, disk_index, data_dir_known = set(), {}, False
         for p in included:
             if p["action"] == "delete":
                 staged.append((p, None))
@@ -1057,6 +1171,24 @@ class ImportDialog(tk.Toplevel):
             # that skipped _analyze get identical validation behavior.
             # Field-aware: a deselected price/tags field is never fixed.
             candidate, _notes = normalize_import_entry(candidate, only)
+            # Phantom-file guard: drop linked measurement paths that are
+            # not on disk (AI hallucinations like
+            # "data/SOURCE/BRAND MODEL.txt" that was never created).
+            # Field-aware like the price/tier fix: a deselected files
+            # field keeps the database value and is never stripped.
+            if data_dir_known and (only is None or "files" in only):
+                incoming_files = list(candidate.get("files") or [])
+                if incoming_files:
+                    kept, dropped = split_files_by_existence(
+                        incoming_files, on_disk_set, disk_index)
+                    if dropped:
+                        candidate["files"] = kept
+                        n_stripped_files += len(dropped)
+                        stripped_reports.append(
+                            "{}: stripped phantom file(s) not on disk: {}"
+                            .format(candidate.get("id") or "(no id)",
+                                    ", ".join(str(d) for d in dropped[:3])
+                                    + ("..." if len(dropped) > 3 else "")))
             exclude = p["old"].get("id") if p["action"] == "changed" else None
             errors = L.validate_entry(candidate, existing_ids=live_ids,
                                       exclude_id=exclude)
@@ -1153,6 +1285,9 @@ class ImportDialog(tk.Toplevel):
         desc = "Imported {} entr{} from AI output{}".format(
             n_touched, "y" if n_touched == 1 else "ies",
             " ({} deleted)".format(n_deleted) if n_deleted else "")
+        if n_stripped_files:
+            desc += " ({} phantom file(s) stripped -- not on disk)".format(
+                n_stripped_files)
         app._record_op("import", desc, changes)
         app.dirty = True
         app._mark_audit_dirty()

@@ -753,7 +753,14 @@ class CurveImportPanel(ttk.Frame):
         if not data_dir:
             return None
         raw_sub = self.subfolder_var.get().strip()
-        parts = [ _sanitize_folder(s) for s in raw_sub.split("/") if s.strip() ]
+        # Always UPPERCASE the sub-folder segments (same rule as
+        # _new_subfolder): the data folder convention is ALL-UPPERCASE
+        # brand folders, and leaving a manually-typed lowercase segment
+        # here used to write/link "data/mybrand/FILE.txt" alongside the
+        # existing "data/MYBRAND/FILE.txt" -- the same file on Windows but
+        # two different linked strings (a phantom/case-duplicate pair).
+        parts = [_sanitize_folder(s).upper()
+                 for s in raw_sub.split("/") if s.strip()]
         parts = [p for p in parts if p]
         # Always UPPERCASE the measurement filename regardless of how it
         # was typed (backend guarantee even if live-typing was bypassed).
@@ -1028,6 +1035,14 @@ class CurveImportPanel(ttk.Frame):
         until Save Entry commits them. Returns how many were newly linked."""
         rels = []
         for w in written:
+            # Never link a phantom: if the output vanished between the
+            # worker thread's write and this main-thread link (AV lock,
+            # external delete, failed replace...), skip it instead of
+            # storing a path that does not exist on disk.
+            if not os.path.exists(w):
+                self._log("[SKIPPED] Not linked (file not on disk): {}"
+                          .format(os.path.basename(w)))
+                continue
             rel = self._relative_for_db(w)
             if rel:
                 rels.append(rel)
@@ -1037,7 +1052,22 @@ class CurveImportPanel(ttk.Frame):
             return 0
         panel = self.app.editor.file_panel
         current = panel.get_files()
-        fresh = [r for r in rels if r not in current]
+        # Case-insensitive dedupe: on Windows "data/BRAND/file.txt" and
+        # "data/BRAND/FILE.txt" are the SAME file, but the old exact-match
+        # check kept both spellings -- the rename box uppercases ("as
+        # typed" lower + upper pair the user reported). Also dedupe within
+        # this batch itself (two jobs writing the same target used to link
+        # it twice).
+        seen = {c.lower() for c in current if isinstance(c, str)}
+        fresh = []
+        for r in rels:
+            key = r.lower() if isinstance(r, str) else r
+            if key not in seen:
+                seen.add(key)
+                fresh.append(r)
+            else:
+                self._log("[SKIPPED] Already linked (same file, different "
+                          "casing): {}".format(r))
         if not fresh:
             self._log("[SKIPPED] Already linked to this entry: {}".format(
                 ", ".join(rels)))
@@ -1070,13 +1100,38 @@ class CurveImportPanel(ttk.Frame):
             if idx is None:
                 self._log("[SKIPPED] Target entry '{}' no longer exists.".format(entry_id))
                 continue
-            rels = [r for r in (self._relative_for_db(p) for p in paths) if r]
+            # Never link phantoms (see _link_written): drop outputs that
+            # are not on disk anymore instead of storing dead paths.
+            live_paths = []
+            for p in paths:
+                if os.path.exists(p):
+                    live_paths.append(p)
+                else:
+                    self._log("[SKIPPED] Not linked to '{}' (file not on "
+                              "disk): {}".format(
+                                  entry_id, os.path.basename(p)))
+            rels = [r for r in (self._relative_for_db(p) for p in live_paths)
+                    if r]
             if not rels:
-                self._log("[SKIPPED] Could not link to '{}': no data folder set.".format(entry_id))
+                if live_paths:
+                    self._log("[SKIPPED] Could not link to '{}': no data folder set.".format(entry_id))
                 continue
             old = app.entries[idx]
             current_files = list(old.get("files") or [])
-            fresh = [r for r in rels if r not in current_files]
+            # Case-insensitive dedupe (same rationale as _link_written):
+            # prevents "as typed" lower + upper double-links of the same
+            # file on case-insensitive disks, and dedupes repeats within
+            # this batch (e.g. two jobs writing the same target).
+            seen = {c.lower() for c in current_files if isinstance(c, str)}
+            fresh = []
+            for r in rels:
+                key = r.lower() if isinstance(r, str) else r
+                if key not in seen:
+                    seen.add(key)
+                    fresh.append(r)
+                else:
+                    self._log("[SKIPPED] Already linked to {} (same file, "
+                              "different casing): {}".format(entry_id, r))
             if not fresh:
                 self._log("[SKIPPED] Already linked to {}: {}".format(
                     entry_id, ", ".join(rels)))
