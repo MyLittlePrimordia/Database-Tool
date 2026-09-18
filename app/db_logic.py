@@ -349,6 +349,10 @@ FORM_CONNECTOR_MAP = {
 }
 
 TWS_FORM_FACTOR = "Wireless Earbuds (TWS)"
+WIRELESS_OVER_EAR_FORM_FACTOR = "Wireless Over-Ear Headphones"
+# Wireless over-ears are permissive (NOT a TWS lock): verified wired-mode
+# specs are kept when published, but 0 is allowed when no verified data
+# exists -- so they are exempt from the zero-spec missing-data warning.
 
 FORM_FACTOR_ICON = {
     "IEM": "iem",
@@ -409,6 +413,9 @@ WARN_ZERO_YEAR = True             # year == 0  -> warning ("unknown" fallback)
 WARN_ZERO_PRICE = True            # price == 0 -> warning
 WARN_UNVERIFIED_DRIVERS = True    # driver_type AND driver_config both empty
 WARN_ZERO_SPECS_NON_TWS = True    # impedance/sensitivity == 0 on wired forms
+                                  # (TWS + Wireless Over-Ear exempt: TWS must
+                                  # be 0; wireless over-ear may be 0 when
+                                  # unverified)
 WARN_TWS_SPECS_NONZERO = True     # nonzero impedance/sensitivity on TWS
                                   # (AUDIT PROMPT: TWS must be 0/0; advisory)
 NO_FILES_WARN_THRESHOLD = 25      # fileless entries: <=N -> warning row,
@@ -2319,13 +2326,13 @@ def run_full_audit(entries, data_root=None):
                 "Driver type and config both empty (unverified) -- fill in "
                 "when known.",
                 severity="warning", code="drivers-unknown"))
-        if WARN_ZERO_SPECS_NON_TWS and ff != TWS_FORM_FACTOR:
+        if WARN_ZERO_SPECS_NON_TWS and ff not in (TWS_FORM_FACTOR, WIRELESS_OVER_EAR_FORM_FACTOR):
             for field, label in (("impedance", "Impedance"),
                                  ("sensitivity", "Sensitivity")):
                 if coerce_int(entry.get(field, 0)) == 0:
                     issues.append(AuditIssue(
                         "Missing Data", idx, eid,
-                        "{} is 0 on a non-TWS entry (unverified) -- set it "
+                        "{} is 0 on a wired entry (unverified) -- set it "
                         "when known.".format(label),
                         severity="warning",
                         code="impedance-unknown" if field == "impedance"

@@ -118,10 +118,11 @@ Do NOT add, remove, rename, or reorder any fields.
 {_rule}
 STRICT ZERO-VALUE (0) RESTRICTIONS
 {_rule}
-1. "impedance" and "sensitivity" are ONLY permitted to be 0 for "{tws}" entries.
-2. For ALL wired entries, 0 is STRICTLY FORBIDDEN and indicates missing/unpopulated data. You MUST research and populate verified numerical specs for impedance (Ohm) and sensitivity (dB/mW, dB/SPL, or dB/Vrms).
-3. "year" and "price_usd" must NEVER be 0. Research the verified launch year and original launch MSRP.
-4. "variant" is the ONLY field permitted to be an empty string ("") if no official variant exists.
+1. "impedance" and "sensitivity" MUST be 0 for "{tws}" entries (TWS lock: no wired signal path, do not populate).
+2. For "Wireless Over-Ear Headphones" entries, research and populate verified specs when published, but 0 is PERMITTED when no verified manufacturer data can be found (do NOT apply the TWS 0/0 lock; never guess).
+3. For ALL wired entries, 0 is STRICTLY FORBIDDEN and indicates missing/unpopulated data. You MUST research and populate verified numerical specs for impedance (Ohm) and sensitivity (dB/mW, dB/SPL, or dB/Vrms).
+4. "year" and "price_usd" must NEVER be 0. Research the verified launch year and original launch MSRP.
+5. "variant" is the ONLY field permitted to be an empty string ("") if no official variant exists.
 
 {_rule}
 TRUSTED SOURCE HIERARCHY & POPULATION PROTOCOL
@@ -129,16 +130,16 @@ TRUSTED SOURCE HIERARCHY & POPULATION PROTOCOL
 When researching specifications online, strictly follow this authority hierarchy:
 
 1. TIER 1A: DIRECT MANUFACTURER SOURCES (HIGHEST SUPREME AUTHORITY)
-   - Official brand websites, official spec sheets, official product user manuals, and manufacturer product launch press releases.
-   - RULE: If a Tier 1A manufacturer source contradicts third-party retailers, Tier 1A ALWAYS WINS and overrides all others.
+    - Official brand websites, official spec sheets, official product user manuals, and manufacturer product launch press releases.
+    - RULE: If a Tier 1A manufacturer source contradicts third-party retailers, Tier 1A ALWAYS WINS and overrides all others.
 
 2. TIER 1B: VERIFIED AUTHORIZED DISTRIBUTORS & MEASUREMENT DATABASES
-   - Only used when Tier 1A manufacturer data is unavailable or defunct.
-   - Requires consensus of AT LEAST TWO matching Tier 1B sources (e.g., Linsoul + Head-Fi, or Squiglink + Audio Science Review).
+    - Only used when Tier 1A manufacturer data is unavailable or defunct.
+    - Requires consensus of AT LEAST TWO matching Tier 1B sources (e.g., Linsoul + Head-Fi, or Squiglink + Audio Science Review).
 
 3. TIER 2: LOW / CONFLICTING THIRD-PARTY SOURCES
-   - Random marketplace listings, conflicting forum rumors, or unverified secondary sellers.
-   - RULE: Do NOT use Tier 2 data if it conflicts with known specs. Keep searching until Tier 1 consensus is established. Never guess.
+    - Random marketplace listings, conflicting forum rumors, or unverified secondary sellers.
+    - RULE: Do NOT use Tier 2 data if it conflicts with known specs. Keep searching until Tier 1 consensus is established. Never guess.
 
 {_rule}
 MODEL / VARIANT NORMALIZATION & ID RULES
@@ -193,7 +194,7 @@ FIELD RULES & SPECIFICATIONS
 brand: Official manufacturer name only.
 year: Original launch/release year (integer only, 1950 or later; NEVER 0).
 price_usd: Original launch MSRP in USD only (Integer only, rounded to nearest $5; NEVER 0).
-impedance & sensitivity: Whole integers only. ONLY permitted to be 0 for "{tws}".
+impedance & sensitivity: Whole integers only. MUST be 0 for "{tws}". For "Wireless Over-Ear Headphones", populate verified specs when published, but 0 is permitted when unverified.
 
 {_rule}
 FORM FACTOR & CONNECTOR CONSISTENCY MATRIX
@@ -321,7 +322,7 @@ Before outputting EVERY entry, verify:
 3. driver_config has NO SPACES around "+" and strictly follows canonical order ({driver_order_short}).
 4. driver_config reflects active transducers PER EAR only, and driver_type correctly classifies single technologies (e.g., "2DD" is "DD", not "Hybrid") while ignoring passive radiators.
 5. "Dual-Magnetic" / "Dual-Cavity" dynamic units are correctly classified as "1DD".
-6. impedance and sensitivity are non-zero for wired entries (only permitted to be 0 for "{tws}").
+6. impedance and sensitivity are non-zero for wired entries (MUST be 0 for "{tws}"; MAY be 0 for "Wireless Over-Ear Headphones" when no verified data exists).
 7. year and price_usd are verified and non-zero.
 8. No forbidden conflicting tag pairs are present.
 9. Exactly ONE price tier tag matches price_usd.
@@ -410,10 +411,11 @@ Every entry must maintain this exact schema:
 {schema}
 
 STRICT "ZERO (0)" RULES:
-1. "impedance" and "sensitivity" are ONLY permitted to be 0 for "{tws}".
-2. For ALL wired entries, 0 is STRICTLY FORBIDDEN and indicates missing/unpopulated data. You MUST search and populate verified numerical specs for impedance (Ohm) and sensitivity (dB/mW, dB/SPL, or dB/Vrms).
-3. "year" and "price_usd" must NEVER be 0. Research the verified launch year and original launch MSRP.
-4. "variant" is the ONLY field permitted to be empty string ("") if no official variant exists.
+1. "impedance" and "sensitivity" MUST be 0 for "{tws}" (TWS lock: no wired signal path, do not populate).
+2. For "Wireless Over-Ear Headphones", keep verified specs when published, but 0 is PERMITTED when no verified manufacturer data can be found (do NOT apply the TWS 0/0 lock; never guess or overwrite verified specs with 0).
+3. For ALL wired entries, 0 is STRICTLY FORBIDDEN and indicates missing/unpopulated data. You MUST search and populate verified numerical specs for impedance (Ohm) and sensitivity (dB/mW, dB/SPL, or dB/Vrms).
+4. "year" and "price_usd" must NEVER be 0. Research the verified launch year and original launch MSRP.
+5. "variant" is the ONLY field permitted to be empty string ("") if no official variant exists.
 
 {_rule}
 TRUSTED SOURCE HIERARCHY & OVERWRITE PROTOCOL

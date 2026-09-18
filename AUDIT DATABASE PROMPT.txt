@@ -57,10 +57,11 @@ Every entry must maintain this exact schema:
 }
 
 STRICT "ZERO (0)" RULES:
-1. "impedance" and "sensitivity" are ONLY permitted to be 0 for "Wireless Earbuds (TWS)" entries.
-2. For ALL wired entries ("IEM", "Earbuds (Wired)", "Over-Ear Headphones (Wired)"), 0 is STRICTLY FORBIDDEN and indicates missing/unpopulated data. You MUST search and populate verified numerical specs for impedance (Ω) and sensitivity (dB/mW, dB/SPL, or dB/Vrms).
-3. "year" and "price_usd" must NEVER be 0. Research the verified launch year and original launch MSRP.
-4. "variant" is the ONLY field permitted to be empty string ("") if no official variant exists.
+1. "impedance" and "sensitivity" MUST be 0 for "Wireless Earbuds (TWS)" entries (TWS lock: no wired signal path, do not populate).
+2. For "Wireless Over-Ear Headphones" entries, keep verified specs when published, but 0 is PERMITTED when no verified manufacturer data can be found (do NOT apply the TWS 0/0 lock; never guess or overwrite verified specs with 0).
+3. For ALL wired entries ("IEM", "Earbuds (Wired)", "Over-Ear Headphones (Wired)"), 0 is STRICTLY FORBIDDEN and indicates missing/unpopulated data. You MUST search and populate verified numerical specs for impedance (Ω) and sensitivity (dB/mW, dB/SPL, or dB/Vrms).
+4. "year" and "price_usd" must NEVER be 0. Research the verified launch year and original launch MSRP.
+5. "variant" is the ONLY field permitted to be empty string ("") if no official variant exists.
 
 ==================================================
 TRUSTED SOURCE HIERARCHY & OVERWRITE PROTOCOL

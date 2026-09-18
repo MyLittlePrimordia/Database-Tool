@@ -5842,12 +5842,13 @@ class MainApp(tk.Tk):
             return errors
 
         # AUDIT PROMPT zero-rule: impedance/sensitivity = 0 is "STRICTLY
-        # FORBIDDEN" on wired entries (only TWS may be 0). validate_entry
+        # FORBIDDEN" on wired entries. TWS must be 0; Wireless Over-Ear may
+        # be 0 when unverified (permissive, no TWS lock). validate_entry
         # deliberately does not block it (specs can legitimately be unknown
         # mid-research), but saving 0/0 silently used to ship unverified
         # data -- so confirm explicitly before committing.
         ff = (entry.get("form_factor") or "").strip()
-        if ff and ff != L.TWS_FORM_FACTOR:
+        if ff and ff not in (L.TWS_FORM_FACTOR, L.WIRELESS_OVER_EAR_FORM_FACTOR):
             missing = [label for field, label in
                        (("impedance", "Impedance"), ("sensitivity", "Sensitivity"))
                        if L.coerce_int(entry.get(field, 0), -1) == 0]

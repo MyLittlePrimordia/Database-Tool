@@ -50,10 +50,11 @@ Do NOT add, remove, rename, or reorder any fields.
 ==================================================
 STRICT ZERO-VALUE (0) RESTRICTIONS
 ==================================================
-1. "impedance" and "sensitivity" are ONLY permitted to be 0 for "Wireless Earbuds (TWS)" entries.
-2. For ALL wired entries ("IEM", "Earbuds (Wired)", "Over-Ear Headphones (Wired)"), 0 is STRICTLY FORBIDDEN and indicates missing/unpopulated data. You MUST research and populate verified numerical specs for impedance (Ω) and sensitivity (dB/mW, dB/SPL, or dB/Vrms).
-3. "year" and "price_usd" must NEVER be 0. Research the verified launch year and original launch MSRP.
-4. "variant" is the ONLY field permitted to be an empty string ("") if no official variant exists.
+1. "impedance" and "sensitivity" MUST be 0 for "Wireless Earbuds (TWS)" entries (TWS lock: no wired signal path, do not populate).
+2. For "Wireless Over-Ear Headphones" entries, research and populate verified specs when published, but 0 is PERMITTED when no verified manufacturer data can be found (do NOT apply the TWS 0/0 lock; never guess).
+3. For ALL wired entries ("IEM", "Earbuds (Wired)", "Over-Ear Headphones (Wired)"), 0 is STRICTLY FORBIDDEN and indicates missing/unpopulated data. You MUST research and populate verified numerical specs for impedance (Ω) and sensitivity (dB/mW, dB/SPL, or dB/Vrms).
+4. "year" and "price_usd" must NEVER be 0. Research the verified launch year and original launch MSRP.
+5. "variant" is the ONLY field permitted to be an empty string ("") if no official variant exists.
 
 ==================================================
 TRUSTED SOURCE HIERARCHY & POPULATION PROTOCOL
@@ -129,7 +130,7 @@ FIELD RULES & SPECIFICATIONS
 brand: Official manufacturer name only.
 year: Original launch/release year (integer only, 1950 or later; NEVER 0).
 price_usd: Original launch MSRP in USD only (Integer only, rounded to nearest $5: e.g., $99 -> 100, $239 -> 240; NEVER 0).
-impedance & sensitivity: Whole integers only. ONLY permitted to be 0 for "Wireless Earbuds (TWS)". For wired entries, you MUST research verified specs (0 is forbidden).
+impedance & sensitivity: Whole integers only. MUST be 0 for "Wireless Earbuds (TWS)". For "Wireless Over-Ear Headphones", populate verified specs when published, but 0 is permitted when unverified. For wired entries, you MUST research verified specs (0 is forbidden).
 
 ==================================================
 FORM FACTOR & CONNECTOR CONSISTENCY MATRIX
@@ -272,7 +273,7 @@ Before outputting EVERY entry, verify:
 3. driver_config has NO SPACES around "+" and strictly follows canonical order (DD -> BA -> Planar -> EST -> MEMS -> PZT -> BC).
 4. driver_config reflects active transducers PER EAR only, and driver_type correctly classifies single technologies (e.g., "2DD" is "DD", not "Hybrid") while ignoring passive radiators.
 5. "Dual-Magnetic" / "Dual-Cavity" dynamic units are correctly classified as "1DD".
-6. impedance and sensitivity are non-zero for wired entries (only permitted to be 0 for TWS).
+6. impedance and sensitivity are non-zero for wired entries (MUST be 0 for TWS; MAY be 0 for "Wireless Over-Ear Headphones" when no verified data exists).
 7. year and price_usd are verified and non-zero.
 8. No forbidden conflicting tag pairs are present.
 9. Exactly ONE price tier tag matches price_usd.
