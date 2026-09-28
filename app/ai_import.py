@@ -77,11 +77,19 @@ def _loads_lenient(raw):
         return None, str(e)
 
 
-def _balanced_objects(text):
-    """Extract every balanced {...} JSON object from `text` as
-    (obj, start, end) spans. Tolerates prose between objects; skips braces
-    inside JSON strings."""
+def _balanced_objects_with_errors(text):
+    """Extract every balanced {...} JSON object from `text`. Returns
+    (found, errors) where `found` is a list of (obj, start, end) spans and
+    `errors` explains anything that was SKIPPED.
+
+    BUG-010: this used to `break` on the first unbalanced brace and to throw
+    away the parse error for any span that failed, so an AI reply truncated
+    mid-entry (routine when the model hits its token limit) or one stray `{`
+    in the prose silently lost every entry after that point -- the dialog
+    then reported a confident "2 new" and the user clicked Apply believing
+    the whole paste had imported. Nothing dropped is now silent."""
     found = []
+    errors = []
     i = 0
     n = len(text)
     while i < n:
@@ -114,12 +122,26 @@ def _balanced_objects(text):
                         break
             j += 1
         if end < 0:
-            break              # unbalanced to EOF: give up on the remainder
-        obj, _err = _loads_lenient(text[i:end])
-        if obj is not None:
+            errors.append(
+                "Input appears TRUNCATED at character {} -- the reply never "
+                "closes this entry, so it and everything after it were NOT "
+                "imported. Re-copy the complete reply.".format(i))
+            break              # unbalanced to EOF: the remainder is inside it
+        obj, err = _loads_lenient(text[i:end])
+        if obj is None:
+            errors.append(
+                "Entry at character {} could not be parsed and was skipped "
+                "({}).".format(i, err or "not valid JSON"))
+        else:
             found.append((obj, i, end))
         i = end
-    return found
+    return found, errors
+
+
+def _balanced_objects(text):
+    """Spans only -- kept for the parse_search_replace callers that do not
+    surface errors. See _balanced_objects_with_errors for the full result."""
+    return _balanced_objects_with_errors(text)[0]
 
 
 def parse_search_replace(text):
@@ -211,10 +233,22 @@ def parse_ai_output(text):
                 "replacements": replacements, "errors": errors}
 
     # 3) loose objects in prose
-    objects = [o for o, _s, _e in _balanced_objects(cleaned)
-               if isinstance(o, dict)]
+    spans, obj_errors = _balanced_objects_with_errors(cleaned)
+    errors.extend(obj_errors)
+    objects = [o for o, _s, _e in spans if isinstance(o, dict)]
     if not objects and not errors:
-        errors.append("No JSON entries found in the provided text.")
+        # BUG-010: step 1's parse error was discarded, so a reply that is
+        # simply not JSON produced one generic sentence with no reason. If
+        # the whole text failed to parse, quote the actual reason -- for a
+        # truncated AI reply that is the difference between "re-copy it" and
+        # "I have no idea what happened".
+        if err:
+            errors.append(
+                "No JSON entries found -- the text is not valid JSON ({}). "
+                "If the AI reply was cut off, re-copy the complete "
+                "reply.".format(err))
+        else:
+            errors.append("No JSON entries found in the provided text.")
     return {"objects": objects, "replacements": [], "errors": errors}
 
 
@@ -549,6 +583,154 @@ def split_files_by_existence(files, on_disk_set, disk_index):
     return deduped, dropped
 
 
+def stage_candidates(included, proposals, include, field_selector,
+                     live_ids, data_dir_known=False, on_disk_set=None,
+                     disk_index=None):
+    """Validate and normalize a batch of import proposals BEFORE anything is
+    written. Returns (staged, problems, stats).
+
+    `staged` is a list of (proposal, clean_candidate) -- a `delete` proposal
+    stages with candidate None. `problems` holds one message per rejected
+    row. `stats` carries the advisory counters the dialog reports back.
+
+    Extracted from ImportDialog._apply so it is a PURE function with no Tk
+    (TEST-002): the collision rule below -- keep `live_ids` in step as rows
+    are renamed, so a later proposal in the same batch cannot validate a
+    collision against a slot this one just vacated -- used to be protected
+    only by a hand-copied version of this loop inside the test suite, so the
+    real code could regress with CI still green. find_replace._apply carries
+    the same live_ids pattern.
+
+    `field_selector(pid, proposal)` returns the set of field names the user
+    ticked for that row, or None when the row is applied whole. Pass
+    `lambda pid, p: None` to apply every row whole.
+    """
+    on_disk_set = on_disk_set or set()
+    disk_index = disk_index or {}
+    staged = []
+    problems = []
+    stats = {"n_stripped_files": 0, "stripped_reports": [],
+             "n_links_kept": 0, "kept_link_reports": []}
+
+    def pid_for(p):
+        return next((iid for iid, pp in
+                     ((iid, proposals[int(iid[1:])]) for iid in include)
+                     if pp is p), None)
+
+    for p in included:
+        if p["action"] == "delete":
+            staged.append((p, None))
+            continue
+        selected = field_selector(pid_for(p), p)
+        if selected is not None:
+            candidate = build_field_merged_candidate(p, selected)
+            if candidate is None:
+                continue        # all fields deselected -> treat as excluded
+            only = set(selected)
+        else:
+            src = p["entry"] if p["action"] == "new" else p["new"]
+            candidate = dict(src)
+            only = None
+        if p["action"] == "changed":
+            # keep AI-repaired ids, but rebuild when identity changed
+            candidate.setdefault("id", p["old"].get("id"))
+            # BUG-017: `candidate` is the AI's object wholesale, and the AI
+            # almost never re-sends `files` (its own audit prompt only says
+            # "preserve exact file paths", it never asks for the value back).
+            # So a missing -- or empty -- `files` was treated as "unlink
+            # everything" and every changed entry silently lost its
+            # measurement links on Apply. Carry the database's links forward
+            # unless the AI actually sent a non-empty list. Unlinking is
+            # still possible: deselect the "files" field, or edit the entry
+            # in the form.
+            incoming = candidate.get("files")
+            if not (isinstance(incoming, list) and incoming):
+                kept_links = list(p["old"].get("files") or [])
+                # always write a well-formed list, even when the old entry
+                # had none, so `files` is never a missing key
+                candidate["files"] = kept_links
+                if kept_links:
+                    stats["n_links_kept"] += 1
+                    stats["kept_link_reports"].append(
+                        "{}: kept {} existing file link(s) -- the AI reply "
+                        "did not list any".format(
+                            p["old"].get("id") or "(no id)", len(kept_links)))
+        candidate["id"] = L.build_id(str(candidate.get("brand") or ""),
+                                     str(candidate.get("model") or ""),
+                                     str(candidate.get("variant") or "")) \
+            or candidate.get("id")
+        # Same $5 + tier auto-fix the Analyze step shows, re-applied here
+        # (idempotent) so manually-built proposals and any path that skipped
+        # _analyze get identical validation behavior. Field-aware: a
+        # deselected price/tags field is never fixed.
+        candidate, _notes = normalize_import_entry(candidate, only)
+        # Phantom-file guard: drop linked measurement paths that are not on
+        # disk (AI hallucinations like "data/SOURCE/BRAND MODEL.txt" that
+        # was never created). Field-aware like the price/tier fix: a
+        # deselected files field keeps the database value.
+        if data_dir_known and (only is None or "files" in only):
+            incoming_files = list(candidate.get("files") or [])
+            if incoming_files:
+                kept, dropped = split_files_by_existence(
+                    incoming_files, on_disk_set, disk_index)
+                if dropped:
+                    candidate["files"] = kept
+                    stats["n_stripped_files"] += len(dropped)
+                    stats["stripped_reports"].append(
+                        "{}: stripped phantom file(s) not on disk: {}"
+                        .format(candidate.get("id") or "(no id)",
+                                ", ".join(str(d) for d in dropped[:3])
+                                + ("..." if len(dropped) > 3 else "")))
+        exclude = p["old"].get("id") if p["action"] == "changed" else None
+        errors = L.validate_entry(candidate, existing_ids=live_ids,
+                                  exclude_id=exclude)
+        if errors:
+            problems.append("{}: {}".format(
+                candidate.get("id") or "(no id)", errors[0]))
+            continue
+        if p["action"] == "new":
+            live_ids.add(candidate["id"])
+        elif p["action"] == "changed" and candidate.get("id") != exclude:
+            # id was renamed -- update live_ids so a later proposal in this
+            # same batch can't validate a collision against a slot this one
+            # just vacated, or land on the id this one just took.
+            live_ids.discard(exclude)
+            live_ids.add(candidate["id"])
+        staged.append((p, candidate))
+    return staged, problems, stats
+
+
+def normalize_brand_spellings(entries, parsed):
+    """Rewrite each proposal object's brand to the database's majority
+    spelling for that exact brand fold ("7Hz" -> "7HZ" when the db spells it
+    "7HZ"). Case/spacing/punctuation variants fold together; genuinely
+    different spellings ("ISN" vs "ISN Audio") fold apart and are never
+    touched -- no online lookup, no fuzzy matching.
+
+    Runs BEFORE classification so a case-only brand difference is no longer
+    reported as a CHANGED row (the identity match sees the normalized
+    brand), and the review rows show the database spelling. Mutates `parsed`
+    in place; returns the rewrite count.
+
+    Module-level and Tk-free (TEST-003) so the test suite can call the code
+    the dialog actually runs, rather than a hand-kept copy of it.
+    """
+    canon = L.brand_canonical_spellings(entries)
+    n = 0
+    for bucket in (parsed.get("objects", []),
+                   [r[1] for r in parsed.get("replacements", [])
+                    if isinstance(r[1], dict)]):
+        for obj in bucket:
+            raw_brand = str(obj.get("brand") or "").strip()
+            if not raw_brand:
+                continue
+            want = canon.get(L.brand_fold_of(raw_brand))
+            if want and want != raw_brand:
+                obj["brand"] = want
+                n += 1
+    return n
+
+
 # ---------------------------------------------------------------------------
 # DIALOG
 # ---------------------------------------------------------------------------
@@ -633,19 +815,20 @@ class ImportDialog(tk.Toplevel):
         vsb.grid(row=0, column=1, sticky="ns")
         tree_frame.rowconfigure(0, weight=1)
         tree_frame.columnconfigure(0, weight=1)
-        self.tree.tag_configure("new", foreground=theme.ACCENT_GREEN)
-        self.tree.tag_configure("changed", foreground=theme.ACCENT_BLUE)
-        self.tree.tag_configure("delete", foreground=theme.ACCENT_RED)
+        self.tree.tag_configure("new", foreground=theme.ACCENT_GREEN_TEXT)
+        self.tree.tag_configure("changed",
+                                foreground=theme.ACCENT_BLUE_TEXT)
+        self.tree.tag_configure("delete", foreground=theme.ACCENT_RED_TEXT)
         self.tree.tag_configure("invalid", foreground=theme.TEXT_DIM)
         # Include-state colors: green = will import on Apply, red/dim =
         # skipped. Kept as dedicated tags (never combined with the action
         # tags above) so toggling never depends on tag priority order.
-        self.tree.tag_configure("state_on", foreground=theme.ACCENT_GREEN)
-        self.tree.tag_configure("state_off", foreground=theme.ACCENT_RED)
-        self.tree.tag_configure("delete_on", foreground=theme.ACCENT_RED)
+        self.tree.tag_configure("state_on", foreground=theme.ACCENT_GREEN_TEXT)
+        self.tree.tag_configure("state_off", foreground=theme.ACCENT_RED_TEXT)
+        self.tree.tag_configure("delete_on", foreground=theme.ACCENT_RED_TEXT)
         self.tree.tag_configure("delete_off", foreground=theme.TEXT_DIM)
-        self.tree.tag_configure("field_on", foreground=theme.ACCENT_GREEN)
-        self.tree.tag_configure("field_off", foreground=theme.ACCENT_RED)
+        self.tree.tag_configure("field_on", foreground=theme.ACCENT_GREEN_TEXT)
+        self.tree.tag_configure("field_off", foreground=theme.ACCENT_RED_TEXT)
         self.tree.bind("<Button-1>", self._on_click)
         self.tree.bind("<space>", self._on_space)
         self.tree.bind("<Return>", self._on_space)
@@ -715,9 +898,38 @@ class ImportDialog(tk.Toplevel):
                                           "load an AI reply first.")
             return
         parsed = parse_ai_output(raw)
-        n_normalized = self._normalize_brands(parsed)
-        n_fixed, self.autofix = _normalize_import_prices(parsed)
-        self.proposals = classify_against(self.app.entries, parsed)
+        # BUG-020: this used to assign self.autofix / self.proposals inline
+        # and then call _render(). classify_against() can raise on ordinary
+        # malformed AI output (a list-valued "id", a scalar "tags"), and
+        # _render() is what clears self.include / self.field_include, wipes
+        # the tree and disables Apply. So a mid-analyze crash left the
+        # PREVIOUS batch's rows on screen with Apply still ENABLED while the
+        # paste box held different text: read the new text, trust the list,
+        # click Apply, and import the wrong batch. Build everything into
+        # locals, commit only once it all succeeded, and keep Apply dead
+        # throughout.
+        self.apply_btn.state(["disabled"])
+        try:
+            n_normalized = self._normalize_brands(parsed)
+            n_fixed, autofix = _normalize_import_prices(parsed)
+            proposals = classify_against(self.app.entries, parsed)
+        except Exception as e:  # noqa: BLE001 - a bad paste must not kill the
+            # dialog, and must never leave a stale review armed
+            self.proposals = []
+            self.include.clear()
+            self.field_include.clear()
+            self._render()
+            messagebox.showerror(
+                APP_TITLE,
+                "Could not read the pasted text:\n\n"
+                "{}: {}\n\n"
+                "Nothing was changed and nothing is selected. Fix the "
+                "format and press Analyze again. (Tip: the AI should reply "
+                "with a single JSON array of complete entry objects.)"
+                .format(type(e).__name__, e), parent=self)
+            return
+        self.autofix = autofix
+        self.proposals = proposals
         self._render()
 
         bits = []
@@ -754,9 +966,14 @@ class ImportDialog(tk.Toplevel):
         self.parse_lbl.configure(
             text=", ".join(bits) if bits else
             "No changes found (the AI output matches the current database).")
-        for err in parsed.get("errors", [])[:2]:
+        # BUG-010: only the first 2 errors were shown, each cut to 80
+        # characters -- so a truncated paste (the single most likely thing to
+        # go wrong) reported a confident "2 new" and the truncation notice
+        # was either absent or unreadable. Show every message in full; a
+        # skipped entry must never be invisible.
+        for err in parsed.get("errors", []):
             self.parse_lbl.configure(
-                text=self.parse_lbl.cget("text") + "  |  " + err[:80])
+                text=self.parse_lbl.cget("text") + "  |  " + str(err))
 
     def _count_phantom_files(self, proposals):
         """How many incoming linked files in `proposals` do not exist on
@@ -793,29 +1010,10 @@ class ImportDialog(tk.Toplevel):
         return n
 
     def _normalize_brands(self, parsed):
-        """Rewrite each proposal object's brand to the database's majority
-        spelling for that exact brand fold ("7Hz" -> "7HZ" when the db
-        spells it "7HZ"). Case/spacing/punctuation variants fold together;
-        genuinely different spellings ("ISN" vs "ISN Audio") fold apart
-        and are never touched -- no online lookup, no fuzzy matching.
-        Runs BEFORE classification so a case-only brand difference is no
-        longer reported as a CHANGED row (the identity match sees the
-        normalized brand), and the review rows show the database
-        spelling. Mutates parsed in place; returns the rewrite count."""
-        canon = L.brand_canonical_spellings(self.app.entries)
-        n = 0
-        for bucket in (parsed.get("objects", []),
-                       [r[1] for r in parsed.get("replacements", [])
-                        if isinstance(r[1], dict)]):
-            for obj in bucket:
-                raw_brand = str(obj.get("brand") or "").strip()
-                if not raw_brand:
-                    continue
-                want = canon.get(L.brand_fold_of(raw_brand))
-                if want and want != raw_brand:
-                    obj["brand"] = want
-                    n += 1
-        return n
+        """Thin wrapper over the module-level normalize_brand_spellings() so
+        the dialog and the test suite share one implementation (TEST-003).
+        Mutates parsed in place; returns the rewrite count."""
+        return normalize_brand_spellings(self.app.entries, parsed)
 
     def _autofix_notes_for(self, p):
         action = p.get("action")
@@ -1123,6 +1321,8 @@ class ImportDialog(tk.Toplevel):
         problems = []
         stripped_reports = []  # ["<id>: dropped <path>", ...] for phantoms
         n_stripped_files = 0
+        kept_link_reports = []   # BUG-017: links preserved from the database
+        n_links_kept = 0
         # One shared data-folder snapshot for the whole batch (the scan is
         # memoized, so this is cheap): lets us drop AI-hallucinated file
         # links that do not exist on disk instead of importing Missing-File
@@ -1142,70 +1342,19 @@ class ImportDialog(tk.Toplevel):
                     disk_index = {p.lower(): p for p in (on_disk or [])}
         except Exception:  # noqa: BLE001 - import must never fail on scan
             on_disk_set, disk_index, data_dir_known = set(), {}, False
-        for p in included:
-            if p["action"] == "delete":
-                staged.append((p, None))
-                continue
-            pid = next((iid for iid, pp in
-                        ((iid, self.proposals[int(iid[1:])])
-                         for iid in self.include) if pp is p), None)
-            selected = self._selected_fields_for(pid, p)
-            if selected is not None:
-                candidate = build_field_merged_candidate(p, selected)
-                if candidate is None:
-                    continue  # all fields deselected -> treat as excluded
-                only = set(selected)
-            else:
-                src = p["entry"] if p["action"] == "new" else p["new"]
-                candidate = dict(src)
-                only = None
-            if p["action"] == "changed":
-                # keep AI-repaired ids, but rebuild when identity changed
-                candidate.setdefault("id", p["old"].get("id"))
-            candidate["id"] = L.build_id(str(candidate.get("brand") or ""),
-                                         str(candidate.get("model") or ""),
-                                         str(candidate.get("variant") or "")) \
-                or candidate.get("id")
-            # Same $5 + tier auto-fix the Analyze step shows, re-applied
-            # here (idempotent) so manually-built proposals and any path
-            # that skipped _analyze get identical validation behavior.
-            # Field-aware: a deselected price/tags field is never fixed.
-            candidate, _notes = normalize_import_entry(candidate, only)
-            # Phantom-file guard: drop linked measurement paths that are
-            # not on disk (AI hallucinations like
-            # "data/SOURCE/BRAND MODEL.txt" that was never created).
-            # Field-aware like the price/tier fix: a deselected files
-            # field keeps the database value and is never stripped.
-            if data_dir_known and (only is None or "files" in only):
-                incoming_files = list(candidate.get("files") or [])
-                if incoming_files:
-                    kept, dropped = split_files_by_existence(
-                        incoming_files, on_disk_set, disk_index)
-                    if dropped:
-                        candidate["files"] = kept
-                        n_stripped_files += len(dropped)
-                        stripped_reports.append(
-                            "{}: stripped phantom file(s) not on disk: {}"
-                            .format(candidate.get("id") or "(no id)",
-                                    ", ".join(str(d) for d in dropped[:3])
-                                    + ("..." if len(dropped) > 3 else "")))
-            exclude = p["old"].get("id") if p["action"] == "changed" else None
-            errors = L.validate_entry(candidate, existing_ids=live_ids,
-                                      exclude_id=exclude)
-            if errors:
-                problems.append("{}: {}".format(
-                    candidate.get("id") or "(no id)", errors[0]))
-                continue
-            if p["action"] == "new":
-                live_ids.add(candidate["id"])
-            elif p["action"] == "changed" and candidate.get("id") != exclude:
-                # id was renamed -- update live_ids so a later proposal in
-                # this same batch can't validate a collision against a slot
-                # this one just vacated, or land on the id this one just
-                # took (see find_replace._apply for the same pattern).
-                live_ids.discard(exclude)
-                live_ids.add(candidate["id"])
-            staged.append((p, candidate))
+        # TEST-002: the staging loop now lives in the module-level
+        # stage_candidates(), so the test suite exercises this exact code
+        # instead of a hand-kept copy of it (a copy let the duplicate-id
+        # rule regress with CI still green).
+        staged, problems, _stats = stage_candidates(
+            included, self.proposals, self.include,
+            self._selected_fields_for, live_ids,
+            data_dir_known=data_dir_known, on_disk_set=on_disk_set,
+            disk_index=disk_index)
+        n_stripped_files = _stats["n_stripped_files"]
+        stripped_reports = _stats["stripped_reports"]
+        n_links_kept = _stats["n_links_kept"]
+        kept_link_reports = _stats["kept_link_reports"]
         if problems:
             if not messagebox.askyesno(
                     APP_TITLE,
@@ -1288,6 +1437,10 @@ class ImportDialog(tk.Toplevel):
         if n_stripped_files:
             desc += " ({} phantom file(s) stripped -- not on disk)".format(
                 n_stripped_files)
+        if n_links_kept:
+            desc += (" ({} entr{} kept their existing file link(s) -- the AI "
+                     "reply listed none)".format(
+                         n_links_kept, "y" if n_links_kept == 1 else "ies"))
         app._record_op("import", desc, changes)
         app.dirty = True
         app._mark_audit_dirty()

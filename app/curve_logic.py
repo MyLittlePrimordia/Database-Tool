@@ -24,6 +24,7 @@ Behavior (unchanged from the standalone app):
 
 import os
 import re
+import math
 import traceback
 
 # The separator before a pairing digit must be EXPLICIT punctuation
@@ -44,6 +45,24 @@ VALID_PAIR_ROLE_SETS = ({"1", "2"}, {"L", "R"})
 
 MIN_FREQ_HZ = 1.0
 MAX_FREQ_HZ = 200000.0
+
+# CURVE-002: bounds for the AMPLITUDE column, which previously had none.
+# Deliberately wide -- a raw SPL sweep runs ~60-110 dB and a normalised one
+# ~-60..+40 -- so no legitimate measurement is rejected; the point is to stop
+# nan/inf and absurd values reaching the standardized file.
+MIN_SPL_DB = -200.0
+MAX_SPL_DB = 200.0
+
+# CURVE-007: a real sweep reaches at least a few kHz. If the highest
+# frequency that survived parsing is below this, the frequency column is
+# almost certainly kHz mislabelled as Hz.
+KHZ_SUSPECT_MAX_HZ = 100.0
+
+# CURVE-003: a frequency response is a sweep. Fewer surviving points than
+# this means the file was not read as (freq, dB) at all -- typically a
+# leading index/row-number column -- and writing it out would fabricate a
+# measurement.
+MIN_CURVE_POINTS = 2
 
 PAIR_MISMATCH_WARN_DB = 10.0
 
@@ -149,12 +168,16 @@ def _looks_like_date_triple(rows, nums):
     return has_real_row
 
 
-def try_parse_data_row(line, rows=None):
-    """Look at one line and decide if it's a real curve data row: freq,
+def try_parse_data_row(line, rows=None, stats=None, col=0):
+    """Look at one line and decide if it is a real curve data row: freq,
     amplitude, and optionally phase. Returns (freq, spl, phase) or None
     if the line isn't a data row (header, comment, metadata, blank...).
     `rows` (candidate rows collected so far) feeds the date-triple
-    corroboration check -- see _looks_like_date_triple."""
+    corroboration check -- see _looks_like_date_triple.
+    `stats`, when given, is a one-key dict used to report rows dropped for
+    being below MIN_FREQ_HZ (the kHz-detection signal in parse_curve_file).
+    `col` is the index of the frequency field within the split row, so a
+    leading row-number column can be skipped (CURVE-003)."""
     stripped = line.strip()
     if not stripped:
         return None
@@ -164,7 +187,7 @@ def try_parse_data_row(line, rows=None):
         return None
 
     nums = []
-    for f in fields[:3]:
+    for f in fields[col:col + 3]:
         try:
             nums.append(float(f))
         except ValueError:
@@ -180,7 +203,23 @@ def try_parse_data_row(line, rows=None):
     phase = nums[2] if len(nums) > 2 else None
 
     if not (MIN_FREQ_HZ <= freq <= MAX_FREQ_HZ):
+        if stats is not None and freq < MIN_FREQ_HZ:
+            stats["below_min"] = stats.get("below_min", 0) + 1
         return None
+
+    # CURVE-002: only the FREQUENCY was range-checked. float("nan") and
+    # float("inf") parse successfully, and every comparison against nan is
+    # False -- but the amplitude was never compared at all, so a row like
+    # "1000  nan" sailed through and write_output formatted it into the
+    # standardized file as the literal text "nan". The file was then linked
+    # into database.json as a valid measurement, and consumers either choke
+    # on it or silently drop those points (fr_analysis's window test is
+    # False for nan), leaving a curve with a hole in it. Reject non-finite
+    # and implausible amplitudes here, before anything can be written.
+    if not (math.isfinite(spl) and MIN_SPL_DB <= spl <= MAX_SPL_DB):
+        return None
+    if phase is not None and not math.isfinite(phase):
+        phase = None
 
     return freq, spl, phase
 
@@ -203,6 +242,38 @@ def _sort_and_dedupe_rows(rows):
     return out
 
 
+def _parse_rows(text, col=0, stats=None):
+    """Run try_parse_data_row over every line of `text`, taking the frequency
+    from field `col`. Kept separate from parse_curve_file so the CURVE-003
+    recovery pass can re-read the same text with a different column offset
+    without touching the file twice."""
+    rows = []
+    for line in text.splitlines():
+        row = try_parse_data_row(line, rows=rows, stats=stats, col=col)
+        if row is not None:
+            rows.append(row)
+    return rows
+
+
+def _looks_like_index_column(rows):
+    """True when the parsed frequency column is a consecutive integer run
+    starting at 0 or 1 -- i.e. a spreadsheet row number, not a frequency.
+
+    Deliberately strict, so it cannot fire on real data: a genuine axis is
+    log-spaced, is never consecutive, and never starts below 20 Hz. A
+    narrow linear sweep (2000, 2001, ...) starts far above 1, so it is left
+    alone."""
+    if len(rows) < 3:
+        return False
+    first = rows[0][0]
+    if first not in (0.0, 1.0):
+        return False
+    for a, b in zip(rows, rows[1:]):
+        if b[0] - a[0] != 1.0:
+            return False
+    return True
+
+
 def parse_curve_file(path):
     """Parse a raw curve file from ANY source regardless of header,
     delimiter, or surrounding metadata. Returns a list of
@@ -210,16 +281,54 @@ def parse_curve_file(path):
     duplicate frequencies collapsed.
     L-8: date-triple detection needs to see whether the file holds any
     REAL sweep rows before dropping a candidate; rows are therefore
-    collected first and the date filter runs on the collected set."""
+    collected first and the date filter runs on the collected set.
+
+    CURVE-007: raises ValueError when the frequency column is plainly kHz.
+    Guessing a rescale is worse than refusing -- a silently 1000x-wrong
+    axis produces a curve that looks plausible in the preview and is
+    garbage everywhere else -- so the file is rejected with a message the
+    conversion log can show.
+    """
     candidates = []
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
-        for line in f:
-            row = try_parse_data_row(line, rows=candidates)
-            if row is not None:
-                candidates.append(row)
-    rows = [r for r in candidates
-            if not _looks_like_date_triple(candidates, r)]
-    return _sort_and_dedupe_rows(rows)
+    stats = {}
+    # CURVE-006: encoding="utf-8" does NOT strip a BOM, so the first data
+    # line arrived as "\ufeff20\t50.0", float() rejected it, and the lowest
+    # frequency point -- the bass reference -- was silently dropped. Excel's
+    # "CSV UTF-8" and many Windows measurement exports write a BOM.
+    # "utf-8-sig" is a no-op for BOM-less files.
+    with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
+        text = f.read()
+    candidates = _parse_rows(text, col=0, stats=stats)
+    rows = _sort_and_dedupe_rows(
+        [r for r in candidates
+         if not _looks_like_date_triple(candidates, r)])
+
+    # CURVE-003: columns are assigned positionally, so a file that leads
+    # with a row-number/index column is read as (index, frequency, dB) and
+    # yields a fabricated curve that is then written out and linked into
+    # database.json as a real measurement. A frequency axis is log-spaced --
+    # 20, 100, 1000, 10000 -- and never a consecutive integer run starting
+    # at 0 or 1, so that shape is a reliable index signature. When it is
+    # seen, re-parse from the NEXT column, which recovers the user's real
+    # curve instead of discarding their file.
+    if _looks_like_index_column(rows):
+        retry = _sort_and_dedupe_rows(
+            [r for r in _parse_rows(text, col=1, stats={})
+             if not _looks_like_date_triple(candidates, r)])
+        if len(retry) >= len(rows):
+            rows = retry
+    # A frequency response is a sweep: fewer than two points is not a curve,
+    # so refuse rather than emit a fabricated one.
+    if len(rows) < MIN_CURVE_POINTS:
+        return []
+    if rows and max(r[0] for r in rows) <= KHZ_SUSPECT_MAX_HZ \
+            and stats.get("below_min"):
+        raise ValueError(
+            "frequency column looks like kHz, not Hz (highest value "
+            "{:.6g}, and {} row(s) fell below {} Hz and were dropped) -- "
+            "re-export with the frequency axis in Hz"
+            .format(max(r[0] for r in rows), stats["below_min"], MIN_FREQ_HZ))
+    return rows
 
 
 def interp_spl(freqs, spls, target_freqs):
@@ -451,6 +560,20 @@ def convert_plan(plan, out_path, log=print):
             base = sanitize_filename(
                 "{}.txt".format(os.path.splitext(os.path.basename(path))[0].upper()))
             target = os.path.join(os.path.dirname(out_path), base)
+            # CURVE-001: this derived name is NOT the planned output, so the
+            # caller's overwrite prompt -- which only ever sees `out_path` --
+            # never knew about it. Writing here destroyed an unrelated
+            # pre-existing file, and did so even when the user had answered
+            # "don't touch existing files". It then logged a plain [OK], as
+            # if the file were new. Refuse instead: the cost is one skipped
+            # conversion, the alternative is silent loss of someone's
+            # measurement.
+            if os.path.exists(target) or target in written or target == out_path:
+                log("[SKIPPED] {}  (a file with this derived name already "
+                    "exists and was NOT overwritten -- rename the output, or "
+                    "move that file aside, to convert this one)"
+                    .format(os.path.basename(target)))
+                continue
         try:
             freq_spl_rows = [(freq, spl) for freq, spl, _phase in rows]
             write_output(target, freq_spl_rows)

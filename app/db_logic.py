@@ -186,6 +186,42 @@ class FileBusyError(OSError):
     present this message verbatim instead of a raw WinError string."""
 
 
+class ConcurrentModificationError(OSError):
+    """The database file changed on disk since this app opened it.
+
+    BUG-024: the app had no cross-process check at all, so a second window
+    on the same file (or an external editor) could be overwritten silently
+    -- and worse, the stale instance's `write_database_backup` would first
+    copy the OTHER instance's fresh file over the single rolling
+    `database.json.bak`, destroying the only pre-save copy on the way."""
+
+
+def file_stamp(path):
+    """Cheap content identity: (mtime_ns, size), or None if unreadable.
+
+    Only a hint -- an external tool can touch a file without changing it, so
+    callers confirm with file_digest() before treating a difference as real.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_mtime_ns, st.st_size)
+
+
+def file_digest(path):
+    """sha256 of a file's bytes, or None if unreadable. Only called to
+    confirm a stamp mismatch, so the cost lands on the rare path."""
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+    except OSError:
+        return None
+    return h.hexdigest()
+
+
 # F3: unique tmp-name suffix for every atomic write. A FIXED "<path>.tmp"
 # let two concurrent writers of the SAME target (two app instances saving
 # one database.json, or overlapping in-process writes) interleave their
@@ -345,7 +381,16 @@ FORM_CONNECTOR_MAP = {
     "Earbuds (Wired)": ["2-pin", "QDC", "MMCX", "A2DC", "Fixed Cable", "Proprietary"],
     "Wireless Earbuds (TWS)": ["Bluetooth"],
     "Wireless Over-Ear Headphones": ["Bluetooth"],
-    "Over-Ear Headphones (Wired)": ["Detachable Cable", "Fixed Cable", "Electrostatic"],
+    # "Proprietary" belongs here. BOTH prompt contracts list it as a valid
+    # wired over-ear connector -- ADD ENTRY: 'Use "Detachable Cable", "Fixed
+    # Cable", "Proprietary", or "Electrostatic"'; AUDIT: 'They use "Fixed
+    # Cable", "Detachable Cable", "Proprietary", or "Electrostatic"' -- and
+    # the Proprietary rule itself lists over-ear hardware (PSB M4U 4, Madoo
+    # Type 512/711, Sleek SA6). Omitting it rejected spec-compliant entries
+    # on load, hid the option in the editor's dropdown, and let the audit
+    # flag correct data as an invalid pairing.
+    "Over-Ear Headphones (Wired)": ["Detachable Cable", "Fixed Cable",
+                                    "Proprietary", "Electrostatic"],
 }
 
 TWS_FORM_FACTOR = "Wireless Earbuds (TWS)"
@@ -400,6 +445,55 @@ TAG_CONFLICT_PAIRS = [
     frozenset(["Warm", "Analytical"]),
     frozenset(["Basshead", "Treblehead"]),
 ]
+
+# How each forbidden pair is meant to be resolved, quoted from the audit
+# prompt's "TAG AUDIT & CONFLICT RESOLUTION MATRIX".
+#
+# These are surfaced in the audit message but deliberately NOT auto-applied.
+# Six of the eight turn on an acoustic judgement the app cannot make without
+# the raw curve -- "keep the dominant treble character", "remove the weaker
+# supported tag" -- and silently deleting a tonal tag would destroy
+# information the user may have measured deliberately. The prompt itself
+# marks them "Remove/Resolve" rather than mandating a specific winner, so
+# flagging plus the contract's own guidance is the correct behaviour; only
+# mechanically-derivable repairs (price tier, id, whitespace, ordering) get
+# a Fix All. The two deterministic rules are called out as such below.
+TAG_CONFLICT_RESOLUTION = {
+    frozenset(["V-Shaped", "U-Shaped"]):
+        'deterministic default: keep the profile the measurement curves '
+        'support; the prompt says default to "V-Shaped" if ambiguous',
+    frozenset(["Neutral", "V-Shaped"]):
+        "remove the weaker supported tag",
+    frozenset(["V-Shaped", "Vocal-Focused"]):
+        'remove "Vocal-Focused" -- a V-shape recesses the midrange',
+    frozenset(["Dark", "Bright"]):
+        "keep the dominant treble character",
+    frozenset(["Dark", "Treblehead"]):
+        "remove the contradictory tag based on the frequency response",
+    frozenset(["Warm", "Bright"]):
+        "resolve to the dominant tonal balance",
+    frozenset(["Warm", "Analytical"]):
+        'remove "Analytical" if warm/bassy, or "Warm" if lean/clinical',
+    frozenset(["Basshead", "Treblehead"]):
+        "keep the defining signature tag",
+}
+
+# Any two tags from the primary-tonality group are also a conflict, even
+# though the prompt lists only some of those combinations.
+PRIMARY_TONALITY_RESOLUTION = (
+    "at most one primary tonal profile is allowed; keep the one the "
+    "measurement curves support"
+)
+
+
+def tag_conflict_resolution(pair):
+    """The contract's guidance for a conflicting tag combination, or None."""
+    key = frozenset(pair)
+    if key in TAG_CONFLICT_RESOLUTION:
+        return TAG_CONFLICT_RESOLUTION[key]
+    if key and key.issubset(PRIMARY_TONALITY_GROUP):
+        return PRIMARY_TONALITY_RESOLUTION
+    return None
 
 PRIMARY_TONALITY_GROUP = {"Neutral", "Balanced", "V-Shaped", "U-Shaped"}
 
@@ -488,11 +582,16 @@ def _brand_fold(brand):
 def brand_spelling_fixes(entries):
     """Find brands whose spelling is inconsistent across the database
     (case, spacing, or punctuation variants of the same fold) and return
-    {entry_index: (current_spelling, canonical_spelling, variant_summary)}
-    for every entry NOT already using the majority spelling. The majority
-    spelling (most entries; ties broken alphabetically for determinism)
-    is treated as canonical. Buckets of size 1 (no inconsistency) are
-    skipped entirely."""
+    {entry_index: (current_spelling, canonical_spelling, variant_summary,
+    has_majority)} for every entry NOT already using the majority spelling.
+
+    The majority spelling (most entries) is treated as canonical. Ties are
+    broken alphabetically for determinism, but `has_majority` is then False
+    -- a 1-vs-1 split is not evidence of anything, so the audit reports it
+    as a warning WITHOUT an auto-fix. Letting "Fix All" act on a coin-flip
+    renamed a correctly-spelled product for no reason.
+
+    Buckets of size 1 (no inconsistency) are skipped entirely."""
     buckets = {}   # fold -> {exact_spelling: [idx, ...]}
     for idx, e in enumerate(entries):
         brand = (e.get("brand") or "").strip()
@@ -509,11 +608,12 @@ def brand_spelling_fixes(entries):
             continue
         ranked = sorted(spellings.items(), key=lambda kv: (-len(kv[1]), kv[0]))
         canonical = ranked[0][0]
+        has_majority = len(ranked[0][1]) > len(ranked[1][1])
         summary = ", ".join("'{}' ({})".format(sp, len(idxs))
                              for sp, idxs in ranked)
         for spelling, idxs in ranked[1:]:
             for idx in idxs:
-                fixes[idx] = (spelling, canonical, summary)
+                fixes[idx] = (spelling, canonical, summary, has_majority)
     return fixes
 
 
@@ -598,15 +698,67 @@ def round_price_to_5(price_usd):
     return int(math.floor((p + 2.5) / 5.0) * 5)
 
 
+# Scaling prefixes (kohm/mohm) are deliberately EXCLUDED: stripping "kohm"
+# would silently turn 2000 ohm into 2, which is a magnitude change wearing
+# formatting's clothes. An unrecognised prefix is rejected instead, so the
+# value becomes 0 and is reported rather than quietly altered. Both the OHM
+# SIGN (U+2126) and GREEK CAPITAL LETTER OMEGA (U+03A9) are listed, written
+# as escapes because the two are indistinguishable in most editors.
+_NUM_UNIT_SUFFIXES = ("ohms", "ohm", "\u2126", "\u03a9", "db", "hz")
+
+# A comma is only ever a THOUSANDS separator in the "1,299" / "1,299.50"
+# shape (groups of exactly three digits). Anything else -- "12,50", "1,5",
+# "1,29,999" -- is a decimal comma or a typo, and deleting the comma would
+# silently rescale the number by 10-100x (a $12,50 price becoming $1250).
+# Such text is left alone so it is rejected and reported like any other
+# unparseable value, instead of being quietly changed into a wrong one.
+_THOUSANDS_RE = re.compile(r"\d{1,3}(?:,\d{3})+(?:\.\d+)?")
+
+
 def coerce_int(value, default=0):
     """Whole-number coercion that cannot raise. Non-finite floats and
-    garbage fall back to `default`."""
+    garbage fall back to `default`.
+
+    BUG-022: a hand-typed thousands separator or currency symbol made
+    float() raise, so the value fell through to `default` -- and for
+    price_usd/impedance that default is 0, which both database prompts
+    explicitly forbid. "$1,299" therefore became a price of 0, silently and
+    irreversibly (the original text is gone by the time anyone sees a
+    warning). Retry once with the purely cosmetic parts of the text removed;
+    the cleaned form is only accepted when it parses cleanly, so this cannot
+    turn garbage into a number."""
     if isinstance(value, bool):
         return int(value)
     if isinstance(value, int):
         return value
     if isinstance(value, str) and "_" in value:
         return default
+    if isinstance(value, str):
+        cleaned = value.strip().replace("$", "")
+        # a unit suffix is only stripped for a value that is otherwise a
+        # plain number, so "18 ohm" -> 18 but "high" stays unparseable.
+        # BOTH sides are lowercased: str.lower() maps the ohm sign to the
+        # lowercase omega, so comparing a lowered string against an
+        # uppercase suffix never matched.
+        lowered = cleaned.lower()
+        for suffix in _NUM_UNIT_SUFFIXES:
+            if lowered.endswith(suffix.lower()):
+                cleaned = cleaned[:-len(suffix)].strip()
+                break
+        # commas are removed ONLY when they are genuine thousands
+        # separators (see _THOUSANDS_RE); otherwise they stay in, float()
+        # rejects the text, and the value falls back to `default`.
+        if "," in cleaned and _THOUSANDS_RE.fullmatch(cleaned):
+            cleaned = cleaned.replace(",", "")
+        if cleaned and cleaned != value.strip():
+            try:
+                f = float(cleaned)
+            except (TypeError, ValueError):
+                f = None
+            if f is not None and math.isfinite(f):
+                if f != int(f):
+                    f = math.floor(f + 0.5)
+                return int(f)
     try:
         f = float(value)
         if not math.isfinite(f):
@@ -859,7 +1011,9 @@ def validate_entry(entry, existing_ids=None, exclude_id=None):
         errors.append("At most {} tags are allowed (has {}).".format(MAX_TAGS, len(tags)))
     conflicts = tag_conflicts(set(map(str, tags)))
     for pair in conflicts:
-        errors.append("Conflicting tags present: {}".format(" + ".join(pair)))
+        _c = "Conflicting tags present: {}".format(" + ".join(pair))
+        _r = tag_conflict_resolution(pair)
+        errors.append("{} -- resolve: {}".format(_c, _r) if _r else _c)
     tier_tags_present = [t for t in tags if t in PRICE_TIER_TAGS]
     if len(tier_tags_present) != 1:
         errors.append("Exactly one price-tier tag is required (Budget/Mid-Tier/Premium/Flagship).")
@@ -886,6 +1040,30 @@ def build_clean_entry(source, notes=None, where=""):
 
     def _label(f):
         return "{} ('{}')".format(f, (source.get("id") or source.get("model") or "?"))
+
+    # Keys outside the schema are DROPPED by the loop below, which used to
+    # happen without a word. That is the worst kind of corruption: a typo'd
+    # field name ("impedence") silently became the default -- 0 for a spec
+    # the prompt forbids on wired gear -- and the original value was gone
+    # with no trace. It also broke this function's own contract, which
+    # promises that corruption can never be laundered quietly. Both prompt
+    # contracts say the schema must not gain, lose, or rename fields, so an
+    # unrecognised key is a schema violation worth reporting.
+    for key in source:
+        if key in SCHEMA_FIELDS or not isinstance(key, str):
+            continue
+        # a near-miss is almost always a misspelling of a real field, so name
+        # the intended target rather than just reporting the loss
+        hint = ""
+        low = key.strip().lower()
+        close = difflib.get_close_matches(low, SCHEMA_FIELDS, n=1, cutoff=0.7)
+        if close:
+            hint = " (did you mean '{}'?)".format(close[0])
+        elif low.replace(" ", "_").replace("-", "_") in SCHEMA_FIELDS:
+            hint = " (did you mean '{}'?)".format(
+                low.replace(" ", "_").replace("-", "_"))
+        note("unknown field '{}' is not in the schema and was "
+             "discarded{}.".format(key, hint))
 
     out = {}
     for f in SCHEMA_FIELDS:
@@ -1104,13 +1282,31 @@ def load_database(path):
 
 
 def save_database(path, entries):
-    """Sort `entries` IN PLACE (preserving object identities for the undo
-    history), then atomically write a canonicalized copy."""
-    entries.sort(key=sort_key)
+    """Return a NEW list sorted by `sort_key` and atomically write a
+    canonicalized copy of it.
+
+    BUG-002: this used to `entries.sort(...)` the caller's list IN PLACE as
+    its first statement, before the fallible write. A save that then failed
+    (FileBusyError when IEM Tool holds the file) left the caller's list
+    reordered with no tree rebuild, so every `entry:N` iid and
+    `MainApp.editing_index` -- the sole authority for which record "Save
+    Entry" overwrites -- addressed a DIFFERENT record, while the tree rows
+    still showed the old labels. The next Save Entry then overwrote one
+    product with another's data.
+
+    `sorted()` allocates a new list but keeps the same element objects, so
+    the undo history's ref_before/ref_after identities are unaffected. The
+    caller's list is now only ever replaced deliberately, by _after_save,
+    on the success path.
+    """
+    ordered = sorted(entries, key=sort_key)
     parent = os.path.dirname(os.path.abspath(path))
     if parent and not os.path.isdir(parent):
         os.makedirs(parent, exist_ok=True)
-    ordered = [build_clean_entry(e) for e in entries]
+    # canonicalize FROM the sorted list, so the file on disk is in sort_key
+    # order (this used to rely on the caller's list having been sorted in
+    # place just above).
+    ordered = [build_clean_entry(e) for e in ordered]
     tmp_path = _unique_tmp(path)
     try:
         # newline="\n": keep the canonical serialization byte-stable (LF)
@@ -1131,7 +1327,7 @@ def save_database(path, entries):
         except OSError:
             pass
         raise
-    return entries
+    return ordered
 
 
 # --------------------------------------------------------------------------
@@ -1895,6 +2091,16 @@ def find_duplicate_pairs(entries, referenced_map=None):
     return issues
 
 
+def _snapshot_entry(entry):
+    """Value snapshot of one entry, used to restore it when a fix is
+    refused. Entry values are JSON scalars or flat lists of scalars
+    (`tags`, `files`), so copying the lists is a complete deep copy --
+    cheaper than importing `copy` for the handful of fields a mutator can
+    touch, and immune to a mutator having rebound a list in place."""
+    return {k: (list(v) if isinstance(v, list) else v)
+            for k, v in entry.items()}
+
+
 def run_full_audit(entries, data_root=None):
     """
     Returns list of AuditIssue. Fix closures capture the audited ENTRY
@@ -1906,7 +2112,17 @@ def run_full_audit(entries, data_root=None):
     seen_ids = {}
     disk_index = None
 
-    def _resolve(entries_list, target_obj, eid, frozen_idx):
+    def _entry_ident(entry):
+        """Content fingerprint used only to CONFIRM a fallback target.
+
+        The id is deliberately excluded (it is what the fallback is trying to
+        re-establish) and so is every mutable field. brand/model/variant is
+        the closest thing to a stable identity this schema has."""
+        return (str(entry.get("brand") or "").strip(),
+                str(entry.get("model") or "").strip(),
+                str(entry.get("variant") or "").strip())
+
+    def _resolve(entries_list, target_obj, eid, frozen_idx, ident=None):
         if target_obj is not None:
             for p, e in enumerate(entries_list):
                 if e is target_obj:
@@ -1914,22 +2130,77 @@ def run_full_audit(entries, data_root=None):
         tid = eid if eid and eid != "-" and not eid.startswith("(no id)") else None
         if tid:
             hits = [p for p, e in enumerate(entries_list) if e.get("id") == tid]
-            if len(hits) == 1:
-                return hits[0]
             if len(hits) > 1:
                 return -1                      # ambiguous: refuse to guess
+            if len(hits) == 1:
+                # BUG-011: the audited entry was deleted (or replaced) after
+                # the audit ran, and some OTHER entry now carries the same id.
+                # Matching on the id alone therefore mutates a different
+                # product -- e.g. a price rounded onto a different headphone.
+                # Confirm the fallback target is really the audited record
+                # before touching it.
+                if ident is not None and \
+                        _entry_ident(entries_list[hits[0]]) != ident:
+                    return -1
+                return hits[0]
         if 0 <= frozen_idx < len(entries_list) \
                 and not entries_list[frozen_idx].get("id"):
+            # BUG-011: this fallback only checked "the entry here has no id".
+            # With two id-less entries, every file-link fix in the batch
+            # resolved to the same slot and emptied one entry's links several
+            # times over. Require the content fingerprint to match too.
+            if ident is not None and \
+                    _entry_ident(entries_list[frozen_idx]) != ident:
+                return -1
             return frozen_idx
         return -1
 
     def make_fix(target_obj, eid, frozen_idx, mutator):
-        """mutator(entry) applies the change to the located entry dict."""
+        """mutator(entry) applies the change to the located entry dict.
+
+        BUG-007: two mutators rewrite an entry's `id` -- id-format and
+        brand-spelling. Both can land on an id another entry already owns.
+        brand-spelling buckets by `_brand_fold` (which strips ALL
+        non-alphanumerics) but `build_id` uses `normalize_component` (which
+        keeps word separators), so brands differing only by spacing
+        ("Moondrop" vs "Moon Drop") fold together for the spelling check
+        yet build DIFFERENT ids -- renaming one onto the other therefore
+        creates a duplicate primary key, and MainApp._pre_save_checks then
+        refuses every Save AND every Save As, with no automated way out
+        ("Duplicate ID" is deliberately non-auto-fixable).
+
+        Enforced here, at the single choke point all 19 mutators pass
+        through, so the collision never exists rather than being cleaned up
+        afterwards. On refusal the WHOLE entry is restored, not just the id:
+        brand-spelling writes brand AND id, so undoing only the id would
+        leave a renamed brand carrying a stale id -- self-inconsistent, and
+        the id-format fix would then try (and be refused) all over again.
+        """
+        # Fingerprint the audited record NOW, at closure-creation time, so the
+        # stale-target guards in _resolve have something to confirm against
+        # later. Captured here rather than passed in by all 19 call sites.
+        ident = _entry_ident(target_obj) if target_obj is not None else None
+
         def fix(entries_list):
-            p = _resolve(entries_list, target_obj, eid, frozen_idx)
+            p = _resolve(entries_list, target_obj, eid, frozen_idx, ident)
             if p < 0:
                 return None
-            mutator(entries_list[p])
+            entry = entries_list[p]
+            pre_image = _snapshot_entry(entry)
+            id_before = pre_image.get("id")
+            mutator(entry)
+            id_after = entry.get("id")
+            if id_after != id_before:
+                for q, other in enumerate(entries_list):
+                    if q != p and other.get("id") == id_after:
+                        entry.clear()
+                        entry.update(pre_image)
+                        log("Fix refused: it would set ID '{}' on entry #{}, "
+                            "which entry #{} already uses. Left unchanged -- "
+                            "resolve the duplicate ID by hand (the Duplicate "
+                            "ID finding is intentionally not auto-fixable)."
+                            .format(id_after, p, q))
+                        return None
             return p
         return fix
 
@@ -2020,7 +2291,7 @@ def run_full_audit(entries, data_root=None):
                 ))
 
         if idx in _brand_fixes:
-            current, canonical, summary = _brand_fixes[idx]
+            current, canonical, summary, has_majority = _brand_fixes[idx]
 
             def _brand_mut(en, val=canonical):
                 en["brand"] = val
@@ -2028,23 +2299,52 @@ def run_full_audit(entries, data_root=None):
                 if new_id:
                     en["id"] = new_id
 
+            if has_majority:
+                msg = ("Brand '{}' is spelled inconsistently with other "
+                       "entries for the same brand ({}). Auto-fix renames it "
+                       "to the majority spelling '{}' and rebuilds the "
+                       "id.".format(current, summary, canonical))
+                fix = make_fix(entry, real_id or eid, idx, _brand_mut)
+            else:
+                # BUG-007: no clear majority (a tie, broken alphabetically
+                # only for determinism). Renaming on a coin-flip rewrites a
+                # real product's brand AND its primary key for no evidence,
+                # so this stays a manual warning.
+                msg = ("Brand '{}' is spelled inconsistently with other "
+                       "entries for the same brand ({}), but there is no "
+                       "clear majority spelling, so this is NOT auto-fixed. "
+                       "Pick the correct spelling and edit the entry "
+                       "yourself.".format(current, summary))
+                fix = None
             issues.append(AuditIssue(
-                "Brand Spelling", idx, eid,
-                "Brand '{}' is spelled inconsistently with other entries "
-                "for the same brand ({}). Auto-fix renames it to the "
-                "majority spelling '{}' and rebuilds the id.".format(
-                    current, summary, canonical),
-                fix=make_fix(entry, real_id or eid, idx, _brand_mut),
+                "Brand Spelling", idx, eid, msg,
+                fix=fix,
                 severity="warning", code="brand-spelling",
             ))
 
         dc = entry.get("driver_config", "")
         has_ws = bool(dc and re.search(r"\s", dc))
         if has_ws:
-            fixed_dc = re.sub(r"\s+", "", dc)
+            # De-spacing and canonical re-ordering are both mechanical
+            # normalisations of the SAME field, and the prompts make both
+            # mandatory ("has NO SPACES around '+' and strictly follows
+            # canonical order"). So the whitespace repair writes the fully
+            # normalised value, not merely the de-spaced one. That also makes
+            # it converge with the dc-order repair below regardless of which
+            # the two run first -- previously a spaced, out-of-order config
+            # like "1BA + 1DD" reported ONLY the whitespace, the whitespace
+            # fix left "1BA+1DD", and the ordering violation never surfaced
+            # in that pass, so Fix All did not reach a compliant state.
+            _dc_parsed = parse_driver_config(dc)
+            if _dc_parsed:
+                fixed_dc = classify_driver(_dc_parsed)[1]
+            else:
+                fixed_dc = re.sub(r"\s+", "", dc)
             issues.append(AuditIssue(
                 "Driver Config", idx, eid,
-                "driver_config '{}' contains whitespace.".format(dc),
+                "driver_config '{}' contains whitespace{}.".format(
+                    dc, "" if fixed_dc == re.sub(r"\s+", "", dc)
+                    else " and is not in canonical order"),
                 fix=make_fix(entry, real_id or eid, idx,
                              lambda en, val=fixed_dc: en.__setitem__("driver_config", val)),
                 code="dc-whitespace",
@@ -2095,7 +2395,21 @@ def run_full_audit(entries, data_root=None):
                                  lambda en, val=expected_type: en.__setitem__("driver_type", val)),
                     code="dt-mismatch",
                 ))
-            if CANONICALIZE_DRIVER_ORDER and not has_ws and dc_stripped != expected_config:
+            # Compare the DE-SPACED form, so this fires only when the
+            # ordering is genuinely wrong. "1DD + 1BA" is already canonical
+            # and is purely a whitespace problem; reporting it as an
+            # ordering error too would be misleading, and the whitespace
+            # repair already covers it.
+            #
+            # Reported even when the config also has whitespace: the two
+            # rules are independent, and suppressing this one behind dc-
+            # whitespace is what stopped Fix All from converging (the audit
+            # list is computed once, up front, so a violation discovered
+            # only after the whitespace repair was applied never got fixed in
+            # that pass). Both repairs write the same normalised value, so
+            # applying them in either order is safe.
+            _dc_tight = re.sub(r"\s+", "", dc_stripped)
+            if CANONICALIZE_DRIVER_ORDER and _dc_tight != expected_config:
                 issues.append(AuditIssue(
                     "Driver Config", idx, eid,
                     "driver_config '{}' not in canonical order (expected '{}').".format(
@@ -2354,9 +2668,12 @@ def run_full_audit(entries, data_root=None):
 
         conflicts = tag_conflicts(set(map(str, tags)))
         for pair in conflicts:
+            _c = "Conflicting tags present: {}".format(" + ".join(pair))
+            _r = tag_conflict_resolution(pair)
             issues.append(AuditIssue(
                 "Tag Conflict", idx, eid,
-                "Conflicting tags present: {}".format(" + ".join(pair)), severity="error"))
+                "{} -- resolve: {}".format(_c, _r) if _r else _c,
+                severity="error"))
 
         if len(tags) < MIN_TAGS:
             issues.append(AuditIssue(

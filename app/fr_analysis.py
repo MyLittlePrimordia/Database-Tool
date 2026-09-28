@@ -131,7 +131,11 @@ def parse_fr_file(path):
                 os.path.basename(path)))
 
     points = []
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
+    # CURVE-006: same BOM bug as curve_logic.parse_curve_file -- "utf-8"
+    # leaves the U+FEFF on the first line, float() rejects it, and the
+    # lowest frequency point is silently lost. "utf-8-sig" is a no-op for
+    # BOM-less files.
+    with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
         for line in f:
             line = line.strip()
             if not line or line.startswith("#") or line.startswith("//"):

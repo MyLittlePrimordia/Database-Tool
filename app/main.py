@@ -24,6 +24,7 @@ import sys
 import time
 import datetime
 import threading
+import traceback
 import unicodedata
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -90,6 +91,30 @@ TAG_EMOJI = {
 def tag_label(tag):
     emoji = TAG_EMOJI.get(tag)
     return "{} {}".format(tag, emoji) if emoji else tag
+
+
+# DESIGN-008: audit severity used to be signalled by foreground colour
+# alone. These glyphs are the non-colour channel, so the list is still
+# readable in greyscale, on a colour-blind display, or when the row is
+# selected (Tk inverts the background, which scrambles a colour-only cue).
+# Deliberately plain shapes that exist in every UI font.
+_SEV_GLYPH = {
+    "error": "\u2716",     # heavy multiplication X
+    "warning": "\u25b2",   # black up-pointing triangle
+    "info": "\u25cb",      # white circle
+}
+_WAIVED_MARK = "[ignored]"
+
+
+def _sev_label(issue, waived=False):
+    """Message text prefixed so severity (and waived state) is readable
+    without relying on colour. Returns the message UNCHANGED when there is
+    no severity to show, so the export report (which uses issue.message
+    directly) is unaffected."""
+    glyph = _SEV_GLYPH.get(getattr(issue, "severity", ""))
+    if waived:
+        return "{} {}".format(_WAIVED_MARK, issue.message)
+    return "{} {}".format(glyph, issue.message) if glyph else issue.message
 
 
 # ---------------------------------------------------------------------------
@@ -237,15 +262,32 @@ def script_folder():
 
 
 class IconManager:
+    """Lazily loads and caches the PNG icons under assets/icons.
+
+    A tk.PhotoImage is owned by the Tk interpreter that created it and is
+    unusable once that root is destroyed, so every cache entry records the
+    root it was built against. This module-level singleton outlives any single
+    root, so without that check a rebuilt window was served images from the
+    dead interpreter and every icon consumer failed with
+    'image "pyimageN" does not exist'."""
+
     def __init__(self):
         self.dir = os.path.join(resource_base(), "assets", "icons")
         self.cache = {}
 
+    def _root(self):
+        try:
+            return tk._get_default_root()
+        except Exception:
+            return None
+
     def get(self, name):
         if not name:
             return None
-        if name in self.cache:
-            return self.cache[name]
+        root = self._root()
+        hit = self.cache.get(name)
+        if hit is not None and hit[0] is root:
+            return hit[1]
         # handle legacy typo: trybrid.png vs tribrid.png
         candidates = [name]
         if name == "tribrid":
@@ -259,7 +301,7 @@ class IconManager:
                 path = p
                 break
         if not path:
-            self.cache[name] = None
+            self.cache[name] = (root, None)
             return None
         try:
             img = tk.PhotoImage(file=path)
@@ -273,10 +315,10 @@ class IconManager:
             if largest > target * 2:
                 factor = max(1, largest // target)
                 img = img.subsample(factor, factor)
-            self.cache[name] = img
+            self.cache[name] = (root, img)
             return img
         except Exception:
-            self.cache[name] = None
+            self.cache[name] = (root, None)
             return None
 
 
@@ -399,9 +441,18 @@ _TAG_ICON_CACHE = {}
 
 
 def tag_icon(tag):
-    """Cached PhotoImage of the tag's colored emoji PNG, or None."""
-    if tag in _TAG_ICON_CACHE:
-        return _TAG_ICON_CACHE[tag]
+    """Cached PhotoImage of the tag's colored emoji PNG, or None.
+
+    Like theme.emoji_photo(), the cache remembers which Tk interpreter built
+    each image: a PhotoImage dies with the root that owns it, so a recreated
+    root must rebuild rather than reuse the previous one's images."""
+    try:
+        root = tk._get_default_root()
+    except Exception:
+        root = None
+    hit = _TAG_ICON_CACHE.get(tag)
+    if hit is not None and hit[0] is root:
+        return hit[1]
     path = os.path.join(resource_base(), "assets", "icons", "tags",
                         "{}.png".format(tag))
     img = None
@@ -413,7 +464,7 @@ def tag_icon(tag):
                 img = img.subsample(factor, factor)
         except Exception:
             img = None
-    _TAG_ICON_CACHE[tag] = img
+    _TAG_ICON_CACHE[tag] = (root, img)
     return img
 
 
@@ -684,7 +735,7 @@ class AutocompleteEntry(ttk.Frame):
                 menu.add_command(
                     label="\u27f2 {}".format(fixed),
                     background=theme.BORDER,
-                    foreground=theme.ACCENT_ORANGE,
+                    foreground=theme.ACCENT_ORANGE_TEXT,
                     command=lambda st=start, en=end, fx=fixed: self._replace_span(st, en, fx))
         menu.add_separator()
 
@@ -1048,9 +1099,16 @@ class DriverConfigPanel(ttk.Frame):
             self.count_widgets[tech] = (minus, plus)
 
         result_row = 2 + (len(L.DRIVER_TECH_ORDER) + self._cols - 1) // self._cols + 1
-        self.result_label = ttk.Label(self, text="Driver Type: (none)      Config: (none)",
-                                       style="Card.TLabel", foreground=theme.ACCENT_GREEN,
-                                       font=theme.font(13, "bold"))
+        # DESIGN-009: the two facts were separated by six literal spaces.
+        # Runs of spaces are a fake column -- they do not align under a
+        # proportional font, do not survive a font-size change, and end up
+        # in the label's accessible name as noise. "  \u00b7  " is the
+        # separator this app already uses elsewhere (see the audit tree's
+        # group rows), so the two read as one deliberate idiom.
+        self.result_label = ttk.Label(
+            self, text=self._driver_summary_text("(none)", "(none)"),
+            style="Card.TLabel", foreground=theme.ACCENT_GREEN_TEXT,
+            font=theme.font(13, "bold"))
         self.result_label.grid(row=result_row, column=0, columnspan=4,
                                sticky="w", padx=8, pady=(8, 8))
         self.set("", "")
@@ -1097,12 +1155,19 @@ class DriverConfigPanel(ttk.Frame):
         self._raw_config = ""     # user acted: recomputed config is intentional
         self._recompute()
 
+    @staticmethod
+    def _driver_summary_text(dtype, dconfig):
+        """The driver summary line. Kept in one place so the placeholder set
+        at construction and the recomputed value cannot drift apart -- they
+        used to be two independent format strings (DESIGN-009)."""
+        return "Driver Type: {}  \u00b7  Config: {}".format(
+            dtype or "(unknown/unverified)", dconfig or "(none)")
+
     def _recompute(self):
         components = {t: self._count(t) for t in self.counts
                       if self._count(t) > 0}
         dtype, dconfig = L.classify_driver(components)
-        label = "Driver Type: {}      Config: {}".format(dtype or "(unknown/unverified)",
-                                                          dconfig or "(none)")
+        label = self._driver_summary_text(dtype, dconfig)
         self.result_label.configure(text=label)
         if self.on_change:
             self.on_change(dtype, dconfig)
@@ -1173,13 +1238,13 @@ class TagSelectorPanel(ttk.Frame):
         # groups start below the suggestion button row
         r = 2
         for group_name, tags in L.TAG_GROUPS.items():
-            ttk.Label(self, text=group_name, style="Card.TLabel", foreground=theme.ACCENT_BLUE,
+            ttk.Label(self, text=group_name, style="Card.TLabel", foreground=theme.ACCENT_BLUE_TEXT,
                       font=theme.font(12, "bold")).grid(
                 row=r, column=0, columnspan=2, sticky="w", padx=8, pady=(8, 2))
             r += 1
             if group_name.startswith("Price Tier"):
                 self.tier_label = ttk.Label(self, text="Auto: Budget ($0-99)",
-                                             style="Card.TLabel", foreground=theme.ACCENT_ORANGE)
+                                             style="Card.TLabel", foreground=theme.ACCENT_ORANGE_TEXT)
                 self.tier_label.grid(row=r, column=0, columnspan=2, sticky="w", padx=16)
                 r += 1
                 continue
@@ -1383,11 +1448,11 @@ class TagSelectorPanel(ttk.Frame):
         n = len(self._selected_set()) + 1  # +1 for automatic price tier tag
         self.count_label.configure(text="{} / {} selected".format(n, L.MAX_TAGS))
         if n < L.MIN_TAGS:
-            self.count_label.configure(foreground=theme.ACCENT_RED)
+            self.count_label.configure(foreground=theme.ACCENT_RED_TEXT)
         elif n > L.MAX_TAGS:
-            self.count_label.configure(foreground=theme.ACCENT_RED)
+            self.count_label.configure(foreground=theme.ACCENT_RED_TEXT)
         else:
-            self.count_label.configure(foreground=theme.ACCENT_GREEN)
+            self.count_label.configure(foreground=theme.ACCENT_GREEN_TEXT)
 
     def update_price(self, price_usd):
         self.current_price = price_usd
@@ -1456,7 +1521,7 @@ class FileLinkerPanel(ttk.Frame):
                   style="CardHeader.TLabel").pack(side="left")
         self.linked_count_var = tk.StringVar(value="")
         ttk.Label(header, textvariable=self.linked_count_var,
-                  style="Card.TLabel", foreground=theme.ACCENT_GREEN).pack(
+                  style="Card.TLabel", foreground=theme.ACCENT_GREEN_TEXT).pack(
             side="left", padx=(10, 0))
 
         ttk.Label(self, text="Available", style="Card.TLabel").grid(row=1, column=0, sticky="w", padx=8)
@@ -2122,7 +2187,7 @@ class EntryEditor(ttk.Frame):
             row=3, column=0, sticky="w", padx=8)
         self.id_var = tk.StringVar(value="")
         id_label = ttk.Label(card, textvariable=self.id_var, style="Card.TLabel",
-                              foreground=theme.ACCENT_GREEN, font=theme.font(13, "bold"))
+                              foreground=theme.ACCENT_GREEN_TEXT, font=theme.font(13, "bold"))
         id_label.grid(row=3, column=1, columnspan=2, sticky="w", padx=8, pady=(0, 8))
 
         # ---- specs card (responsive: numeric fields lay out 4-across on
@@ -2161,8 +2226,8 @@ class EntryEditor(ttk.Frame):
         self.sensitivity_entry = ttk.Entry(specs, textvariable=self.sensitivity_var, width=8)
         attach_entry_context_menu(self.sensitivity_entry)
 
-        self.year_hint = ttk.Label(specs, text="", style="Card.TLabel", foreground=theme.ACCENT_RED)
-        self.price_hint = ttk.Label(specs, text="", style="Card.TLabel", foreground=theme.ACCENT_ORANGE)
+        self.year_hint = ttk.Label(specs, text="", style="Card.TLabel", foreground=theme.ACCENT_RED_TEXT)
+        self.price_hint = ttk.Label(specs, text="", style="Card.TLabel", foreground=theme.ACCENT_ORANGE_TEXT)
 
         ff_lbl = _spec_label("Form Factor")
         self.form_var = tk.StringVar(value=L.FORM_FACTORS[0])
@@ -2184,7 +2249,7 @@ class EntryEditor(ttk.Frame):
             self.connector_var, width=12)
 
         self.spec_hint = ttk.Label(specs, text="", style="Card.TLabel",
-                                    foreground=theme.ACCENT_ORANGE, wraplength=260,
+                                    foreground=theme.ACCENT_ORANGE_TEXT, wraplength=260,
                                     justify="left")
 
         # widget refs used by the responsive re-layout
@@ -2277,7 +2342,7 @@ class EntryEditor(ttk.Frame):
                    command=self._on_save).pack(side="left", padx=4)
         self.save_btn = actions.winfo_children()[-1]
         ttk.Button(actions, text="Clear / New", command=self.new_entry).pack(side="left", padx=4)
-        self.validation_label = ttk.Label(actions, text="", style="TLabel", foreground=theme.ACCENT_RED,
+        self.validation_label = ttk.Label(actions, text="", style="TLabel", foreground=theme.ACCENT_RED_TEXT,
                                            justify="left")
         self.validation_label.pack(side="left", padx=12)
         # account for the two buttons already sitting in this row when
@@ -2975,13 +3040,13 @@ class MergeDialog(tk.Toplevel):
                   foreground=theme.TEXT_DIM).grid(row=0, column=0, sticky="w",
                                                   padx=(0, 8))
         ttk.Label(grid, text="A:  " + id_a, style="Card.TLabel",
-                  foreground=theme.ACCENT_BLUE).grid(row=0, column=1,
+                  foreground=theme.ACCENT_BLUE_TEXT).grid(row=0, column=1,
                                                      sticky="w", padx=(0, 4))
         ttk.Label(grid, text="Keep", style="Card.TLabel",
                   foreground=theme.TEXT_DIM).grid(row=0, column=2,
                                                   columnspan=2, sticky="w")
         ttk.Label(grid, text="B:  " + id_b, style="Card.TLabel",
-                  foreground=theme.ACCENT_BLUE).grid(row=0, column=4,
+                  foreground=theme.ACCENT_BLUE_TEXT).grid(row=0, column=4,
                                                      sticky="w", padx=(8, 0))
 
         self._vars = {}
@@ -2990,7 +3055,7 @@ class MergeDialog(tk.Toplevel):
             # values); identical fields recede so the eye lands on the
             # decisions that actually matter
             differs = self.a.get(key) != self.b.get(key)
-            name_fg = theme.ACCENT_ORANGE if differs else theme.TEXT_DIM
+            name_fg = theme.ACCENT_ORANGE_TEXT if differs else theme.TEXT_DIM
             val_fg = theme.TEXT_MAIN if differs else theme.TEXT_DIM
             ttk.Label(grid, text=label, style="Card.TLabel",
                       foreground=name_fg).grid(
@@ -3023,7 +3088,7 @@ class MergeDialog(tk.Toplevel):
         ttk.Label(grid, text="{} + {} -> {} unique (combined)".format(
             len(self.a.get("files") or []), len(self.b.get("files") or []),
             len(self.files_union)), style="Card.TLabel",
-            foreground=theme.ACCENT_GREEN).grid(row=union_row, column=1,
+            foreground=theme.ACCENT_GREEN_TEXT).grid(row=union_row, column=1,
                                                 columnspan=4, sticky="w")
         ttk.Label(grid, text="(price-tier tag follows the winning price)",
                   style="Card.TLabel",
@@ -3033,19 +3098,21 @@ class MergeDialog(tk.Toplevel):
         # legend for the color coding
         ttk.Label(grid, text="\u25cf differing fields highlighted",
                   style="Card.TLabel",
-                  foreground=theme.ACCENT_ORANGE).grid(
+                  foreground=theme.ACCENT_ORANGE_TEXT).grid(
             row=union_row + 2, column=0, columnspan=5, sticky="w",
             pady=(6, 0))
 
         self.status_lbl = ttk.Label(card, text="", style="Card.TLabel",
-                                    foreground=theme.ACCENT_RED,
+                                    foreground=theme.ACCENT_RED_TEXT,
                                     wraplength=660, justify="left")
         self.status_lbl.pack(anchor="w", padx=8, pady=(8, 0))
 
         btns = ttk.Frame(card, style="CardFlat.TFrame")
         btns.pack(fill="x", padx=8, pady=(8, 10))
-        ttk.Button(btns, text="Merge", style="Accent.TButton",
-                   command=self._apply).pack(side="left")
+        self.merge_btn = ttk.Button(btns, text="Merge",
+                                    style="Accent.TButton",
+                                    command=self._apply)
+        self.merge_btn.pack(side="left")
         ttk.Button(btns, text="Cancel",
                    command=self.destroy).pack(side="left", padx=8)
 
@@ -3121,7 +3188,48 @@ class MergeDialog(tk.Toplevel):
 
         app = self.app
         pos_a, pos_b = self.pos_a, self.pos_b
+        # BUG-003 defence in depth: the two positions MUST be distinct
+        # before `del` is reached, otherwise the write at pos_a and the
+        # delete at pos_b target the same slot. _merge_selected already
+        # refuses this, but MergeDialog is a public constructor -- never
+        # trust the caller with the only irreversible step in the app.
+        if pos_a == pos_b or not (0 <= pos_a < len(app.entries)) \
+                or not (0 <= pos_b < len(app.entries)):
+            self.status_lbl.configure(
+                text="Cannot merge: both rows resolve to the same record.")
+            self.merge_btn.configure(state="disabled")
+            return
         a_obj, b_obj = app.entries[pos_a], app.entries[pos_b]
+        # BUG-015: this is the only irreversible step in the app and it had
+        # no confirmation -- the "Merge" button WAS the confirmation, one
+        # click deleted a record, and the recovery route (History tab ->
+        # Undo Selected) is a different tab and is silently dropped after
+        # HISTORY_MAX further operations.
+        # BUG-015b: _apply was not idempotent and nothing disabled the button,
+        # so if anything between the `del` below and self.destroy() raised,
+        # the grab-locked dialog stayed open and a SECOND click deleted
+        # another entry (self.a/self.b still referenced the old dicts and
+        # pos_b had shifted). Latch on merged_id, which was already being
+        # set but never read.
+        if self.merged_id is not None:
+            return
+        if not messagebox.askyesno(
+                APP_TITLE,
+                "Merge these two entries into one?\n\n"
+                "  KEEP    {} {}\n"
+                "  DELETE  {} {}\n"
+                "  RESULT  {} {}\n\n"
+                "{} measurement file link(s) will be combined.\n\n"
+                "The deleted entry can be restored from the History tab."
+                .format(self._fmt(self.a.get("brand")),
+                        self._fmt(self.a.get("model")),
+                        self._fmt(self.b.get("brand")),
+                        self._fmt(self.b.get("model")),
+                        self._fmt(merged.get("brand")),
+                        self._fmt(merged.get("model")),
+                        len(getattr(self, "files_union", []) or [])),
+                parent=self):
+            return
         # Whether the editor is holding one of the two merged entries must
         # be decided BEFORE the list is mutated: afterwards neither old
         # object is in the list (pos_a holds the new merged dict, pos_b is
@@ -3131,6 +3239,11 @@ class MergeDialog(tk.Toplevel):
         merged_final = L.build_clean_entry(merged)
         app.entries[pos_a] = merged_final
         del app.entries[pos_b]
+        # Latch IMMEDIATELY after the only destructive step, before any of
+        # the fallible calls below, so a crash cannot leave a live dialog
+        # whose button still deletes.
+        self.merged_id = merged_final["id"]
+        self.merge_btn.configure(state="disabled")
         changes = [{
             "pos_hint": pos_a,
             "ref_before": a_obj, "copy_before": app._deepcopy(a_obj),
@@ -3155,7 +3268,6 @@ class MergeDialog(tk.Toplevel):
         app._autosave()
         app.status_var.set("Merged '{}' and '{}' into '{}'.".format(
             a_obj.get("id") or "?", b_obj.get("id") or "?", merged_final["id"]))
-        self.merged_id = merged_final["id"]
         self.destroy()
 
 
@@ -3182,9 +3294,14 @@ class AuditPanel(ttk.Frame):
         self._row_issues = {}      # leaf iid  -> AuditIssue
         self._group_items = {}     # group iid -> [AuditIssue, ...]
 
-        # primary actions as buttons; row-specific actions (Go to Entry,
-        # Merge Duplicate, Ignore/Un-ignore) live in the right-click
-        # context menu so the tab stays uncluttered
+        # Primary actions as buttons. Row-specific actions (Go to Entry,
+        # Merge Duplicate) live in the right-click context menu so the tab
+        # stays uncluttered.
+        # DESIGN-014: Ignore / Un-ignore USED to be context-menu-only, but
+        # they are not row-specific -- dismissing a finding is a recurring
+        # triage decision, the app's own status text promotes it, and the
+        # choice is persisted to backup/ignored.json. A right-click-only
+        # action is invisible and undiscoverable, so both are buttons now.
         top = ttk.Frame(self, style="TFrame")
         top.pack(fill="x", padx=10, pady=8)
         btn_row = ttk.Frame(top, style="TFrame")
@@ -3195,6 +3312,10 @@ class AuditPanel(ttk.Frame):
                    command=self._fix_selected).pack(side="left", padx=2)
         ttk.Button(btn_row, text="Fix All", style="Blue.Compact.TButton",
                    command=self._fix_all).pack(side="left", padx=2)
+        ttk.Button(btn_row, text="Ignore", style="Compact.TButton",
+                   command=self._ignore_selected).pack(side="left", padx=2)
+        ttk.Button(btn_row, text="Un-ignore", style="Compact.TButton",
+                   command=self._unignore_selected).pack(side="left", padx=2)
         ttk.Button(btn_row, text="Export Report", style="Compact.TButton",
                    command=self._export).pack(side="left", padx=2)
 
@@ -3278,8 +3399,24 @@ class AuditPanel(ttk.Frame):
         if sys.platform == "darwin":
             self.tree.bind("<Button-2>", self._show_context_menu)
 
-        self.tree.tag_configure("error", foreground=theme.ACCENT_RED)
-        self.tree.tag_configure("warning", foreground=theme.ACCENT_ORANGE)
+        # DESIGN-008: severity used to be conveyed by foreground colour ALONE,
+        # and `info` and `waived` were the *same* colour (TEXT_DIM) while
+        # ttk applies the LAST matching tag -- so a waived ERROR rendered
+        # identically to a waived WARNING and to plain INFO. Three changes:
+        #   * the _TEXT accent variants, so the colours clear WCAG AA on
+        #     every theme's card surface (the raw accents were 2.75-3.9:1)
+        #   * a glyph prefix per severity in the message text, plus an
+        #     explicit "[ignored]" marker on waived rows, so severity and
+        #     waived-state are both readable with NO colour at all (see
+        #     _sev_label). Previously `info` and `waived` were the same
+        #     colour and ttk applies the last matching tag, so a waived
+        #     ERROR looked identical to a waived WARNING and to INFO.
+        #     (theme.font() only knows bold/normal and its cache warns that
+        #     reconfiguring a Font repaints every widget using it, so the
+        #     waived state is carried by text rather than a slant.)
+        self.tree.tag_configure("error", foreground=theme.ACCENT_RED_TEXT)
+        self.tree.tag_configure("warning",
+                                foreground=theme.ACCENT_ORANGE_TEXT)
         self.tree.tag_configure("info", foreground=theme.TEXT_DIM)
         self.tree.tag_configure("waived", foreground=theme.TEXT_DIM)
         self.tree.bind("<Double-1>", self._on_issue_activate)
@@ -3440,9 +3577,11 @@ class AuditPanel(ttk.Frame):
         waived issues are hidden entirely; 'Ignored only' flips the
         filter to show just those (dim, with an [ignored] mark)."""
         # severity tag colors follow the live theme (rerender doubles as
-        # the Audit tab's registered retheme hook)
-        self.tree.tag_configure("error", foreground=theme.ACCENT_RED)
-        self.tree.tag_configure("warning", foreground=theme.ACCENT_ORANGE)
+        # the Audit tab's registered retheme hook). Uses the _TEXT variants
+        # so they stay legible on every palette -- see DESIGN-008.
+        self.tree.tag_configure("error", foreground=theme.ACCENT_RED_TEXT)
+        self.tree.tag_configure("warning",
+                                foreground=theme.ACCENT_ORANGE_TEXT)
         self.tree.tag_configure("info", foreground=theme.TEXT_DIM)
         self.tree.tag_configure("waived", foreground=theme.TEXT_DIM)
         self.tree.delete(*self.tree.get_children())
@@ -3487,14 +3626,14 @@ class AuditPanel(ttk.Frame):
                         if iss.entry_id not in ("(none)", "(summary)") \
                         else iss.category
                     self.tree.insert("", "end", iid=iid, text=label,
-                                     values=(iss.message,
+                                     values=(_sev_label(iss, self._waived(iss)),
                                              "Yes" if iss.fix else "No"),
                                      tags=tags, open=True)
                 continue
             worst = min(items, key=lambda i: self._SEV_RANK.get(i.severity, 9))
             nfix = sum(1 for i in items if i.fix)
             gid = "g{}".format(seq); seq += 1
-            msg = worst.message
+            msg = _sev_label(worst, False)
             if len(msg) > 140:
                 msg = msg[:139] + "\u2026"
             n_ign = sum(1 for i in items if self._waived(i))
@@ -3511,10 +3650,11 @@ class AuditPanel(ttk.Frame):
             for iss in items:
                 iid = "i{}".format(seq); seq += 1
                 self._row_issues[iid] = iss
-                tags = (iss.severity, "waived") if self._waived(iss) \
+                waived = self._waived(iss)
+                tags = (iss.severity, "waived") if waived \
                     else (iss.severity,)
                 self.tree.insert(parent, "end", iid=iid, text=leaf_label(iss),
-                                 values=(iss.message,
+                                 values=(_sev_label(iss, waived),
                                          "Yes" if iss.fix else "No"),
                                  tags=tags)
 
@@ -3652,6 +3792,33 @@ class AuditPanel(ttk.Frame):
 
     def _fix_selected(self):
         chosen = [i for i in self._issues_for_selection() if i.fix]
+        if not chosen:
+            messagebox.showinfo(
+                APP_TITLE, "No auto-fixable issues in the current selection.")
+            return
+        # BUG-013: "Fix All" asks before applying; this button did not, even
+        # though it can touch as many records. Two things made that dangerous:
+        # a stray Ctrl-click plus one button press, and -- because
+        # _issues_for_selection() expands a selected GROUP HEADER into every
+        # issue inside it -- selecting a single COLLAPSED group applied that
+        # whole group's fixes with none of its rows on screen. State the real
+        # count, and say so when group rows are contributing.
+        n_entries = len({i.entry_index for i in chosen
+                         if isinstance(getattr(i, "entry_index", None), int)})
+        group_rows = [iid for iid in self.tree.selection()
+                      if iid in self._group_items]
+        extra = ""
+        if group_rows:
+            extra = ("\n\n{} {} from GROUP rows, which include every issue "
+                     "inside that group -- not just the ones you can "
+                     "see.".format(len(group_rows),
+                                    "is" if len(group_rows) == 1 else "are"))
+        if not messagebox.askyesno(
+                APP_TITLE,
+                "Apply {} fix{} to {} entr{}?{}".format(
+                    len(chosen), "" if len(chosen) == 1 else "es",
+                    n_entries, "y" if n_entries == 1 else "ies", extra)):
+            return
         self.app.apply_fixes(chosen)
         self.app.run_audit(switch_tab=False)
 
@@ -3683,6 +3850,31 @@ class AuditPanel(ttk.Frame):
                 APP_TITLE,
                 "No longer in the database: {}.\n\nRe-run the audit to "
                 "refresh duplicate findings.".format(", ".join(missing)))
+            return
+        # BUG-003: _find_slot matches on id and returns the FIRST hit, so two
+        # distinct entries sharing one id (a 'Duplicate ID' error the app
+        # itself flags -- and which the id-format / brand-spelling fixes can
+        # create) both resolve to the same position. MergeDialog would then
+        # write the merged entry into that slot and immediately `del` the
+        # same slot, destroying the entry and producing no merge at all.
+        if pos_a == pos_b:
+            messagebox.showerror(
+                APP_TITLE,
+                "Cannot merge these two rows.\n\n"
+                "They share the ID '{}', so the app cannot tell them "
+                "apart -- both resolve to the same record.\n\n"
+                "This is the 'Duplicate ID' problem, not a duplicate "
+                "entry. Fix it first: open each row, correct its "
+                "Brand / Model / Variant so the ID is rebuilt "
+                "correctly, then re-run the audit.".format(pair[0]))
+            return
+        # BUG-005: MergeDialog._apply reloads the form when the editor is
+        # holding one of the two merged entries, which discards unsaved form
+        # edits and re-captures the baseline so even the exit prompt stays
+        # quiet. Those two positions are known here, so ask up front.
+        if self.app._confirm_editor_reload(
+                {pos_a, pos_b}, set(pair),
+                "Merging these two entries"):
             return
         MergeDialog(self.winfo_toplevel(), self.app, pos_a, pos_b)
 
@@ -3727,6 +3919,23 @@ class AuditPanel(ttk.Frame):
                                              filetypes=[("Text file", "*.txt")],
                                              initialfile="audit_report.txt")
         if not path:
+            return
+        # BUG-004: defaultextension only fires when the typed name has NO
+        # extension, so typing "database.json" yields exactly that -- and
+        # open(path,"w") would truncate the live catalog, then report
+        # "Report saved to: .../database.json". Force the extension so the
+        # destructive case cannot be typed at all.
+        if not path.lower().endswith(".txt"):
+            path += ".txt"
+        # Defence in depth: never write the report over the working
+        # database, whatever the name.
+        db_path = getattr(self.app, "db_path", None)
+        if db_path and os.path.normcase(os.path.abspath(path)) == \
+                os.path.normcase(os.path.abspath(db_path)):
+            messagebox.showerror(
+                APP_TITLE,
+                "Refusing to write the audit report over your database:\n\n"
+                "{}".format(db_path))
             return
         try:
             with open(path, "w", encoding="utf-8") as f:
@@ -3794,10 +4003,11 @@ class HistoryPanel(ttk.Frame):
         self.tree.bind("<Button-5>", self._on_mousewheel)
 
         self.tree.tag_configure("section", background=theme.BG_CARD,
-                                 foreground=theme.ACCENT_ORANGE,
+                                 foreground=theme.ACCENT_ORANGE_TEXT,
                                  font=theme.font(12, "bold"))
         self.tree.tag_configure("op", foreground=theme.TEXT_MAIN)
-        self.tree.tag_configure("redoable", foreground=theme.ACCENT_BLUE)
+        self.tree.tag_configure("redoable",
+                                foreground=theme.ACCENT_BLUE_TEXT)
 
     def _on_mousewheel(self, event):
         if getattr(event, "num", None) == 4:
@@ -4004,6 +4214,13 @@ class StatusMarquee(tk.Canvas):
 # MAIN APPLICATION
 # ---------------------------------------------------------------------------
 class MainApp(tk.Tk):
+    # Throttle for report_callback_exception: a callback bound to a
+    # high-frequency event (<Configure>, <Motion>, an after() loop) can
+    # raise on every single firing, and one modal dialog per firing would
+    # look like a hang. Re-show only for a signature not seen recently.
+    _ERR_DIALOG_COOLDOWN_S = 5.0
+    _ERR_MAX_SIGNATURES = 20
+
     def __init__(self):
         super().__init__()
         self.title(APP_TITLE)
@@ -4012,9 +4229,15 @@ class MainApp(tk.Tk):
         self.minsize(860, 540)   # half-screen snap stays fully usable
         self.configure(background=theme.BG_MAIN)
         setup_styles(self)
+        self._err_reported = {}   # signature -> last time shown
 
         self.entries = []
         self.db_path = None
+        # BUG-024: identity of the database file as it was when this app last
+        # read or wrote it, so a save can detect that something else changed
+        # it in the meantime (a second window, an external editor).
+        self._db_stamp = None
+        self._db_digest = None
         self.data_root = None
         self.dirty = False
         self.editing_index = None  # index into self.entries currently loaded in editor, or None for "new"
@@ -4053,6 +4276,76 @@ class MainApp(tk.Tk):
         # process if a message arrives during interpreter teardown.
         win_drop.disable_native_file_drop(self)
         super().destroy()
+
+    # ------------------------------------------------------------------
+    def report_callback_exception(self, exc, val, tb):
+        """Last-resort handler for ANY uncaught exception raised inside a Tk
+        event callback (button commands, key bindings, after() timers).
+
+        HARD-004: without this, tkinter prints the traceback to stderr and
+        returns. The project ships a PyInstaller `--windowed` binary, which
+        has no console, so the user saw the button simply do nothing --
+        with no message, no status-bar change, and no record. The worst
+        cases were the two batch paths (apply_fixes and MergeDialog._apply),
+        which mutate the database and record history BEFORE their fallible
+        tail, so a crash there left records silently changed with no undo
+        entry and no autosave.
+
+        Every occurrence is logged in full to editor.log (the only channel
+        that survives a windowed build); the modal is throttled so a
+        high-frequency callback cannot spawn a dialog per firing.
+        """
+        try:
+            detail = "".join(traceback.format_exception(exc, val, tb))
+        except Exception:                      # pragma: no cover
+            detail = "{}: {}".format(getattr(exc, "__name__", exc), val)
+        try:
+            L.log("Unhandled UI error:\n" + detail)
+        except Exception:                      # pragma: no cover
+            pass
+        summary = "{}: {}".format(getattr(exc, "__name__", exc), val)
+        # signature = exception type + the deepest frame, so two different
+        # bugs of the same type are still reported independently
+        try:
+            frames = traceback.extract_tb(tb)
+            where = ""
+            for fr in frames:
+                if os.path.basename(fr.filename) != "__init__.py":
+                    where = "{}:{} in {}".format(
+                        os.path.basename(fr.filename), fr.lineno, fr.name)
+            sig = "{}|{}".format(getattr(exc, "__name__", exc), where)
+        except Exception:                      # pragma: no cover
+            sig = getattr(exc, "__name__", str(exc))
+        now = time.time()
+        # Throttle state is read defensively: `getattr` on a Tk widget falls
+        # through to the Tcl interpreter for unknown names, and this method
+        # must never raise -- an error handler that raises is worse than no
+        # handler at all.
+        try:
+            seen_map = self.__dict__.get("_err_reported")
+            if seen_map is None:
+                seen_map = {}
+                self.__dict__["_err_reported"] = seen_map
+            last = seen_map.get(sig, 0.0)
+            if now - last < self._ERR_DIALOG_COOLDOWN_S:
+                return
+            if len(seen_map) >= self._ERR_MAX_SIGNATURES:
+                seen_map.clear()
+            seen_map[sig] = now
+        except Exception:
+            pass          # throttle failed -> fall through and just report
+        msg = ("Something went wrong and the action did not finish.\n\n"
+               "{}\n\nNothing was corrupted, but the change may not have "
+               "been saved. The full details were written to editor.log."
+               .format(summary))
+        try:
+            self.status_var.set("Unexpected error: {}".format(summary))
+        except Exception:
+            pass
+        try:
+            messagebox.showerror(APP_TITLE, msg)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     def _on_native_drop(self, paths):
@@ -4368,10 +4661,15 @@ class MainApp(tk.Tk):
         bar. A plain Frame of Labels that we build and post the SAME
         Menu objects from gives full, guaranteed control over the
         strip's colors on every Windows version (and every other
-        platform), at no loss of functionality: none of the app's
-        keyboard shortcuts (Ctrl+S etc.) or menu commands depend on the
-        native menu bar -- shortcuts are bound directly to the window
-        elsewhere, and no menu here uses `accelerator=`/`underline=`.
+        platform), at no loss of functionality.
+
+        DESIGN-001/002: the custom bar used to be mouse-only -- six
+        tk.Labels bound to <Button-1>, with `takefocus=0` and no
+        mnemonics, so a keyboard-only user could not reach a single
+        command in the app, not even Save, Undo or Exit. Two changes:
+        every command now carries an `accelerator=` hint so the shortcut
+        is visible in the dropdown, and the bar labels carry an underline
+        plus a real Alt+letter binding (see _build_custom_menu_bar).
         """
         self._menus = []
 
@@ -4379,22 +4677,32 @@ class MainApp(tk.Tk):
         filemenu.add_command(label="Open Database...", command=self.open_database)
         filemenu.add_command(label="Set Data Folder...", command=self.set_data_folder)
         filemenu.add_separator()
+        # NOTE: deliberately NOT labelled Ctrl+S. That combination is bound
+        # to the editor's "Save Entry" (form commit), which is a different
+        # action from writing database.json -- claiming it here would be a
+        # lie in the menu. Save As takes the conventional shifted slot.
         filemenu.add_command(label="Save", command=self.save)
-        filemenu.add_command(label="Save As...", command=self.save_as)
+        filemenu.add_command(label="Save As...", command=self.save_as,
+                             accelerator="Ctrl+Shift+S")
         filemenu.add_separator()
         filemenu.add_command(label="Exit", command=self._on_close)
         self._menus.append(filemenu)
 
         editmenu = tk.Menu(self, tearoff=0)
-        editmenu.add_command(label="Add New Entry", command=self.add_entry)
-        editmenu.add_command(label="Delete Selected Entry", command=self.delete_entry)
+        editmenu.add_command(label="Add New Entry", command=self.add_entry,
+                             accelerator="Ctrl+N")
+        editmenu.add_command(label="Delete Selected Entry",
+                             command=self.delete_entry)
         editmenu.add_separator()
-        editmenu.add_command(label="Undo Last Action", command=self.undo_last)
-        editmenu.add_command(label="Redo Last Undone Action", command=self.redo_last)
+        editmenu.add_command(label="Undo Last Action", command=self.undo_last,
+                             accelerator="Ctrl+Z")
+        editmenu.add_command(label="Redo Last Undone Action",
+                             command=self.redo_last, accelerator="Ctrl+Y")
         self._menus.append(editmenu)
 
         auditmenu = tk.Menu(self, tearoff=0)
-        auditmenu.add_command(label="Run Full Audit", command=self.run_audit)
+        auditmenu.add_command(label="Run Full Audit", command=self.run_audit,
+                              accelerator="Ctrl+R")
         self._menus.append(auditmenu)
 
         toolmenu = tk.Menu(self, tearoff=0)
@@ -4403,7 +4711,7 @@ class MainApp(tk.Tk):
             command=lambda: self.notebook.select(self.curve_panel))
         toolmenu.add_command(
             label="Find & Replace...",
-            command=self.open_find_replace)
+            command=self.open_find_replace, accelerator="Ctrl+H")
         toolmenu.add_command(
             label="Compare Curves...",
             command=self.open_curve_compare)
@@ -4447,19 +4755,38 @@ class MainApp(tk.Tk):
 
     def _build_custom_menu_bar(self):
         """Pack the custom dark-themeable strip (see _build_menu's
-        docstring for why this replaced the native OS menu bar)."""
+        docstring for why this replaced the native OS menu bar).
+
+        DESIGN-001: the labels were plain tk.Labels with takefocus=0 and
+        only <Button-1>, so Tab skipped the whole bar and Alt/F10 did
+        nothing -- a keyboard-only user could not reach any command. Each
+        label is now in the focus chain and has a real Alt+letter binding
+        that both focuses and opens the menu, with a visible focus ring so it
+        is obvious which menu is open.
+
+        DESIGN-012: the mnemonic underline used to be permanently visible, so
+        every label read as "_File" / "_Edit" to anyone not already expecting
+        the Windows convention -- and the underline itself was initially
+        landing on the leading padding space rather than the letter. Windows
+        hides mnemonic underlines until Alt is pressed, and that is what this
+        does now: no underline at rest, revealed for as long as Alt is held.
+        The Alt+letter bindings are untouched -- they never depended on the
+        underline being drawn."""
         bar = tk.Frame(self, background=theme.BG_PANEL)
         bar.pack(side="top", fill="x")
         self._menu_bar_frame = bar
         self._menu_bar_labels = []
+        self._menu_bar_open = None      # label currently shown as focused
 
         def make_opener(label_widget, menu):
             def opener(_event=None):
                 x = label_widget.winfo_rootx()
                 y = label_widget.winfo_rooty() + label_widget.winfo_height()
+                self._mark_menu_focus(label_widget, True)
                 try:
                     menu.tk_popup(x, y)
                 finally:
+                    self._mark_menu_focus(label_widget, False)
                     try:
                         menu.grab_release()
                     except Exception:
@@ -4474,20 +4801,98 @@ class MainApp(tk.Tk):
 
         def make_leave(label_widget):
             def _leave(_event=None):
-                label_widget.configure(background=theme.BG_PANEL,
-                                       foreground=theme.TEXT_MAIN)
+                if self._menu_bar_open is not label_widget:
+                    label_widget.configure(background=theme.BG_PANEL,
+                                           foreground=theme.TEXT_MAIN)
             return _leave
 
         for label_text, menu in self._menu_bar_items:
-            lbl = tk.Label(bar, text="  {}  ".format(label_text),
+            mnemonic = label_text[0].lower()
+            # DESIGN-011: the text used to be "  {}  ".format(...) with
+            # underline=0. Index 0 of that string was a SPACE, not the
+            # mnemonic, so Tk underlined the padding and the stray underscore
+            # appeared in front of the name. The string padding is gone --
+            # same lesson as the tab labels (DESIGN-010): pad the WIDGET.
+            # padx=10 reproduces the old visual width exactly -- the two
+            # literal spaces were 4px each in this font (Segoe UI 10), so
+            # 2*2 (old padx) + 4*4 (four spaces) = 20px, i.e. padx=10 -- so
+            # none of this shifts the bar's layout.
+            #
+            # DESIGN-012: underline=-1 means "draw no underline" (0 would mean
+            # "underline the character at index 0"). The mnemonic underline
+            # is revealed by _set_mnemonics() while Alt is held, matching
+            # Windows.
+            lbl = tk.Label(bar, text=label_text, underline=-1,
                            background=theme.BG_PANEL, foreground=theme.TEXT_MAIN,
-                           font=theme.font(theme.FONT_BASE_PX), padx=2, pady=4,
-                           cursor="hand2")
+                           font=theme.font(theme.FONT_BASE_PX), padx=10, pady=4,
+                           cursor="hand2", takefocus=1)
             lbl.pack(side="left")
             lbl.bind("<Button-1>", make_opener(lbl, menu))
             lbl.bind("<Enter>", make_enter(lbl))
             lbl.bind("<Leave>", make_leave(lbl))
+            # Space/Return on a focused label opens it, like a real menu bar
+            lbl.bind("<Key-space>", make_opener(lbl, menu))
+            lbl.bind("<Return>", make_opener(lbl, menu))
             self._menu_bar_labels.append(lbl)
+            # DESIGN-001: the real keyboard route to every command
+            self.bind_all("<Alt-{}>".format(mnemonic),
+                          make_opener(lbl, menu), add="+")
+            lbl.bind("<FocusIn>", make_enter(lbl))
+            lbl.bind("<FocusOut>", make_leave(lbl))
+
+        # DESIGN-012: show the mnemonic underlines only while Alt is held, the
+        # way Windows does it. Without this the bar permanently reads as
+        # "_File" / "_Edit" / "_Audit", which looks like a rendering fault
+        # rather than an affordance.
+        def _set_mnemonics(on):
+            for x in self._menu_bar_labels:
+                try:
+                    x.configure(underline=0 if on else -1)
+                except Exception:
+                    pass
+
+        def _mnemonics_on(_event=None):
+            _set_mnemonics(True)
+
+        def _mnemonics_off(_event=None):
+            _set_mnemonics(False)
+
+        for _seq, _fn in (("<KeyPress-Alt_L>", _mnemonics_on),
+                          ("<KeyPress-Alt_R>", _mnemonics_on),
+                          ("<KeyRelease-Alt_L>", _mnemonics_off),
+                          ("<KeyRelease-Alt_R>", _mnemonics_off)):
+            # unbind first: bind_all ADDS, so a rebuild would otherwise stack
+            # a fresh copy of these handlers on every pass
+            try:
+                self.unbind_all(_seq)
+            except Exception:
+                pass
+            self.bind_all(_seq, _fn, add="+")
+        # a KeyRelease swallowed by a menu popup or a focus change must never
+        # leave the underlines stuck on
+        try:
+            self.unbind_all("<FocusOut>")
+        except Exception:
+            pass
+        self.bind_all("<FocusOut>", _mnemonics_off, add="+")
+        self.bind_all("<ButtonPress>", _mnemonics_off, add="+")
+
+    def _mark_menu_focus(self, label_widget, active):
+        """Show which bar item is open (keyboard focus ring). The default
+        state is a flat label; when open it takes the accent background plus
+        a 1px sunken relief, so it is distinguishable without relying on
+        colour alone."""
+        if active:
+            self._menu_bar_open = label_widget
+            label_widget.configure(relief="sunken", borderwidth=1,
+                                   background=theme.ACCENT_BLUE,
+                                   foreground=theme.contrast_text(theme.ACCENT_BLUE))
+        else:
+            if self._menu_bar_open is label_widget:
+                self._menu_bar_open = None
+            label_widget.configure(relief="flat", borderwidth=0,
+                                   background=theme.BG_PANEL,
+                                   foreground=theme.TEXT_MAIN)
 
     def _sync_menu_colors(self):
         """Re-palette every dropdown tk.Menu plus the custom menu-bar
@@ -4503,7 +4908,14 @@ class MainApp(tk.Tk):
                 self._menu_bar_frame.configure(background=theme.BG_PANEL)
                 for lbl in getattr(self, "_menu_bar_labels", []):
                     lbl.configure(background=theme.BG_PANEL, foreground=theme.TEXT_MAIN,
-                                 font=theme.font(theme.FONT_BASE_PX))
+                                  font=theme.font(theme.FONT_BASE_PX))
+                    # DESIGN-001: a retheme must not erase the focus ring
+                    # on whichever menu is open, or the keyboard user loses
+                    # their place mid-navigation.
+                    if getattr(self, "_menu_bar_open", None) is lbl:
+                        lbl.configure(relief="sunken", borderwidth=1,
+                                      background=theme.ACCENT_BLUE,
+                                      foreground=theme.contrast_text(theme.ACCENT_BLUE))
         except Exception:
             pass
 
@@ -4617,27 +5029,34 @@ class MainApp(tk.Tk):
         self._tab_pad_after = None
         self.notebook.bind("<Configure>", self._schedule_fit_tabs, add="+")
 
+        # DESIGN-010: tab labels were built as "  Editor  " -- two literal
+        # spaces either side. That padding is a fixed floor theme.set_tab_pad()
+        # can never reclaim (it resizes the STYLE padding, not the text), and
+        # it leaks into the label's accessible name as leading/trailing
+        # noise. The style already supplies 9-14px of real, responsive
+        # padding, so the spaces bought nothing except the fragile
+        # .startswith("  Audit") coupling in the badge code below.
         self.editor = EntryEditor(self.notebook, self)
-        self._editor_tab_text = "  Editor  "
+        self._editor_tab_text = "Editor"
         self.notebook.add(self.editor, text=self._editor_tab_text)
 
         self.audit_panel = AuditPanel(self.notebook, self)
-        self.notebook.add(self.audit_panel, text="  Audit  ")
+        self.notebook.add(self.audit_panel, text="Audit")
 
         self.history_panel = None   # created just below, before any op recording
         self.history_panel = HistoryPanel(self.notebook, self)
-        self.notebook.add(self.history_panel, text="  History  ")
+        self.notebook.add(self.history_panel, text="History")
 
         # companion tools (secondary to the editor by design)
         self.curve_panel = curve_import.CurveImportPanel(self.notebook, self)
-        self.notebook.add(self.curve_panel, text="  Import  ")
+        self.notebook.add(self.curve_panel, text="Import")
         # drag-panning for the Import tab's scrollable body (wired here, not
         # inside curve_import, to keep the module import graph acyclic)
         attach_touch_scroll_canvas(self.curve_panel.scroll_canvas,
                                    self.curve_panel.scroll_inner)
 
         self.tools_panel = tools_panel.ToolsPanel(self.notebook, self)
-        self.notebook.add(self.tools_panel, text="  Export  ")
+        self.notebook.add(self.tools_panel, text="Export")
 
         # ttk panes start at their requested sizes, which can squeeze the
         # tree pane to near-zero; set the initial sash position once the
@@ -4667,13 +5086,34 @@ class MainApp(tk.Tk):
         self.status_marquee.pack(side="left", padx=8, pady=2,
                                  fill="x", expand=True)
 
-        # app-wide shortcuts: Ctrl+S = Save Entry (editor commit),
-        # Ctrl+N = new entry. Modal dialogs run with their own grab, so
-        # these only ever fire while the main window has focus.
-        self.bind("<Control-s>", self._on_ctrl_save)
-        self.bind("<Control-S>", self._on_ctrl_save)
-        self.bind("<Control-n>", self._on_ctrl_new)
-        self.bind("<Control-N>", self._on_ctrl_new)
+        # app-wide shortcuts. Ctrl+S = Save Entry (editor commit) and
+        # Ctrl+N = new entry, both pre-existing. DESIGN-002: everything
+        # below was MISSING, so the two most valuable actions in a database
+        # editor -- undo and find/replace -- had no keyboard route at all
+        # even though both are in the menus. Modal dialogs run with their own
+        # grab, so these only fire while the main window has focus.
+        for seq in ("<Control-s>", "<Control-S>"):
+            self.bind(seq, self._on_ctrl_save)
+        for seq in ("<Control-n>", "<Control-N>"):
+            self.bind(seq, self._on_ctrl_new)
+        # Ctrl+F and Ctrl+H both open Find & Replace (the dialog has both
+        # fields), matching what most editors do.
+        for seq in ("<Control-f>", "<Control-F>",
+                    "<Control-h>", "<Control-H>"):
+            self.bind(seq, self._on_ctrl_find)
+        # Undo/redo, with both the Ctrl+Y and Ctrl+Shift+Z conventions
+        for seq in ("<Control-z>", "<Control-Z>"):
+            self.bind(seq, self._on_ctrl_undo)
+        for seq in ("<Control-y>", "<Control-Y>",
+                    "<Control-Shift-Z>", "<Control-Shift-z>"):
+            self.bind(seq, self._on_ctrl_redo)
+        for seq in ("<Control-r>", "<Control-R>"):
+            self.bind(seq, self._on_ctrl_audit)
+        # Save As advertises Ctrl+Shift+S in the File menu, so it has to
+        # actually exist -- an accelerator label that is not bound is worse
+        # than no label at all.
+        for seq in ("<Control-Shift-s>", "<Control-Shift-S>"):
+            self.bind(seq, self._on_ctrl_save_as)
 
         # live-retheme hooks: canvas art + placed widgets the style engine
         # and retint walker cannot reach on their own
@@ -4704,6 +5144,57 @@ class MainApp(tk.Tk):
 
     def _on_ctrl_new(self, _event=None):
         self.add_entry()
+        return "break"
+
+    def _text_widget_has_focus(self, event=None):
+        """True when the key event came from a widget the user types text into.
+
+        The app-wide shortcuts below are bound on the toplevel, so they also
+        fire while a form field has focus. Ctrl+Z there means "undo my last
+        keystroke", NOT "roll back the last committed database operation",
+        and Ctrl+H is Tk's own backspace in an entry. Firing the app-level
+        action from a field would silently undo a saved edit or delete while
+        the user was only correcting a typo.
+
+        The event's own widget is the most reliable answer (it is the widget
+        the key was delivered to); focus_get() is only a fallback, because it
+        can return None or raise KeyError (popdown lists) in some states."""
+        w = getattr(event, "widget", None)
+        if not isinstance(w, tk.Misc):
+            try:
+                w = self.focus_get()
+            except Exception:
+                return False
+        return isinstance(w, (tk.Entry, tk.Text, tk.Spinbox,
+                              ttk.Entry, ttk.Combobox))
+
+    def _on_ctrl_find(self, _event=None):
+        # Ctrl+F opens Find & Replace from anywhere; Ctrl+H is also Tk's
+        # backspace inside a text field, so leave that one to the field.
+        if str(getattr(_event, "keysym", "")).lower() == "h" \
+                and self._text_widget_has_focus(_event):
+            return None
+        self.open_find_replace()
+        return "break"
+
+    def _on_ctrl_undo(self, _event=None):
+        if self._text_widget_has_focus(_event):
+            return None            # let the field handle its own editing keys
+        self.undo_last()
+        return "break"
+
+    def _on_ctrl_redo(self, _event=None):
+        if self._text_widget_has_focus(_event):
+            return None
+        self.redo_last()
+        return "break"
+
+    def _on_ctrl_audit(self, _event=None):
+        self.run_audit()
+        return "break"
+
+    def _on_ctrl_save_as(self, _event=None):
+        self.save_as()
         return "break"
 
     def _on_retheme_hook(self):
@@ -4878,14 +5369,29 @@ class MainApp(tk.Tk):
         if self.dirty or form_dirty:
             resp = messagebox.askyesnocancel(
                 APP_TITLE,
-                "You have unsaved changes. Save before exiting?\n\n"
-                "Yes = Save, No = Exit without saving, Cancel = Stay."
-                + ("\n\n(The entry form also has uncommitted edits -- Yes "
-                   "saves the database, those form edits are lost.)"
-                   if form_dirty and not self.dirty else ""))
+                "You have unsaved changes.\n\n"
+                "Yes = Save everything and exit\n"
+                "No  = Exit without saving (discard everything)\n"
+                "Cancel = Stay"
+                + ("\n\nThe entry form holds edits that were never "
+                   "committed and are in no backup. Yes saves them into "
+                   "the database first; No discards them."
+                   if form_dirty else ""))
             if resp is None:
                 return
             if resp:
+                # BUG-001: the form's uncommitted edits are in no autosave
+                # and no backup -- self.save() only writes self.entries, so
+                # they were silently lost on the old path. Commit the form
+                # FIRST, then save the database. validate_and_commit
+                # re-captures the baseline on success (main.py:5941), so a
+                # still-dirty form afterwards means the commit was refused
+                # (validation error or a cancelled overwrite prompt) and we
+                # must not exit.
+                if form_dirty:
+                    self.editor._on_save()
+                    if self.editor.form_is_dirty():
+                        return
                 self.save()
                 # if still dirty after save attempt, stay
                 if self.dirty:
@@ -4982,6 +5488,8 @@ class MainApp(tk.Tk):
             self.db_path = None            # unknown archive: pick a real target on save
         else:
             self.db_path = path
+        self._db_stamp = L.file_stamp(self.db_path)     # BUG-024
+        self._db_digest = L.file_digest(self.db_path) if self.db_path else None
         self.data_root = os.path.dirname(os.path.abspath(path))
         self.waivers = L.load_waivers(self.db_path)
         self.history, self.redo_stack = L.load_history(self.db_path)
@@ -4998,13 +5506,32 @@ class MainApp(tk.Tk):
             "  (RECOVERED from autosave backup -- use Save As to keep it)" if restored else "")
         if notes:
             msg += "  ({} note(s))".format(len(notes))
+            # BUG-022: every note used to go to print() and only the first
+            # 10 to the dialog. The project ships a PyInstaller --windowed
+            # binary, which has no console, so notes 11+ were permanently
+            # invisible -- and each one describes a value that was CHANGED
+            # or DESTROYED on load. db_logic.log() is the only diagnostic
+            # channel that survives a windowed build, so write them all
+            # there, keep a readable preview in the dialog, and make the full
+            # list reachable on demand rather than truncation being the only
+            # option.
             for n in notes:
-                print(n)
-            # show first few notes in dialog
-            preview = "\n".join(notes[:10])
-            if len(notes) > 10:
-                preview += "\n... and {} more (see console)".format(len(notes)-10)
-            messagebox.showwarning(APP_TITLE, "Notes while loading:\n\n" + preview)
+                L.log("load note: " + n)
+            head = min(len(notes), 10)
+            preview = "\n".join(notes[:head])
+            if len(notes) > head:
+                preview += ("\n... and {} more (all {} are in editor.log)"
+                            .format(len(notes) - head, len(notes)))
+            msgbox = messagebox.showwarning
+            if len(notes) > head:
+                # offer the full list rather than hiding it behind a log path
+                if messagebox.askyesno(
+                        APP_TITLE,
+                        "Notes while loading:\n\n{}\n\n"
+                        "Show all {} notes?".format(preview, len(notes))):
+                    msgbox = messagebox.showinfo
+                    preview = "\n".join(notes)
+            msgbox(APP_TITLE, "Notes while loading:\n\n" + preview)
         self.status_var.set(msg)
         self._notify_db_changed()
         # Post-load audit runs WITHOUT yanking the user off the Editor tab;
@@ -5090,14 +5617,51 @@ class MainApp(tk.Tk):
         except Exception:
             pass
 
-    def _pre_save_checks(self):
+    def _check_not_changed_on_disk(self, path):
+        """BUG-024: refuse to overwrite a database that changed underneath us.
+
+        Only meaningful for the file this app currently has open -- a Save As
+        to a new path has no staleness to detect. A cheap (mtime_ns, size)
+        stamp is compared first; only if it differs is the content hashed,
+        so an external tool that merely touches the file (open/close, a
+        backup scanner) does not produce a false alarm. Raises
+        L.ConcurrentModificationError, which save() turns into a dialog."""
+        if not self.db_path or os.path.normcase(os.path.abspath(path)) != \
+                os.path.normcase(os.path.abspath(self.db_path)):
+            return
+        base = getattr(self, "_db_stamp", None)
+        if base is None:
+            return                      # never loaded from disk; nothing to compare
+        current = L.file_stamp(path)
+        if current is None or current == base:
+            return                      # missing, or untouched since we read it
+        known = getattr(self, "_db_digest", None)
+        if known is not None and L.file_digest(path) == known:
+            # same bytes, new timestamp (a touch, not an edit) -- adopt the
+            # new stamp so the next save is not flagged again
+            self._db_stamp = current
+            return
+        raise L.ConcurrentModificationError(
+            "{} changed on disk since it was opened here.".format(
+                os.path.basename(path)))
+
+    def _pre_save_checks(self, allow_duplicate_ids=False):
         """Shared Save / Save As gate. Returns True when it's OK to proceed
         (blocking problems are refused outright; advisory ones need an
         explicit yes). Advisory gate only: reuse the freshest cached audit
         results instead of re-running the full audit (incl. a data-folder
         walk) on the UI thread every save. The Audit tab auto-refreshes on
         mutations, so stale results simply mean "no prompt", never a wrong
-        save."""
+        save.
+
+        `allow_duplicate_ids` exists so Save As stays an ESCAPE HATCH. A
+        hand-edited or externally-synced file can arrive with duplicate IDs
+        (load_database does not reject them), and the Duplicate ID audit
+        finding is deliberately non-auto-fixable -- so with the hard block
+        on both paths the user was trapped: unable to save, unable to Save
+        As, unable to get their own data out to repair by hand. Save As
+        still asks first, so this is a deliberate choice, not a silent
+        bypass of the primary save."""
         if not self.entries:
             messagebox.showwarning(APP_TITLE, "Nothing to save -- no database loaded.")
             return False
@@ -5107,11 +5671,40 @@ class MainApp(tk.Tk):
         dup_ids = {}
         for idx, e in enumerate(self.entries):
             dup_ids.setdefault(e.get("id"), []).append(idx)
-        dup_msgs = ["Duplicate ID '{}' used {} times.".format(k, len(v))
-                    for k, v in dup_ids.items() if len(v) > 1]
-        if dup_msgs:
-            messagebox.showerror(APP_TITLE, "Cannot save -- fix these first:\n\n" + "\n".join(dup_msgs))
-            return False
+        dups = {k: v for k, v in dup_ids.items() if len(v) > 1}
+        if dups:
+            # name the actual records, not just the id string: the old
+            # message gave the user an id and nothing to match it against
+            dup_msgs = []
+            for k, idxs in sorted(dups.items(), key=lambda kv: str(kv[0])):
+                who = []
+                for i in idxs[:4]:
+                    e = self.entries[i]
+                    who.append("row {}: {} {}".format(
+                        i + 1, e.get("brand") or "?", e.get("model") or "?"))
+                if len(idxs) > 4:
+                    who.append("... and {} more".format(len(idxs) - 4))
+                dup_msgs.append("Duplicate ID '{}' used {} times:\n    {}"
+                                .format(k, len(idxs), "\n    ".join(who)))
+            body = "\n\n".join(dup_msgs)
+            if allow_duplicate_ids:
+                if not messagebox.askyesno(
+                        APP_TITLE,
+                        "This database has duplicate IDs:\n\n{}\n\n"
+                        "Saving anyway keeps them. The main database cannot "
+                        "be saved until they are fixed, so use this copy to "
+                        "inspect or repair the file outside the app.\n\n"
+                        "Save anyway?".format(body)):
+                    return False
+            else:
+                messagebox.showerror(
+                    APP_TITLE,
+                    "Cannot save -- fix these first:\n\n{}\n\n"
+                    "Open each entry and correct its Brand / Model / Variant "
+                    "so the ID is rebuilt. If you need the data out of the "
+                    "app first, use File \u2192 Save As, which can write a copy "
+                    "anyway.".format(body))
+                return False
         if blocking:
             proceed = messagebox.askyesno(
                 APP_TITLE,
@@ -5125,14 +5718,22 @@ class MainApp(tk.Tk):
         """Back up whatever currently sits at `path` (if anything) into
         backup/database.json.bak, write the new content, then refresh
         database.json.gz right alongside it. Returns (ordered_entries,
-        backup_path_or_None, gz_path_or_None). Raises on the primary
+        backup_path_or_none, gz_path_or_none). Raises on the primary
         save failing; a gzip failure is logged but never blocks the save
         that already succeeded.
+
+        BUG-024: no cross-process check existed, so a stale second window
+        (or an external editor) was overwritten silently -- and the single
+        rolling backup was destroyed on the way, because
+        write_database_backup() below copies whatever is on disk RIGHT NOW
+        over database.json.bak. So the check runs BEFORE the backup, not
+        after: by then the only pre-save copy is already gone.
         M-1: the primary JSON write stays on the UI thread (it must be
         durable before anything else believes the save happened, and the
         exit path joins it), but the .gz refresh now runs on a worker
         thread so a 10k-entry catalog does not freeze the window for the
         duration of a level-9 gzip pass."""
+        self._check_not_changed_on_disk(path)
         snap = L.write_database_backup(path)
         # M-1: immediate feedback before the (potentially long) write.
         self.status_var.set("Saving {} entries to {}...".format(
@@ -5168,15 +5769,22 @@ class MainApp(tk.Tk):
     def _after_save(self, path, ordered, snap, gz_path, extra_note=""):
         self.entries = ordered
         # F1: resolve the editor's entry by ID, never by list position.
-        # save_database() sorted self.entries IN PLACE, so any index captured
-        # after it (like self.editing_index, which predates the sort) now
-        # points at whatever entry slid into that slot -- re-highlighting
-        # (and silently reloading into the form) the WRONG entry after any
-        # save that reordered the list. editor.original_id is the plain
-        # string id of the entry the form is actually holding; it is
-        # maintained by every editor flow and unaffected by the sort.
+        # self.entries has just been REPLACED with a new list object (and
+        # every element with a freshly-built dict), so any index captured
+        # before the save -- self.editing_index above all -- now points at
+        # whatever entry slid into that slot. Re-highlighting (and silently
+        # reloading into the form) the WRONG entry after any save that
+        # reordered the list is the bug this guards.
+        # editor.original_id is the plain string id of the entry the form is
+        # actually holding; it is maintained by every editor flow and
+        # unaffected by the sort. (save_database no longer sorts in place --
+        # see BUG-002 -- but adopting the new list here is the same hazard.)
         current_id = getattr(self.editor, "original_id", None) or None
         self.db_path = path
+        # BUG-024: re-baseline the on-disk identity after our own write, so
+        # the next save is not reported as a foreign change.
+        self._db_stamp = L.file_stamp(path)
+        self._db_digest = L.file_digest(path)
         self.dirty = False
         try:
             L.save_waivers(path, self.waivers)
@@ -5249,6 +5857,29 @@ class MainApp(tk.Tk):
             return
         try:
             ordered, snap, gz_path = self._write_database_to(self.db_path)
+        except L.ConcurrentModificationError:
+            # BUG-024: refuse rather than clobber. Nothing has been written
+            # and the rolling backup is untouched (the check runs first), so
+            # the safest next step is offered rather than assumed.
+            self.status_var.set("Save blocked: the file changed on disk.")
+            choice = messagebox.askyesnocancel(
+                APP_TITLE,
+                    "This database file has changed on disk since you "
+                    "opened it -- another copy of this app, or another "
+                    "program, has written to it.\n\n"
+                    "Your changes are still here and have NOT been "
+                    "written, so nothing of yours was lost.\n\n"
+                    "Yes  = discard my changes and reload the file\n"
+                    "No   = keep my changes and save them to a NEW file "
+                    "(Save As)\n"
+                    "Cancel = stay here and decide later")
+            if choice is None:
+                return
+            if choice:
+                self._load_from_path(self.db_path)
+                return
+            self.save_as()
+            return
         except L.FileBusyError as e:
             # DL-4: another process (IEM Tool, editor, second instance)
             # holds database.json open. The database on disk is untouched;
@@ -5270,7 +5901,9 @@ class MainApp(tk.Tk):
     def save_as(self):
         """Explicit 'save a copy elsewhere' -- picks a new file/location and
         adopts it as the working database from then on."""
-        if not self._pre_save_checks():
+        # escape hatch: a database that cannot pass the primary save's
+        # duplicate-ID gate must still be exportable, or the user is trapped
+        if not self._pre_save_checks(allow_duplicate_ids=True):
             return
         initial = os.path.basename(self.db_path) if self.db_path else "database.json"
         path = filedialog.asksaveasfilename(
@@ -5818,13 +6451,46 @@ class MainApp(tk.Tk):
         }])
         self._autosave()
 
+    def _resolve_edit_target(self, original_id):
+        """Locate the entry the editor form is currently holding.
+
+        BUG-002 / HARD-002: `editing_index` is a bare position, and the list
+        it indexes gets reordered by things other than an explicit load --
+        most dangerously a FAILED save, which used to sort self.entries in
+        place before the write was attempted. The position then addresses a
+        different record while the tree rows still show the old labels, and
+        "Save Entry" overwrites the wrong product.
+
+        `original_id` is the stable identity the editor already maintains
+        (set by load_entry / new_entry / _on_save), so prefer it. The
+        positional index wins only when it AGREES with the id, which keeps
+        duplicate-id databases unambiguous: if the slot the form came from
+        still holds that id, that is the entry the user is looking at.
+        Returns None only when the id is None (a genuinely new entry --
+        new_entry() always clears it) or nothing matches at all.
+
+        Note the deliberate asymmetry: an id match is honoured even when
+        editing_index is None. That combination means the positional handle
+        was lost while the form still holds a real record, and updating that
+        record is the safe repair -- treating it as new would APPEND a
+        duplicate of it."""
+        idx = self.editing_index
+        idx_ok = idx is not None and 0 <= idx < len(self.entries)
+        if idx_ok and self.entries[idx].get("id") == original_id:
+            return idx
+        if original_id:
+            for i, e in enumerate(self.entries):
+                if e.get("id") == original_id:
+                    return i
+        return idx if idx_ok else None
+
     def validate_and_commit(self, entry, original_id):
         editor = self.editor
-        editing = self.editing_index is not None \
-            and 0 <= self.editing_index < len(self.entries)
+        target = self._resolve_edit_target(original_id)
+        editing = target is not None
 
         if editing:
-            old_id = self.entries[self.editing_index].get("id")
+            old_id = self.entries[target].get("id")
             if entry["id"] != old_id:
                 ok = messagebox.askyesno(
                     APP_TITLE,
@@ -5833,7 +6499,7 @@ class MainApp(tk.Tk):
                 if not ok:
                     return ["Cancelled - '{}' was left unchanged.".format(old_id)]
             existing_ids = {e.get("id") for i, e in enumerate(self.entries)
-                            if i != self.editing_index}
+                            if i != target}
         else:
             existing_ids = {e.get("id") for e in self.entries}
 
@@ -5868,10 +6534,13 @@ class MainApp(tk.Tk):
         clean = L.build_clean_entry(entry)
 
         if editing:
-            idx = self.editing_index
+            idx = target
             old_obj = self.entries[idx]
             old_copy = self._deepcopy(old_obj)
             self.entries[idx] = clean
+            # the resolved target is authoritative; keep editing_index in
+            # step so later positional readers (tree iids) agree with it
+            self.editing_index = idx
             detail = L.describe_entry_change(old_copy, clean)
             desc = "Edited '{}'{}".format(clean["id"],
                                           " -- {}".format(detail) if detail else "")
@@ -6017,7 +6686,8 @@ class MainApp(tk.Tk):
     # ------------------------------------------------------------------
     # AUDIT TAB BADGE (live issue count on the tab label)
     # ------------------------------------------------------------------
-    AUDIT_TAB_BASE = "  Audit  "
+    # DESIGN-010: kept in step with the unpadded label set at construction.
+    AUDIT_TAB_BASE = "Audit"
 
     def _update_audit_badge(self, live_issues):
         """Show unresolved issue count on the Audit tab so results are
@@ -6025,11 +6695,13 @@ class MainApp(tk.Tk):
         load). Errors and warnings share one number; 0 hides the badge."""
         label = self.AUDIT_TAB_BASE
         if live_issues:
-            label = "  Audit \u26a0 {}  ".format(live_issues)
+            label = "Audit \u26a0 {}".format(live_issues)
         try:
             for i, tab in enumerate(self.notebook.tabs()):
+                # the widget comparison is authoritative; the prefix test is
+                # only a fallback and now matches the unpadded label
                 if str(self.audit_panel) == tab or \
-                        self.notebook.tab(tab, "text").startswith("  Audit"):
+                        self.notebook.tab(tab, "text").startswith("Audit"):
                     self.notebook.tab(i, text=label)
                     break
         except Exception:
@@ -6039,26 +6711,60 @@ class MainApp(tk.Tk):
         fixable = [i for i in issues if i.fix]
         if not fixable:
             return
+        # BUG-005: a fix mutates the entry in place, and
+        # _reload_editor_if_affected then calls editor.load_entry(), which
+        # overwrites every form field AND re-captures the baseline -- so the
+        # edits vanish with no prompt and the form then reports itself clean,
+        # meaning even the exit warning stays silent.
+        if self._confirm_editor_reload(
+                {getattr(i, "entry_index", -1) for i in fixable},
+                {getattr(i, "entry_id", None) for i in fixable},
+                "Fixing these issues"):
+            return
         # M-2: snapshot ONLY the entries the fixes can touch (each issue
         # carries its position). Fix closures mutate dict CONTENTS and never
         # change the list length (verified: every mutator writes into a
         # located entry), so a shallow list copy + per-target deepcopies is
         # sufficient -- the old full-database deepcopy stalled the UI and
         # allocated 30-80 MB on every Fix All over a 10k-entry catalog.
+        #
+        # BUG-006: the snapshot used to be keyed ONLY by each issue's
+        # predicted entry_index, but db_logic's _resolve() locates its target
+        # by object identity FIRST and falls back to id. So a fix that
+        # resolved by id (because the list shifted between the audit and the
+        # click) had no pre-image at all: its mutation was neither rolled
+        # back on a crash nor recorded for undo, and it was autosaved anyway.
+        # Cover BOTH resolution paths up front.
+        id_to_pos = {}
+        for j, e in enumerate(self.entries):
+            eid = e.get("id")
+            if eid and eid not in id_to_pos:
+                id_to_pos[eid] = j
         touched_positions = set()
         for i in fixable:
             idx = getattr(i, "entry_index", None)
             if isinstance(idx, int) and 0 <= idx < len(self.entries):
                 touched_positions.add(idx)
+            eid = getattr(i, "entry_id", None)
+            if eid and eid in id_to_pos:
+                touched_positions.add(id_to_pos[eid])
         before_snapshot = [None] * len(self.entries)   # deepcopy only where touched
         for idx in touched_positions:
             before_snapshot[idx] = self._deepcopy(self.entries[idx])
+        # the pre-batch view of the whole list, used below to decide whether
+        # an entry that fails validation AFTER a fix was already failing
+        # BEFORE it (a pre-existing problem must never be "reverted" on top
+        # of a legitimate repair)
+        pre_list = [before_snapshot[i] if before_snapshot[i] is not None
+                    else self.entries[i] for i in range(len(self.entries))]
         applied = failed = stale = 0
+        committed_positions = set()   # pos values of fixes that succeeded
         for issue in fixable:
             try:
                 pos = issue.fix(self.entries)
                 if isinstance(pos, int) and 0 <= pos < len(self.entries):
                     applied += 1
+                    committed_positions.add(pos)
                     if before_snapshot[pos] is None:
                         # M-5: `issue.fix()` already mutated entries[pos] IN
                         # PLACE as a side effect of resolving it (it both
@@ -6084,10 +6790,57 @@ class MainApp(tk.Tk):
             except Exception as e:
                 failed += 1
                 L.log("Fix '{}' failed: {}".format(issue.category, e))
+                # BUG-006: a mutator writes into the entry dict IN PLACE, so
+                # one that raises after its first write leaves a
+                # half-applied entry that used to be counted, logged and then
+                # happily repopulated + autosaved. Restore every touched
+                # position this call could have dirtied and that no
+                # successful fix has already claimed.
+                for idx in sorted(touched_positions):
+                    if idx in committed_positions or before_snapshot[idx] is None:
+                        continue
+                    if not (0 <= idx < len(self.entries)):
+                        continue
+                    if self.entries[idx] != before_snapshot[idx]:
+                        L.log("apply_fixes: rolled back partial fix on "
+                              "position {} after '{}' raised.".format(
+                                  idx, issue.category))
+                        self.entries[idx] = self._deepcopy(before_snapshot[idx])
         # grow the before-snapshot bookkeeping if a fix moved past the end
         if len(before_snapshot) < len(self.entries):
             before_snapshot.extend(
                 [None] * (len(self.entries) - len(before_snapshot)))
+
+        # ---- BUG-006: post-condition gate -----------------------------
+        # "the fix returned an int" is not evidence that the entry is still
+        # valid. Run the SAME validator the entry form uses over every entry
+        # the batch changed, and roll back the ones this batch made WORSE.
+        # An entry that already failed validation BEFORE the batch is left
+        # alone: reverting it would throw away a legitimate repair and
+        # re-plant a problem the user was in the middle of fixing.
+        reverted = []
+        for idx in sorted(touched_positions):
+            if before_snapshot[idx] is None or not (0 <= idx < len(self.entries)):
+                continue
+            if self.entries[idx] == before_snapshot[idx]:
+                continue                       # untouched: nothing to check
+            others_now = {e.get("id") for k, e in enumerate(self.entries)
+                          if k != idx and e.get("id")}
+            if not L.validate_entry(self.entries[idx], existing_ids=others_now,
+                                    exclude_id=None):
+                continue                       # fixed entry is valid: keep it
+            others_pre = {e.get("id") for k, e in enumerate(pre_list)
+                          if k != idx and e.get("id")}
+            if L.validate_entry(before_snapshot[idx], existing_ids=others_pre,
+                                exclude_id=None):
+                continue                       # was already invalid: keep fix
+            self.entries[idx] = self._deepcopy(before_snapshot[idx])
+            reverted.append(self.entries[idx].get("id")
+                            or "(no id) #{}".format(idx))
+        if reverted:
+            L.log("apply_fixes: rolled back {} fix(es) that would have left "
+                  "the entry invalid: {}".format(len(reverted),
+                                                 ", ".join(map(str, reverted))))
 
         changes = []
         for i, (before_e, after_e) in enumerate(zip(before_snapshot, self.entries)):
@@ -6118,6 +6871,11 @@ class MainApp(tk.Tk):
             # record, which made the old derivation over-report skips.
             note = " ({} of {} skipped: {} stale, {} failed)".format(
                 not_applied, len(fixable), stale, failed)
+        if reverted:
+            note += ("  \u2022 {} fix(es) ROLLED BACK because they would have "
+                     "left the entry invalid ({}).".format(
+                         len(reverted), ", ".join(map(str, reverted[:3]))
+                         + ("..." if len(reverted) > 3 else "")))
         self.dirty = True
         self.populate_tree()
         self._reload_editor_if_affected({c["pos_hint"] for c in changes})
@@ -6125,6 +6883,42 @@ class MainApp(tk.Tk):
             len(changes), note))
         self._notify_db_changed()
         self._autosave()
+
+    def _confirm_editor_reload(self, positions, entry_ids, verb):
+        """Guard the form against a batch operation that will reload the
+        entry it is showing.
+
+        A fix mutates its target in place and _reload_editor_if_affected
+        then calls editor.load_entry(), which overwrites every form field
+        AND re-captures the baseline -- so unsaved edits vanish with no
+        prompt, and the form then reports itself clean, which also silences
+        the exit warning. Tree-selection, Add Entry, Delete and Undo/Redo all
+        guard this; Fix All and Merge did not.
+
+        Returns True when the user declined and the caller must abort.
+        Only asks when the entry on screen is actually in the blast radius,
+        so repairing 500 unrelated entries never nags."""
+        idx = self.editing_index
+        if idx is None or not (0 <= idx < len(self.entries)):
+            return False
+        if idx not in positions:
+            return False
+        try:
+            if not self.editor.form_is_dirty():
+                return False
+        except Exception:
+            return False
+        edited_id = getattr(self.editor, "original_id", None)
+        if edited_id and entry_ids and edited_id not in entry_ids:
+            # a brand-new entry has no id yet; the position match above is
+            # authoritative in that case, so only skip the prompt when this
+            # is a committed entry that is provably NOT a target
+            return False
+        return not messagebox.askyesno(
+            APP_TITLE,
+            "The entry form has unsaved changes.\n\n{} will reload the "
+            "entry you are editing and DISCARD those edits.\n\n"
+            "Continue?".format(verb))
 
     def _reload_editor_if_affected(self, positions):
         """Reload the editor form when the entry it is showing was mutated

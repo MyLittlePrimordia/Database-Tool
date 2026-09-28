@@ -90,13 +90,13 @@ class CurveCompareDialog(tk.Toplevel):
         self.combo_b = ttk.Combobox(pick_row, textvariable=self.var_b,
                                     values=labels, state="normal")
         ttk.Label(pick_row, text="A", style="Card.TLabel",
-                  foreground=theme.ACCENT_BLUE).grid(row=0, column=0,
+                  foreground=theme.ACCENT_BLUE_TEXT).grid(row=0, column=0,
                                                      sticky="w")
         self.combo_a.grid(row=1, column=0, sticky="ew", padx=(0, 8))
         ttk.Button(pick_row, text="\u21c4 Swap",
                    command=self._swap).grid(row=1, column=1, padx=4)
         ttk.Label(pick_row, text="B", style="Card.TLabel",
-                  foreground=theme.ACCENT_ORANGE).grid(row=0, column=2,
+                  foreground=theme.ACCENT_ORANGE_TEXT).grid(row=0, column=2,
                                                        sticky="w")
         self.combo_b.grid(row=1, column=2, sticky="ew", padx=(8, 0))
         # F-5: A-B difference trace. Styled like the Editor tab's FR

@@ -169,12 +169,170 @@ def lighten(color, t=0.15):
 
 
 def contrast_text(hex_color):
-    """Black or white per perceived luminance (same rule as IEM Tool's
-    getContrastTextColor) so accent-filled buttons/tabs stay readable in
-    every theme, including the light Parchment palette."""
+    """Legible label colour for text sitting ON an accent fill.
+
+    Picks whichever of black/white actually MEASURES better under WCAG
+    instead of guessing from a luminance cutoff. The old 0.6 threshold
+    returned white for fills such as #dd6b20, where white is only 3.39:1
+    while black is 8.52:1 -- so every Accent and Danger button was
+    technically unreadable in nine themes.
+
+    Returns an exact black or white whenever either one clears AA (the
+    normal case), and only nudges the colour when neither does. Callers
+    that string-compare the result therefore keep working, but that is now
+    incidental rather than contractual -- compare luminance directly
+    instead (see style_titlebar)."""
+    dark, light = "#000000", "#ffffff"
+    r_dark = contrast_ratio(dark, hex_color)
+    r_light = contrast_ratio(light, hex_color)
+    if r_dark >= MIN_CONTRAST_TEXT and r_dark >= r_light:
+        return dark
+    if r_light >= MIN_CONTRAST_TEXT:
+        return light
+    # Neither pure black nor pure white clears AA against this fill, so keep
+    # the fill (it is the brand colour) and move the label just far enough.
+    return ensure_contrast(dark if r_dark >= r_light else light, hex_color)
+
+
+# WCAG 2.1 relative luminance / contrast ratio -----------------------------
+def _relative_luminance(hex_color):
+    """WCAG 2.1 relative luminance of a hex colour."""
+    def chan(v):
+        v = v / 255.0
+        return v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4
     r, g, b = _rgb(hex_color)
-    return "#000000" if (0.299 * r + 0.587 * g + 0.114 * b) / 255 > 0.6 \
-        else "#ffffff"
+    return 0.2126 * chan(r) + 0.7152 * chan(g) + 0.0722 * chan(b)
+
+
+def contrast_ratio(fg, bg):
+    """WCAG 2.1 contrast ratio between two hex colours (1.0 - 21.0)."""
+    a, b = _relative_luminance(fg), _relative_luminance(bg)
+    hi, lo = max(a, b), min(a, b)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+# AA for body text. The app's base font is 13px, which is below the 18.66px
+# bold / 24px "large text" exemption, so 4.5:1 is the bar that applies.
+MIN_CONTRAST_TEXT = 4.5
+
+
+def ensure_contrast(fg, bg, target=MIN_CONTRAST_TEXT):
+    """Return `fg` adjusted until it clears `target` contrast against `bg`.
+
+    DESIGN-007/008: several palette entries were authored as *backgrounds*
+    (accent-filled buttons, where contrast_text() picks the label colour) and
+    then reused verbatim as *foregrounds* on cards and panels -- where they
+    are unreadable. Measured worst case was Parchment's header at 1.84:1,
+    and the shared severity red was 2.75:1 on its own card. Rather than
+    hand-tuning nine palettes, move the colour's lightness away from the
+    surface until it passes. The hue is preserved, so a theme still looks
+    like itself; only the lightness changes, and only as far as it must.
+    """
+    if contrast_ratio(fg, bg) >= target:
+        return fg
+    # Move toward whichever extreme leaves more headroom. Deciding by a
+    # fixed luminance threshold is wrong for mid-tone surfaces: Parchment's
+    # panel (#bda87d) is light but sits below 0.5, so a threshold test
+    # pushed the header toward white and made it WORSE (2.32:1). Compare the
+    # ratio each extreme can actually reach instead.
+    bl = _relative_luminance(bg)
+    headroom_black = (bl + 0.05) / 0.05          # ratio at pure black
+    headroom_white = 1.05 / (bl + 0.05)          # ratio at pure white
+    toward = "#000000" if headroom_black >= headroom_white else "#ffffff"
+    best = fg
+    for i in range(1, 101):
+        cand = blend(fg, toward, i / 100.0)
+        best = cand
+        if contrast_ratio(cand, bg) >= target:
+            return cand
+    return best
+
+
+def accent_fg(accent, surface):
+    """A legible foreground version of an accent colour for use as TEXT on
+    `surface`. The accent itself is unchanged, so accent-filled buttons and
+    selected tabs keep their exact brand colour."""
+    return ensure_contrast(accent, surface)
+
+
+def _legible_on_all(fg, surfaces, rounds=8):
+    """Nudge `fg` until it clears MIN_CONTRAST_TEXT on EVERY surface.
+
+    ensure_contrast() is single-surface, and a colour that has to work as
+    text on four backgrounds at once cannot be solved in one step -- moving
+    it off the binding surface can push another one under the line. So this
+    repeatedly corrects whichever surface is currently worst. Bounded
+    because each pass strictly increases the worst ratio, and it returns the
+    best value found if it somehow hits the bound.
+    """
+    surfaces = [s for s in surfaces if s]
+    if not surfaces:
+        return fg
+    best, best_r = fg, -1.0
+    for _ in range(rounds):
+        worst_bg = min(surfaces, key=lambda s: contrast_ratio(fg, s))
+        r = contrast_ratio(fg, worst_bg)
+        if r > best_r:
+            best, best_r = fg, r
+        if r >= MIN_CONTRAST_TEXT:
+            return fg
+        nxt = ensure_contrast(fg, worst_bg)
+        if nxt == fg:
+            break
+        fg = nxt
+    return best
+
+
+def _derived_text_colors(p):
+    """The legible text variants implied by palette dict `p`.
+
+    These are DERIVED, not authored, so they are absent from the raw
+    palette. retint() remaps a tk widget by looking its current colour up in
+    an old->new table, so a derived colour that is not in that table simply
+    never gets remapped: a tk.Label given fg=theme.ACCENT_RED_TEXT would keep
+    the previous theme's red forever. ttk widgets are immune (apply_styles
+    restyles them), which is exactly why the bug hides in tk.Label/Canvas
+    code and not in the stylesheet. Computing the set for both palettes lets
+    set_theme extend the remap table to cover them.
+    """
+    return {
+        "text_dim": _legible_on_all(
+            p["text_secondary"],
+            (p["bg_card"], p["bg_sidebar"], p["bg_body"], p["bg_input"])),
+        "accent_blue_text": ensure_contrast(p["accent"], p["bg_card"]),
+        "accent_green_text": ensure_contrast(p["accent_green"], p["bg_card"]),
+        "accent_red_text": ensure_contrast(p["accent_red"], p["bg_card"]),
+        "accent_amber_text": ensure_contrast(p["accent_amber"], p["bg_card"]),
+        "accent_violet_text": ensure_contrast(p["accent_violet"], p["bg_card"]),
+        "accent_on_panel_text": ensure_contrast(p["accent"], p["bg_sidebar"]),
+    }
+
+
+# ===========================================================================
+# LEGIBLE TEXT VARIANTS (DESIGN-007 / DESIGN-008)
+#
+# The four accents above are authored as BACKGROUNDS -- accent-filled
+# buttons, the selected tab, focus rings -- where contrast_text() supplies a
+# readable label. Reusing them verbatim as FOREGROUNDS (card headers, tree
+# headings, audit severity text) is what made them unreadable: the shared
+# severity red measured 2.75:1 on Parchment's own card, Parchment's card
+# header 2.85:1, and the page header 1.84:1.
+#
+# These are recomputed by set_theme() for the active palette and are the ONLY
+# values that should be used as text. The background originals are untouched,
+# so buttons, tabs and focus rings keep their exact colours.
+#
+# Defined after ensure_contrast() on purpose, and re-derived on every theme
+# switch.
+# ===========================================================================
+ACCENT_BLUE_TEXT = ensure_contrast(ACCENT_BLUE, BG_CARD)
+ACCENT_GREEN_TEXT = ensure_contrast(ACCENT_GREEN, BG_CARD)
+ACCENT_RED_TEXT = ensure_contrast(ACCENT_RED, BG_CARD)
+ACCENT_ORANGE_TEXT = ensure_contrast(ACCENT_ORANGE, BG_CARD)
+ACCENT_PURPLE_TEXT = ensure_contrast(ACCENT_PURPLE, BG_CARD)
+# header text sits on the panel/sidebar surface, which is a different colour
+# from the cards, so it gets its own derivation
+ACCENT_ON_PANEL_TEXT = ensure_contrast(ACCENT_BLUE, BG_PANEL)
 
 
 # ===========================================================================
@@ -431,12 +589,16 @@ def render_emoji_png(emoji, size, out_path):
 def emoji_photo(emoji, size=18, root=None):
     """tk.PhotoImage of a COLOR emoji (transparent background), cached per
     (emoji, size). Returns None when color rendering is unavailable -- the
-    caller should fall back to the plain text glyph."""
+    caller should fall back to the plain text glyph.
+
+    A PhotoImage belongs to the Tk interpreter that created it and is dead the
+    moment that root is destroyed, so the cache also records WHICH root each
+    image came from. Without that, a recreated root was handed images from the
+    previous interpreter and every consumer failed with 'image "pyimageN" does
+    not exist'. Within one process this never surfaced, because the app has a
+    single root for its whole lifetime."""
     if not emoji:
         return None
-    key = (emoji, size)
-    if key in _EMOJI_PHOTO_CACHE:
-        return _EMOJI_PHOTO_CACHE[key]
     import tkinter as tk
     try:
         if root is None:
@@ -445,6 +607,10 @@ def emoji_photo(emoji, size=18, root=None):
         return None
     if root is None:
         return None
+    key = (emoji, size)
+    hit = _EMOJI_PHOTO_CACHE.get(key)
+    if hit is not None and hit[0] is root:
+        return hit[1]
     slug = "".join("{:04X}".format(ord(c)) for c in emoji)
     path = os.path.join(_settings_dir(), "emoji_cache",
                         "e{}_{}.png".format(slug, size))
@@ -453,9 +619,11 @@ def emoji_photo(emoji, size=18, root=None):
             return None
     try:
         photo = tk.PhotoImage(file=path, master=root)
-        _EMOJI_PHOTO_CACHE[key] = photo
+        _EMOJI_PHOTO_CACHE[key] = (root, photo)
         return photo
     except Exception:
+        # drop any stale entry so a later call re-attempts cleanly
+        _EMOJI_PHOTO_CACHE.pop(key, None)
         return None
 
 
@@ -500,6 +668,39 @@ def set_theme(theme_id):
     TEXT_MAIN = new["text_main"]
     TEXT_DIM = new["text_secondary"]
     OK_COLOR = new["accent_green"]
+
+    # DESIGN-007/008: recompute the legible text variants for THIS palette.
+    # They are module globals on purpose so existing call sites can keep
+    # writing theme.ACCENT_RED_TEXT with no plumbing.
+    global ACCENT_BLUE_TEXT, ACCENT_GREEN_TEXT, ACCENT_RED_TEXT
+    global ACCENT_ORANGE_TEXT, ACCENT_PURPLE_TEXT, ACCENT_ON_PANEL_TEXT
+    ACCENT_BLUE_TEXT = ensure_contrast(ACCENT_BLUE, BG_CARD)
+    ACCENT_GREEN_TEXT = ensure_contrast(ACCENT_GREEN, BG_CARD)
+    ACCENT_RED_TEXT = ensure_contrast(ACCENT_RED, BG_CARD)
+    ACCENT_ORANGE_TEXT = ensure_contrast(ACCENT_ORANGE, BG_CARD)
+    ACCENT_PURPLE_TEXT = ensure_contrast(ACCENT_PURPLE, BG_CARD)
+    ACCENT_ON_PANEL_TEXT = ensure_contrast(ACCENT_BLUE, BG_PANEL)
+
+    # Secondary text is real text (hints, "(not set)", live counts), so it
+    # is held to the same AA threshold as the accents rather than being
+    # assumed legible. Two palettes shipped text_secondary just under the
+    # line on the card surface (circuit 4.28:1, arcade 4.47:1). A single
+    # colour has to clear every surface at once, so iterate against whichever
+    # surface is currently binding until none of them is under AA.
+    TEXT_DIM = _legible_on_all(new["text_secondary"],
+                               (BG_CARD, BG_PANEL, BG_MAIN, BG_INPUT))
+
+    # Teach retint() about the derived colours as well. The table built
+    # above only covers authored palette entries, so without this a tk widget
+    # coloured with TEXT_DIM or an ACCENT_*_TEXT would keep the old theme's
+    # value on every switch -- a stale-colour bug that is invisible in ttk
+    # (restyled wholesale) and therefore easy to miss in review.
+    _old_derived = _derived_text_colors(old)
+    _new_derived = _derived_text_colors(new)
+    for _k, _ov in _old_derived.items():
+        _nv = _new_derived[_k]
+        if _ov != _nv:
+            _prev_palette[_ov] = _nv
 
     _settings["theme"] = current_theme_id
     _save_settings()
@@ -718,9 +919,9 @@ def apply_styles(root):
     style.configure("Card.TLabel", background=BG_CARD, foreground=TEXT_MAIN)
     style.configure("Dim.TLabel", background=BG_MAIN, foreground=TEXT_DIM)
     style.configure("Header.TLabel", background=BG_PANEL,
-                    foreground=ACCENT_BLUE, font=header)
+                    foreground=ACCENT_ON_PANEL_TEXT, font=header)
     style.configure("CardHeader.TLabel", background=BG_CARD,
-                    foreground=ACCENT_BLUE, font=base_bold)
+                    foreground=ACCENT_BLUE_TEXT, font=base_bold)
     style.configure("Status.TLabel", background=BG_PANEL,
                     foreground=TEXT_DIM, font=small)
 
@@ -808,11 +1009,15 @@ def apply_styles(root):
 
     # green checkmark toast (clipboard-copy feedback, Export tab): ttk
     # buttons have no widget-level foreground, so the color swap is a
-    # dedicated style the button switches to for a second
+    # dedicated style the button switches to for a second.
+    # This style sets no background, so it sits on the plain TButton card
+    # surface -- the green is TEXT here, not a fill, and the raw accent
+    # measured 2.8-3.9:1 on that surface (DESIGN-007).
     style.configure("Compact.Toast.TButton", padding=(7, 5), width=0,
-                    foreground=ACCENT_GREEN)
+                    foreground=ACCENT_GREEN_TEXT)
     style.map("Compact.Toast.TButton",
-              foreground=[("pressed", ACCENT_GREEN), ("active", ACCENT_GREEN)])
+              foreground=[("pressed", ACCENT_GREEN_TEXT),
+                          ("active", ACCENT_GREEN_TEXT)])
 
     # toast variant for ACCENT (orange) buttons: the whole block flashes
     # green with white text, then reverts to the orange Accent look
@@ -946,7 +1151,7 @@ def apply_styles(root):
                     lightcolor=BORDER, darkcolor=BORDER, font=base,
                     rowheight=FONT_BASE_PX + 12)
     style.configure("Treeview.Heading", background=BG_CARD,
-                    foreground=ACCENT_BLUE, font=base_bold,
+                    foreground=ACCENT_BLUE_TEXT, font=base_bold,
                     bordercolor=BORDER, lightcolor=BORDER, darkcolor=BORDER,
                     relief="flat", padding=(6, 6))
     style.map("Treeview",
@@ -1078,7 +1283,15 @@ def style_titlebar(root):
         hwnd = ctypes.windll.user32.GetParent(root.winfo_id())
         if not hwnd:
             return
-        is_dark = contrast_text(BG_PANEL) == "#ffffff"
+        # Whether the panel reads as dark is a property of the PANEL, so ask
+        # the panel's own brightness. This used to be inferred by comparing
+        # contrast_text(BG_PANEL) to the literal "#ffffff", which silently
+        # depended on contrast_text returning one of exactly two values --
+        # and would have flipped the title bar to the wrong mode the moment
+        # that function started nudging its result. Same 0.6 perceived-
+        # brightness rule as before, so the behaviour is unchanged.
+        _pr, _pg, _pb = _rgb(BG_PANEL)
+        is_dark = (0.299 * _pr + 0.587 * _pg + 0.114 * _pb) / 255 <= 0.6
 
         try:
             uxtheme = ctypes.WinDLL("uxtheme", use_last_error=True)

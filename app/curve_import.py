@@ -1,4 +1,4 @@
-﻿"""
+"""
 curve_import.py -- the "Import Curves" notebook tab.
 
 Replaces the standalone Curve Converter app and wires it directly into
@@ -253,7 +253,7 @@ class CurveImportPanel(ttk.Frame):
                          font=theme.font(13, "bold"), cursor="hand2", padx=4)
         x_btn.pack(side="right", padx=(4, 10))
         x_btn.bind("<Button-1>", lambda e, p=path: self._remove_file(p))
-        x_btn.bind("<Enter>", lambda e, b=x_btn: b.configure(fg=theme.ACCENT_RED))
+        x_btn.bind("<Enter>", lambda e, b=x_btn: b.configure(fg=theme.ACCENT_RED_TEXT))
         x_btn.bind("<Leave>", lambda e, b=x_btn: b.configure(fg=theme.TEXT_DIM))
         # clicking a queued file previews its raw curve; Ctrl+click toggles
         # it in the multi-select, Shift+click selects a range (plain click
@@ -364,7 +364,7 @@ class CurveImportPanel(ttk.Frame):
         else:
             self.preview_plot.clear(msg="No parsable data rows in this file")
             self.preview_info.configure(
-                text="RAW  \u00b7  {}  (no data)".format(name), fg=theme.ACCENT_RED)
+                text="RAW  \u00b7  {}  (no data)".format(name), fg=theme.ACCENT_RED_TEXT)
 
     def _select_plan_row(self, idx):
         if not (0 <= idx < len(self._plans)):
@@ -392,7 +392,7 @@ class CurveImportPanel(ttk.Frame):
         if not series:
             self.preview_plot.clear(msg="No parsable data rows in this plan")
             self.preview_info.configure(text=label + "  (no data)",
-                                        fg=theme.ACCENT_RED)
+                                        fg=theme.ACCENT_RED_TEXT)
             return
         avg = None
         if plan.averaged and len(series) == 2:
@@ -449,7 +449,7 @@ class CurveImportPanel(ttk.Frame):
             row=0, column=0, sticky="w", pady=(0, 2))
         self.root_var = tk.StringVar(value="(not set)")
         root_lbl = ttk.Label(sub, textvariable=self.root_var, style="Card.TLabel",
-                  foreground=theme.ACCENT_BLUE, justify="left")
+                  foreground=theme.ACCENT_BLUE_TEXT, justify="left")
         root_lbl.grid(row=0, column=1, columnspan=2,
                       sticky="w", padx=4, pady=(0, 2))
         # long absolute paths used to force this column wide enough to show
@@ -486,7 +486,7 @@ class CurveImportPanel(ttk.Frame):
         hint = ("\u26a0 Set the data folder first (File \u25b8 Set Data Folder...)"
                 if not self.app.get_data_root() else "")
         self.dest_hint = ttk.Label(sub, text=hint, style="Card.TLabel",
-                                   foreground=theme.ACCENT_ORANGE,
+                                   foreground=theme.ACCENT_ORANGE_TEXT,
                                    justify="left")
         self.dest_hint.grid(row=3, column=0, columnspan=4, sticky="w", pady=(2, 0))
         theme.bind_dynamic_wrap(self.dest_hint, source=sub)
@@ -583,7 +583,7 @@ class CurveImportPanel(ttk.Frame):
         self.convert_btn.pack(side="right")
         self.convert_status = tk.StringVar(value="")
         convert_status_lbl = ttk.Label(header, textvariable=self.convert_status,
-                  style="Card.TLabel", foreground=theme.ACCENT_BLUE,
+                  style="Card.TLabel", foreground=theme.ACCENT_BLUE_TEXT,
                   justify="right")
         convert_status_lbl.pack(side="right", padx=12)
         theme.bind_dynamic_wrap(convert_status_lbl, source=header, min_wrap=100)
@@ -719,7 +719,7 @@ class CurveImportPanel(ttk.Frame):
                                       state="readonly", width=20, font=self._font)
             link_combo.pack(side="left", padx=(0, 6), pady=3)
 
-            exists_lbl = tk.Label(row, text="", bg=row_bg, fg=theme.ACCENT_RED,
+            exists_lbl = tk.Label(row, text="", bg=row_bg, fg=theme.ACCENT_RED_TEXT,
                                   font=theme.font(12, "bold"))
             exists_lbl.pack(side="left", padx=(0, 6))
 
@@ -1190,8 +1190,8 @@ class CurveImportPanel(ttk.Frame):
                            insertbackground=theme.TEXT_MAIN, font=self._font,
                            relief="flat", wrap="word", padx=10, pady=8)
         self.log.pack(fill="both", expand=True, padx=8, pady=(0, 8))
-        self.log.tag_configure("ok", foreground=theme.ACCENT_GREEN)
-        self.log.tag_configure("fail", foreground=theme.ACCENT_RED)
+        self.log.tag_configure("ok", foreground=theme.ACCENT_GREEN_TEXT)
+        self.log.tag_configure("fail", foreground=theme.ACCENT_RED_TEXT)
         self.log.configure(state="disabled")
         self._log_expanded = False
 

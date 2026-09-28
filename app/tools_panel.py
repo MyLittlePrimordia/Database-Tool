@@ -1,4 +1,4 @@
-﻿"""
+"""
 tools_panel.py -- the "Export" notebook tab.
 
 Two dead-simple cards that replace the standalone Database Compressor
@@ -58,8 +58,8 @@ class ToolsPanel(ttk.Frame):
             wrap="word", padx=10, pady=8,
         )
         self.log.pack(fill="both", expand=True, padx=8, pady=(0, 8))
-        self.log.tag_configure("ok", foreground=theme.ACCENT_GREEN)
-        self.log.tag_configure("fail", foreground=theme.ACCENT_RED)
+        self.log.tag_configure("ok", foreground=theme.ACCENT_GREEN_TEXT)
+        self.log.tag_configure("fail", foreground=theme.ACCENT_RED_TEXT)
         self.log.configure(state="disabled")
 
         self.refresh_state()
@@ -109,7 +109,7 @@ class ToolsPanel(ttk.Frame):
 
         self.gz_result_var = tk.StringVar(value="")
         gz_result_lbl = ttk.Label(card, textvariable=self.gz_result_var, style="Card.TLabel",
-                  foreground=theme.ACCENT_GREEN)
+                  foreground=theme.ACCENT_GREEN_TEXT)
         gz_result_lbl.grid(row=6, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 8))
         theme.bind_dynamic_wrap(gz_result_lbl, source=card)
 
@@ -160,7 +160,7 @@ class ToolsPanel(ttk.Frame):
 
         self.split_result_var = tk.StringVar(value="")
         split_result_lbl = ttk.Label(card, textvariable=self.split_result_var, style="Card.TLabel",
-                  foreground=theme.ACCENT_GREEN)
+                  foreground=theme.ACCENT_GREEN_TEXT)
         split_result_lbl.grid(row=8, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 8))
         theme.bind_dynamic_wrap(split_result_lbl, source=card)
 
@@ -227,7 +227,7 @@ class ToolsPanel(ttk.Frame):
         src.pack(fill="x", padx=12, pady=(0, 0))
         ttk.Label(src, text="Source:", style="Dim.TLabel").pack(side="left")
         self._source_label = ttk.Label(src, text="", style="TLabel",
-                                       foreground=theme.ACCENT_BLUE)
+                                       foreground=theme.ACCENT_BLUE_TEXT)
         self._source_label.pack(side="left", padx=6)
 
     # ------------------------------------------------------------------

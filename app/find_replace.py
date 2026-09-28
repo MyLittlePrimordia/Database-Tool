@@ -85,6 +85,8 @@ class FindReplaceDialog(tk.Toplevel):
         self.geometry("900x620")
 
         self._rows_by_pos = {}     # pos -> (old_value, new_value)
+        self._iid_by_pos = {}      # pos -> tree iid
+        self._scan_field = None    # field the staged rows were scanned for
         self.include = {}          # iid -> bool
 
         outer, card = theme.make_card(self)
@@ -214,6 +216,21 @@ class FindReplaceDialog(tk.Toplevel):
         else:
             self.mode_combo.configure(state="readonly")
             self.case_chk.configure(state="normal")
+        # BUG-008: the staged preview was computed for the PREVIOUS field but
+        # _apply re-reads the CURRENT one, so switching to "File Path" after
+        # scanning "Model" wrote the model text into the files list, one
+        # single-character path per character -- and validate_entry never
+        # inspects `files`, so it passed and was autosaved. Any field change
+        # invalidates the preview: drop the rows and disable Apply so the
+        # user must Scan again.
+        self._invalidate_preview()
+
+    def _invalidate_preview(self):
+        """Discard a staged scan. _render_rows({}) is the single place that
+        owns the row/include/iid/apply-button state, so reuse it rather than
+        clearing the pieces by hand."""
+        self._scan_field = None
+        self._render_rows({})
 
     def _mode_key(self):
         label = self.mode_var.get()
@@ -303,6 +320,9 @@ class FindReplaceDialog(tk.Toplevel):
         self.include.clear()
         self._rows_by_pos = dict(rows)
         self._iid_by_pos = {}
+        # BUG-008: remember WHICH field these staged values belong to. Empty
+        # rows mean "nothing is staged", so the pairing is cleared too.
+        self._scan_field = self.field_var.get() if rows else None
         for pos, (old_val, new_val) in sorted(rows.items()):
             entry = self.app.entries[pos]
             eid = entry.get("id") or "(no id) #{}".format(pos)
@@ -350,6 +370,21 @@ class FindReplaceDialog(tk.Toplevel):
 
         field = self.field_var.get()
         kind = _FIELD_KIND[field]
+        # BUG-008 defence in depth: refuse to write staged values that were
+        # scanned for a DIFFERENT field. _on_field_changed already clears the
+        # preview, so reaching here means the field changed without that
+        # handler running (e.g. a programmatic field_var.set()). Applying a
+        # text field's string into `files`/`tags` produces one bogus
+        # single-element path per character, and validate_entry does not
+        # inspect `files`, so nothing downstream would catch it.
+        if self._scan_field != field:
+            self._invalidate_preview()
+            messagebox.showwarning(
+                APP_TITLE,
+                "The field changed since the last scan, so the preview no "
+                "longer applies. Press Scan again.",
+                parent=self)
+            return
         app = self.app
         live_ids = {e.get("id") for e in app.entries if e.get("id")}
 
@@ -358,6 +393,19 @@ class FindReplaceDialog(tk.Toplevel):
         for pos in included:
             entry = app.entries[pos]
             old_val, new_val = self._rows_by_pos[pos]
+            # The staged value's container type must match the target field's,
+            # or the assignment above silently shreds a string. Assert the
+            # invariant instead of trusting it.
+            wants_list = kind in ("tag", "files")
+            if isinstance(new_val, list) != wants_list:
+                self._invalidate_preview()
+                messagebox.showerror(
+                    APP_TITLE,
+                    "Internal consistency check failed while applying to "
+                    "'{}'. Nothing was changed -- press Scan again."
+                    .format(self._field_label()),
+                    parent=self)
+                return
             candidate = dict(entry)
             if kind == "tag":
                 candidate["tags"] = list(new_val)
