@@ -1,8 +1,8 @@
-# Database Tool
+# 🛠️ Database Tool
 
-A standalone desktop GUI for maintaining, auditing, importing, and exporting `database.json` — the catalog database used by **IEM Tool**.
+**A lightweight, zero-dependency desktop GUI for managing and auditing the IEM Tool catalog.**
 
-Built entirely with Python and standard `tkinter`. It requires zero third-party packages to run.
+Add new IEMs, import frequency response curves, auto-detect sound signatures, and audit your database for broken links—with zero external Python packages to install.
 
 <p align="center">
   <img src="preview.png" width="900" alt="Database Tool Screenshot">
@@ -10,97 +10,60 @@ Built entirely with Python and standard `tkinter`. It requires zero third-party 
 
 ---
 
-## Features
+## ⚡ What it does
 
-### Editor
-- **Searchable entry tree:** Entries are grouped by brand with real-time filtering.
-- **Autofill suggestions:** Brand, Model, and Variant suggest existing values.
-- **Auto-generated IDs:** Normalizes Brand/Model/Variant into database-safe IDs.
-- **Input validation:** Handles price rounding, driver configuration, connectors, form factors, and the 31 approved tags.
-- **Measurement linking:** Links `.txt` measurement files with a live file count.
-- **Offline spellcheck:** Checks Brand/Model/Variant without flagging names already in the database.
-- **TWS lock:** Wireless Earbuds (TWS) zeroes and locks Impedance/Sensitivity.
-- **Drag & drop:** Native file drag & drop on Windows.
-
-### Import Curves
-- Converts raw `.txt` / `.csv` measurements into the standard two-column format.
-- Detects explicit measurement pairs and averages matching curves.
-- Does not treat product names such as `Hype 2` or `MACH 2` as measurement pairs.
-- Can automatically link converted files to the open entry.
-
-### FR Curve Analysis
-- Analyzes linked measurements and suggests bass, midrange, pinna gain, and treble tags.
-- Supports multiple measurements and scientific notation.
-
-### Database Audit & Repair
-- Checks database structure, IDs, fields, years, tags, and specs.
-- Finds missing, unlinked, and incorrectly-cased measurement paths.
-- Flags measurement files linked to multiple entries (non-auto-fixable), including case-only path differences (e.g. `data/ADEN/7HZ ZERO.txt` vs `data/aden/7hz zero.txt`, the same file on Windows/macOS).
-- Batch-fixes common database issues.
-- Limits large unlinked-file lists to 200 entries.
-
-### Undo History & Backups
-- **Undo/redo:** Tracks changes made during the current session.
-- **Autosave backups:** Keeps the last 15 backups in `.db_editor_backups`.
-- **Recovery:** Offers to restore a newer backup when available.
-- Warns before undo/redo reloads entries with unsaved form changes.
-
-### Export
-- **Compress:** Creates `database.json.gz` for the website.
-- **Split:** Creates token-sized `*_chunk_N.json` files for AI context windows.
-- Exports include unsaved changes currently in the application.
-- Old chunk files are cleaned up automatically.
-- `.json.gz` files can be loaded for auditing.
+- ✏️ **Visual IEM Editor:** Search and edit entries grouped by brand. Features real-time search, smart autofill, spec validation, and offline spellcheck.
+- 📈 **Smart Curve Importer:** Converts raw `.txt` or `.csv` measurements into clean curves, automatically pairs and averages L/R channels, and links them to entries.
+- 🏷️ **Sound Signature Tagging:** Analyzes frequency response curves to automatically detect and tag bass, midrange, pinna gain, and treble profiles.
+- 🩺 **1-Click Audit & Repair:** Scans for missing files, duplicate links, casing errors, and broken IDs—with batch auto-repair for common issues.
+- 🛡️ **Safe & Reversible:** Complete undo/redo history and rotating autosave backups so you never lose work.
+- 📦 **Ready to Export:** Compress directly to `database.json.gz` or split into token-sized chunks for AI context windows.
 
 ---
 
-## Running from Source
+## 🚀 Quick Start
 
-Requires **Python 3.8+**. `tkinter` is included with standard Python installations on Windows and macOS.
+Built entirely with standard Python and `tkinter`—**no `pip install` required!**
 
-On Debian/Ubuntu Linux, install `tkinter` via:
+### Prerequisites
+- **Python 3.8+** (Windows & macOS include `tkinter` automatically)
+- *Ubuntu/Debian Linux only:* `sudo apt install python3-tk`
 
-```bash
-sudo apt install python3-tk
-```
-
-### Run
-
+### Launch the App
 ```bash
 python main.py
 ```
-
-> **Note:** A `database.json` located in the working directory will load automatically.
+> **Tip:** If a `database.json` file is in the same folder, it loads automatically on launch.
 
 ---
 
-## Building Executables
+<details>
+<summary><b>💻 Building Standalone Executables</b></summary>
 
-Building standalone executables requires [PyInstaller](https://pyinstaller.org/):
+To compile into a standalone `.exe`, `.dmg`, or `.AppImage` without needing Python installed:
 
+First, install PyInstaller:
 ```bash
 pip install pyinstaller
 ```
 
 ### Windows (.exe)
-
 ```bash
 python -m PyInstaller --onefile --windowed --name "Database Tool" --icon="assets/icon.ico" --add-data "assets;assets" main.py
 ```
 
 ### macOS (.dmg) & Linux (.AppImage)
-
-Build scripts are included in the repository:
-
+Use the included build scripts:
 ```bash
 chmod +x build_macos.sh build_linux_appimage.sh
 ./build_macos.sh
 ./build_linux_appimage.sh
 ```
+</details>
 
----
+<details>
+<summary><b>🔗 Related Projects</b></summary>
 
-## 🔗 Related Projects
-
-* **[🎧 IEM Tool](https://github.com/MyLittlePrimordia/IEM-Tool):** The offline desktop app that uses this database for EQ, target matching, and discovery.
-* **[📦 Database](https://github.com/MyLittlePrimordia/Database):** The official dataset repository where new measurements are merged, audited & maintained.
+* **[🎧 IEM Tool](https://github.com/MyLittlePrimordia/IEM-Tool):** The main desktop app that uses this database for EQ, target matching, and discovery.
+* **[📦 Database](https://github.com/MyLittlePrimordia/Database):** The official repository where measurement curves and `database.json` datasets are hosted.
+</details>
